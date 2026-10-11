@@ -794,7 +794,7 @@ static void jensen_init(MachineState *machine)
                           "jensen-system-board-id", 4);
     memory_region_add_subregion(&s->isa_io, 0xc80, &s->board_id);
     bus = isa_bus_new(NULL, &s->isa_mem, &s->isa_io, &error_fatal);
-    pic = i82357_pic_init(bus, qdev_get_gpio_in(DEVICE(s->cpu),
+    pic = i8259_init(bus, qdev_get_gpio_in(DEVICE(s->cpu),
                                          ALPHA_CPU_INPUT_IRQ1));
     isa_bus_register_input_irqs(bus, pic);
     s->pit = i8254_pit_init(bus, 0x40, 0, NULL);
@@ -807,7 +807,7 @@ static void jensen_init(MachineState *machine)
     /* The common DMA high-page and PIC ELCR mappings take precedence. */
     memory_region_add_subregion_overlap(&s->isa_io, 0, &s->isp_ext, -1);
     fdc = isa_new(TYPE_ISA_FDC);
-    qdev_prop_set_bit(DEVICE(fdc), "jensen-mode", true);
+    qdev_prop_set_bit(DEVICE(fdc), "strict-pio", true);
     for (i = 0; i < MAX_FD; i++) {
         floppy_drive[i] = drive_get(IF_FLOPPY, 0, i);
     }
@@ -1014,8 +1014,14 @@ static void jensen_class_init(ObjectClass *oc, void *data)
     static const char * const cpu_types[] = {
         ALPHA_CPU_TYPE_NAME("ev4"), NULL
     };
+    static GlobalProperty pic_defaults[] = {
+        { "isa-i8259", "edge-irq-withdrawal", "on" },
+        { "isa-i8259", "ltim-supported", "off" },
+    };
     MachineClass *mc = MACHINE_CLASS(oc);
 
+    compat_props_add(mc->compat_props, pic_defaults,
+                     G_N_ELEMENTS(pic_defaults));
     mc->desc = "DECpc AXP 150 / DEC 2000 (Jensen, experimental)";
     mc->init = jensen_init;
     mc->reset = jensen_reset;

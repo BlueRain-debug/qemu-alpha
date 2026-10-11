@@ -96,7 +96,7 @@ struct FDCtrl {
     int dma_chann;
     uint8_t phase;
     IsaDma *dma;
-    bool jensen_mode;
+    bool strict_pio;
     bool specify_nd;
     /* Controller's identification */
     uint8_t version;

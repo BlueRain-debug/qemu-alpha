@@ -29,6 +29,7 @@
 #include "qemu/timer.h"
 #include "qemu/log.h"
 #include "hw/isa/i8259_internal.h"
+#include "hw/qdev-properties.h"
 #include "trace.h"
 #include "qom/object.h"
 
@@ -38,7 +39,6 @@
 //#define DEBUG_IRQ_LATENCY
 
 #define TYPE_I8259 "isa-i8259"
-#define TYPE_I82357_PIC "isa-82357-pic"
 typedef struct PICClass PICClass;
 DECLARE_CLASS_CHECKERS(PICClass, PIC,
                        TYPE_I8259)
@@ -51,7 +51,6 @@ struct PICClass {
     PICCommonClass parent_class;
 
     DeviceRealize parent_realize;
-    bool eisa_82357;
 };
 
 #ifdef DEBUG_IRQ_LATENCY
@@ -153,11 +152,12 @@ static void pic_set_irq(void *opaque, int irq, int level)
             s->last_irr |= mask;
         } else {
             s->last_irr &= ~mask;
-            if (PIC_GET_CLASS(s)->eisa_82357) {
+            if (s->edge_irq_withdrawal) {
                 /*
-                 * EK-A0638-TD.001 17-28: even edge requests must remain
-                 * asserted until the first INTA. Withdraw a released source
-                 * without clearing an already acknowledged ISR bit.
+                 * 8259A datasheet p.18: both edge and level requests must
+                 * remain high through the first INTA. Withdrawal cancels
+                 * the pending request, not an already acknowledged ISR bit.
+                 * Legacy QEMU pulse sources require the compatibility mode.
                  */
                 s->irr &= ~mask;
             }
@@ -254,8 +254,8 @@ static void pic_ioport_write(void *opaque, hwaddr addr64,
             s->init_state = 1;
             s->init4 = val & 1;
             s->single_mode = val & 2;
-            /* The EISA ISP uses ELCR; ICW1.LTIM is disabled (17-28). */
-            s->ltim = PIC_GET_CLASS(s)->eisa_82357 ? 0 : val & 8;
+            /* EISA ISPs can disable LTIM in favor of per-input ELCR. */
+            s->ltim = s->ltim_supported ? val & 8 : 0;
         } else if (val & 0x08) {
             if (val & 0x04) {
                 s->poll = 1;
@@ -415,8 +415,7 @@ static void pic_realize(DeviceState *dev, Error **errp)
     pc->parent_realize(dev, errp);
 }
 
-static qemu_irq *pic_init(ISABus *bus, qemu_irq parent_irq_in,
-                          const char *type)
+qemu_irq *i8259_init(ISABus *bus, qemu_irq parent_irq_in)
 {
     qemu_irq *irq_set;
     DeviceState *dev;
@@ -425,7 +424,7 @@ static qemu_irq *pic_init(ISABus *bus, qemu_irq parent_irq_in,
 
     irq_set = g_new0(qemu_irq, ISA_NUM_IRQS);
 
-    isadev = i8259_init_chip(type, bus, true);
+    isadev = i8259_init_chip(TYPE_I8259, bus, true);
     dev = DEVICE(isadev);
 
     qdev_connect_gpio_out(dev, 0, parent_irq_in);
@@ -435,7 +434,7 @@ static qemu_irq *pic_init(ISABus *bus, qemu_irq parent_irq_in,
 
     isa_pic = PIC_COMMON(dev);
 
-    isadev = i8259_init_chip(type, bus, false);
+    isadev = i8259_init_chip(TYPE_I8259, bus, false);
     dev = DEVICE(isadev);
 
     qdev_connect_gpio_out(dev, 0, irq_set[2]);
@@ -448,21 +447,17 @@ static qemu_irq *pic_init(ISABus *bus, qemu_irq parent_irq_in,
     return irq_set;
 }
 
-qemu_irq *i8259_init(ISABus *bus, qemu_irq parent_irq_in)
-{
-    return pic_init(bus, parent_irq_in, TYPE_I8259);
-}
-
-qemu_irq *i82357_pic_init(ISABus *bus, qemu_irq parent_irq_in)
-{
-    return pic_init(bus, parent_irq_in, TYPE_I82357_PIC);
-}
-
-static void i82357_pic_class_init(ObjectClass *klass, void *data)
-{
-    PIC_CLASS(klass)->eisa_82357 = true;
-    DEVICE_CLASS(klass)->desc = "82357 EISA interrupt controller";
-}
+/*
+ * Default to the historical latch behavior: devices such as HPET deliver
+ * zero-duration QEMU IRQ pulses. Boards whose sources hold the physical IRQ
+ * until service may enable hardware request withdrawal without losing pulses
+ * on unrelated machines. LTIM remains supported by ordinary 8259A devices.
+ */
+static const Property pic_properties[] = {
+    DEFINE_PROP_BOOL("edge-irq-withdrawal", PICCommonState,
+                     edge_irq_withdrawal, false),
+    DEFINE_PROP_BOOL("ltim-supported", PICCommonState, ltim_supported, true),
+};
 
 static void i8259_class_init(ObjectClass *klass, void *data)
 {
@@ -471,6 +466,7 @@ static void i8259_class_init(ObjectClass *klass, void *data)
 
     device_class_set_parent_realize(dc, pic_realize, &k->parent_realize);
     device_class_set_legacy_reset(dc, pic_reset);
+    device_class_set_props(dc, pic_properties);
 }
 
 static const TypeInfo i8259_info = {
@@ -481,16 +477,9 @@ static const TypeInfo i8259_info = {
     .class_size = sizeof(PICClass),
 };
 
-static const TypeInfo i82357_pic_info = {
-    .name = TYPE_I82357_PIC,
-    .parent = TYPE_I8259,
-    .class_init = i82357_pic_class_init,
-};
-
 static void pic_register_types(void)
 {
     type_register_static(&i8259_info);
-    type_register_static(&i82357_pic_info);
 }
 
 type_init(pic_register_types)

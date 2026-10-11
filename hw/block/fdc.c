@@ -1018,17 +1018,18 @@ static const VMStateDescription vmstate_fdc_phase = {
     }
 };
 
-/* Only Jensen opts into separate SPECIFY.ND and DOR state. */
-static bool fdc_jensen_needed(void *opaque)
+/* Strict PIO keeps SPECIFY.ND separate from DOR. */
+static bool fdc_strict_pio_needed(void *opaque)
 {
-    return ((FDCtrl *)opaque)->jensen_mode;
+    return ((FDCtrl *)opaque)->strict_pio;
 }
 
-static const VMStateDescription vmstate_fdc_jensen = {
+static const VMStateDescription vmstate_fdc_strict_pio = {
+    /* Retain the subsection ID used by the original Jensen implementation. */
     .name = "fdc/jensen",
     .version_id = 1,
     .minimum_version_id = 1,
-    .needed = fdc_jensen_needed,
+    .needed = fdc_strict_pio_needed,
     .fields = (const VMStateField[]) {
         VMSTATE_BOOL(specify_nd, FDCtrl),
         VMSTATE_END_OF_LIST()
@@ -1077,7 +1078,7 @@ const VMStateDescription vmstate_fdc = {
         &vmstate_fdc_reset_sensei,
         &vmstate_fdc_result_timer,
         &vmstate_fdc_phase,
-        &vmstate_fdc_jensen,
+        &vmstate_fdc_strict_pio,
         NULL
     }
 };
@@ -1561,7 +1562,7 @@ static void fdctrl_start_transfer(FDCtrl *fdctrl, int direction)
     }
     fdctrl->eot = fdctrl->fifo[6];
     if ((fdctrl->dor & FD_DOR_DMAEN) &&
-        !(fdctrl->jensen_mode && fdctrl->specify_nd)) {
+        !(fdctrl->strict_pio && fdctrl->specify_nd)) {
         /* DMA transfer is enabled. */
         IsaDmaClass *k = ISADMA_GET_CLASS(fdctrl->dma);
 
@@ -1585,7 +1586,7 @@ static void fdctrl_start_transfer(FDCtrl *fdctrl, int direction)
         }
         return;
     }
-    if (fdctrl->jensen_mode && direction == FD_DIR_WRITE && cur_drv->ro) {
+    if (fdctrl->strict_pio && direction == FD_DIR_WRITE && cur_drv->ro) {
         fdctrl_stop_transfer(fdctrl, FD_SR0_ABNTERM | FD_SR0_SEEK,
                              FD_SR1_NW, 0x00);
         return;
@@ -1733,9 +1734,9 @@ int fdctrl_transfer_handler(void *opaque, int nchan, int dma_pos, int dma_len)
     return len;
 }
 
-static void fdctrl_jensen_pio_ack(FDCtrl *fdctrl)
+static void fdctrl_pio_ack(FDCtrl *fdctrl)
 {
-    if (fdctrl->jensen_mode) {
+    if (fdctrl->strict_pio) {
         uint8_t status0 = fdctrl->status0;
 
         fdctrl_reset_irq(fdctrl);
@@ -1743,12 +1744,12 @@ static void fdctrl_jensen_pio_ack(FDCtrl *fdctrl)
     }
 }
 
-static void fdctrl_jensen_pio_complete(FDCtrl *fdctrl)
+static void fdctrl_pio_complete(FDCtrl *fdctrl)
 {
     /*
      * 82077AA 4.2.5: EOT without DMA terminal count is an implied TC,
-     * reported as abnormal termination with ST1.EN. ARC accepts this
-     * expected end condition; a zero status would make it retry the read.
+     * reported as abnormal termination with ST1.EN. This is an expected
+     * end condition for polled reads, including those issued by ARC.
      * Keep CHRN on the final sector, as in 86Box's non-DMA EOT path.
      */
     fdctrl->status0 &= ~FD_SR0_SEEK;
@@ -1778,7 +1779,7 @@ static uint32_t fdctrl_read_data(FDCtrl *fdctrl)
     switch (fdctrl->phase) {
     case FD_PHASE_EXECUTION:
         assert(fdctrl->msr & FD_MSR_NONDMA);
-        fdctrl_jensen_pio_ack(fdctrl);
+        fdctrl_pio_ack(fdctrl);
         if (pos == 0) {
             if (fdctrl->data_pos != 0)
                 if (!fdctrl_seek_to_next_sect(fdctrl, cur_drv)) {
@@ -1800,8 +1801,8 @@ static uint32_t fdctrl_read_data(FDCtrl *fdctrl)
             /* Result bytes share the FIFO with short DTL payloads. */
             retval = fdctrl->fifo[pos];
             fdctrl->msr &= ~FD_MSR_RQM;
-            if (fdctrl->jensen_mode) {
-                fdctrl_jensen_pio_complete(fdctrl);
+            if (fdctrl->strict_pio) {
+                fdctrl_pio_complete(fdctrl);
                 return retval;
             }
             fdctrl_stop_transfer(fdctrl, 0x00, 0x00, 0x00);
@@ -2028,7 +2029,7 @@ static void fdctrl_handle_specify(FDCtrl *fdctrl, int direction)
 {
     fdctrl->timer0 = (fdctrl->fifo[1] >> 4) & 0xF;
     fdctrl->timer1 = fdctrl->fifo[2] >> 1;
-    if (fdctrl->jensen_mode) {
+    if (fdctrl->strict_pio) {
         /* DOR bit 3 gates DMA/IRQ pins; it does not select transfer mode. */
         fdctrl->specify_nd = fdctrl->fifo[2] & 1;
     } else if (fdctrl->fifo[2] & 1) {
@@ -2295,7 +2296,7 @@ static void fdctrl_write_data(FDCtrl *fdctrl, uint32_t value)
         /* For DMA requests, RQM should be cleared during execution phase, so
          * we would have errored out above. */
         assert(fdctrl->msr & FD_MSR_NONDMA);
-        fdctrl_jensen_pio_ack(fdctrl);
+        fdctrl_pio_ack(fdctrl);
 
         /* FIFO data write */
         if (pos == FD_SECTOR_LEN - 1 ||
@@ -2305,18 +2306,18 @@ static void fdctrl_write_data(FDCtrl *fdctrl, uint32_t value)
                            fdctrl->fifo, 0) < 0) {
                 FLOPPY_DPRINTF("error writing sector %d\n",
                                fd_sector(cur_drv));
-                if (fdctrl->jensen_mode) {
+                if (fdctrl->strict_pio) {
                     fdctrl_stop_transfer(fdctrl, FD_SR0_ABNTERM, 0, 0);
                 }
                 break;
             }
-            if (fdctrl->jensen_mode &&
+            if (fdctrl->strict_pio &&
                 fdctrl->data_pos == fdctrl->data_len) {
-                fdctrl_jensen_pio_complete(fdctrl);
+                fdctrl_pio_complete(fdctrl);
                 break;
             }
             if (!fdctrl_seek_to_next_sect(fdctrl, cur_drv)) {
-                if (fdctrl->jensen_mode) {
+                if (fdctrl->strict_pio) {
                     fdctrl_stop_transfer(fdctrl, FD_SR0_ABNTERM,
                                          FD_SR1_EC, 0);
                 }
@@ -2380,7 +2381,7 @@ static void fdctrl_result_timer(void *opaque)
     if (cur_drv->last_sect != 0) {
         cur_drv->sect = (cur_drv->sect % cur_drv->last_sect) + 1;
     }
-    if (fdctrl->jensen_mode &&
+    if (fdctrl->strict_pio &&
         (!cur_drv->blk || !blk_is_inserted(cur_drv->blk))) {
         fdctrl_stop_transfer(fdctrl, FD_SR0_ABNTERM, FD_SR1_MA, 0);
         return;
