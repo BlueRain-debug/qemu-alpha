@@ -568,7 +568,7 @@ static void alpha_update_exception_state_ev4(CPUAlphaState *env,
     if (flags.load_insn) {
         uint32_t insn = cpu_ldl_code(env, env->pc + diff);
 
-        SET_FIELD(exc_sum, EV4_MMCSR, RA, get_ra(insn));
+        SET_FIELD(mm_stat, EV4_MMCSR, RA, get_ra(insn));
         SET_FIELD(mm_stat, EV4_MMCSR, OPCODE, get_opc(insn));
     }
 

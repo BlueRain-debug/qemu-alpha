@@ -39,3 +39,9 @@ tig_control_read(uint64_t addr, uint64_t val, unsigned len) "addr=0x%"PRIx64 " v
 # jensen.c
 jensen_rtc_read(uint64_t port, uint8_t index, uint8_t value) "port=0x%" PRIx64 " index=0x%02x value=0x%02x"
 jensen_rtc_write(uint64_t port, uint8_t index, uint8_t value) "port=0x%" PRIx64 " index=0x%02x value=0x%02x"
+
+# jensen-scsi.c
+jensen_aha_read(uint64_t reg, uint64_t value, unsigned size) "reg=0x%" PRIx64 " value=0x%" PRIx64 " size=%u"
+jensen_aha_write(uint64_t reg, uint64_t value, unsigned size) "reg=0x%" PRIx64 " value=0x%" PRIx64 " size=%u"
+jensen_aha_command(uint32_t ecb, unsigned target, unsigned command, unsigned cdb, uint32_t length) "ecb=0x%x target=%u command=0x%x cdb=0x%x length=%u"
+jensen_aha_complete(uint32_t ecb, unsigned host, unsigned target, uint32_t residual) "ecb=0x%x host=0x%x target=0x%x residual=%u"

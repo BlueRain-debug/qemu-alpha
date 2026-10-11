@@ -39,3 +39,4 @@ config JENSEN
     select PFLASH_CFI01
     select I8257
     select FDC_ISA
+    select SCSI
