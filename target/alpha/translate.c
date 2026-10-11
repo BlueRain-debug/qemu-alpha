@@ -642,16 +642,14 @@ static void glue(gen_ieee_, name)(DisasContext *s,              \
 GEN_IEEE_CONVERT(cvtqs)
 GEN_IEEE_CONVERT(cvtqt)
 
-static void gen_ieee_cvtql(DisasContext *s, int rb, int rc)
+static void gen_ieee_cvtql(DisasContext *s, int rb, int rc, int qualifier)
 {
     TCGv_i64 vb, vc;
     TCGv_i32 qual;
-    int fn11;
 
-    fn11 = get_fn11(s->insn);
     vb = read_fpu_reg(s, rb);
     vc = fpu_reg(s, rc);
-    qual = tcg_constant_i32(fn11 & QUAL_MASK);
+    qual = tcg_constant_i32(qualifier);
     gen_helper_ieee_cvtql(vc, tcg_env, vb, qual);
     gen_helper_check_float_exceptions(tcg_env, qual);
 }
@@ -2739,6 +2737,37 @@ static bool trans_sqrtt(DisasContext *s, arg_sqrtt *a)
     return true;
 }
 
+static bool trans_cvtql(DisasContext *s, arg_cvtql *a)
+{
+    if (!fp_access_check(s)) {
+        return false;
+    }
+    if (unlikely(a->ra != 31)) {
+        return false;
+    }
+    gen_ieee_cvtql(s, a->rb, a->rc, get_fn11(s->insn) & QUAL_MASK);
+    return true;
+}
+
+static bool trans_cvtql_nt(DisasContext *s, arg_cvtql_nt *a)
+{
+    if (!fp_access_check(s)) {
+        return false;
+    }
+    if (unlikely(a->ra != 31)) {
+        return false;
+    }
+    /*
+     * Windows NT 3.5 build 756 WINSRV uses function 0x330. Although the
+     * Alpha manuals do not list this encoding, retain it for NT compatibility
+     * as CVTQL/V (0x130). Ignore the extra QUAL_I bit: CVTQL does not support
+     * inexact traps, but integer overflow must still raise an exception.
+     */
+    gen_ieee_cvtql(s, a->rb, a->rc, QUAL_V);
+    return true;
+}
+
+
 #define GEN_IEEE_OP1(name)                              \
 static bool glue(trans_, name)(DisasContext *s,         \
                                glue(arg_, name) *a)     \
@@ -2779,10 +2808,8 @@ GEN_IEEE_OP2(cmptle)
 GEN_IEEE_OP1(cvttq)
 GEN_IEEE_OP1(cvtqs)
 GEN_IEEE_OP1(cvtqt)
-GEN_IEEE_OP1(cvtql)
 GEN_IEEE_OP1(cvtst)
 GEN_IEEE_OP1(cvtts)
-
 
 #define GEN_VAX_OP1(name)                               \
 static bool glue(trans_, name)(DisasContext *s,         \
