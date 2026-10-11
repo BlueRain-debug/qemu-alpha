@@ -80,7 +80,6 @@ jobs:
               --enable-strip
               --disable-qom-cast-debug
               --disable-stack-protector
-              --disable-hardening
               --disable-pie
               --enable-trace-backends=nop
               --extra-cflags="-fomit-frame-pointer -ffunction-sections -fdata-sections"
@@ -145,7 +144,7 @@ jobs:
             COPYING \
             COPYING.LIB \
             LICENSE \
-            README.md \
+            README.rst \
             linux-library-dependencies.txt \
             "$dist/"
 
@@ -275,7 +274,7 @@ jobs:
             COPYING \
             COPYING.LIB \
             LICENSE \
-            README.md \
+            README.rst \
             linux-aarch64-library-dependencies.txt \
             "$dist/"
 
@@ -391,7 +390,6 @@ jobs:
               --enable-strip
               --disable-qom-cast-debug
               --disable-stack-protector
-              --disable-hardening
               --disable-pie
               --enable-trace-backends=nop
               --extra-cflags="-fomit-frame-pointer"
@@ -501,7 +499,7 @@ jobs:
             COPYING \
             COPYING.LIB \
             LICENSE \
-            README.md \
+            README.rst \
             "$dist/"
 
           install -m 0644 \
