@@ -17,26 +17,48 @@ permissions:
 jobs:
   linux:
     name: ${{ matrix.job_name }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
 
     strategy:
       fail-fast: false
       matrix:
         include:
           - job_name: Linux x86-64 (GCC)
+            runner: ubuntu-24.04
+            arch: x86_64
             optimized: false
             build_dir: build-linux
             dist_stem: qemu-system-alpha-linux-x86_64
             archive: qemu-system-alpha-linux-x86_64.tar.gz
             artifact_name: Linux-AMD64
+            deps_file: linux-library-dependencies.txt
           - job_name: Linux x86-64-v2 optimized (GCC)
+            runner: ubuntu-24.04
+            arch: x86_64
             optimized: true
             build_dir: build-linux-x86_64-v2-optimized
             dist_stem: qemu-system-alpha-linux-x86_64-v2-optimized
             archive: qemu-system-alpha-linux-x86_64-v2-optimized.tar.gz
             artifact_name: Linux-AMD64-x86-64-v2-optimized
+            deps_file: linux-library-dependencies.txt
+          - job_name: Linux AArch64 (GCC, native)
+            runner: ubuntu-24.04-arm
+            arch: aarch64
+            build_dir: build-linux-aarch64
+            dist_stem: qemu-system-alpha-linux-aarch64
+            archive: qemu-system-alpha-linux-aarch64.tar.gz
+            artifact_name: Linux-AA64
+            deps_file: linux-aarch64-library-dependencies.txt
 
     steps:
+      - name: Verify the native AArch64 runner
+        if: matrix.arch == 'aarch64'
+        run: |
+          set -euo pipefail
+
+          test "$(uname -m)" = aarch64
+          test "$(dpkg --print-architecture)" = arm64
+
       - name: Check out the source tree
         uses: actions/checkout@v6
 
@@ -72,6 +94,8 @@ jobs:
 
           build_dir="${{ matrix.build_dir }}"
           optimization_args=()
+          # The x86-64 baseline and LTO tuning only apply to the arch: x86_64
+          # entries; the native AArch64 entry builds with default flags.
           if [[ "${{ matrix.optimized }}" == "true" ]]; then
             optimization_args=(
               --x86-version=2
@@ -112,6 +136,10 @@ jobs:
 
           ninja -C "$build_dir" -j"$(nproc)" qemu-system-alpha
 
+          if [[ "${{ matrix.optimized }}" == "true" ]]; then
+            strip --strip-unneeded "$build_dir/qemu-system-alpha"
+          fi
+
       - name: Validate and package the Linux artifact
         run: |
           set -euo pipefail
@@ -127,11 +155,15 @@ jobs:
 
           file "$executable" > linux-file.txt
           cat linux-file.txt
-          grep -Eq 'ELF 64-bit.*x86-64' linux-file.txt
+          if [[ "${{ matrix.arch }}" == "aarch64" ]]; then
+            grep -Eq 'ELF 64-bit.*ARM aarch64' linux-file.txt
+          else
+            grep -Eq 'ELF 64-bit.*x86-64' linux-file.txt
+          fi
 
-          ldd "$executable" | tee linux-library-dependencies.txt
-          if grep -Fq 'not found' linux-library-dependencies.txt; then
-            echo "Linux x86-64 artifact has unresolved shared libraries" >&2
+          ldd "$executable" | tee "${{ matrix.deps_file }}"
+          if grep -Fq 'not found' "${{ matrix.deps_file }}"; then
+            echo "Linux artifact has unresolved shared libraries" >&2
             exit 1
           fi
           "$executable" --version
@@ -145,7 +177,7 @@ jobs:
             COPYING.LIB \
             LICENSE \
             README.rst \
-            linux-library-dependencies.txt \
+            "${{ matrix.deps_file }}" \
             "$dist/"
 
           install -m 0644 \
@@ -168,136 +200,6 @@ jobs:
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.archive }}
-          if-no-files-found: error
-          archive: false
-
-  linux-aarch64:
-    name: Linux AArch64 (GCC, native)
-    runs-on: ubuntu-24.04-arm
-
-    steps:
-      - name: Verify the native AArch64 runner
-        run: |
-          set -euo pipefail
-
-          test "$(uname -m)" = aarch64
-          test "$(dpkg --print-architecture)" = arm64
-
-      - name: Check out the source tree
-        uses: actions/checkout@v6
-
-      - name: Install build dependencies
-        run: |
-          set -euo pipefail
-
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            bison \
-            build-essential \
-            file \
-            flex \
-            git \
-            libfdt-dev \
-            libglib2.0-dev \
-            libgtk-3-dev \
-            libpixman-1-dev \
-            libsdl2-dev \
-            libslirp-dev \
-            ninja-build \
-            pkg-config \
-            python3 \
-            python3-pip \
-            python3-setuptools \
-            python3-venv \
-            python3-wheel \
-            zlib1g-dev
-
-      - name: Configure and build the Linux emulator
-        run: |
-          set -euo pipefail
-
-          mkdir build-linux-aarch64
-
-          (
-            cd build-linux-aarch64
-            CC=gcc CXX=g++ ../configure \
-              --python=/usr/bin/python3 \
-              --target-list=alpha-softmmu \
-              --enable-system \
-              --enable-tcg \
-              --enable-pixman \
-              --enable-fdt=system \
-              --enable-gtk \
-              --enable-sdl \
-              --enable-slirp \
-              --enable-vnc \
-              --disable-docs \
-              --disable-werror
-          )
-
-          ninja -C build-linux-aarch64 -j"$(nproc)" qemu-system-alpha
-
-      - name: Validate the native AArch64 executable
-        run: |
-          set -euo pipefail
-
-          executable="build-linux-aarch64/qemu-system-alpha"
-          test -x "$executable"
-          test -s "$executable"
-
-          elf_header="$(readelf -h "$executable")"
-          printf '%s\n' "$elf_header"
-          grep -Eq 'Machine:[[:space:]]+AArch64' <<<"$elf_header"
-          "$executable" --version
-
-      - name: Package the Linux AArch64 artifact
-        run: |
-          set -euo pipefail
-
-          executable="build-linux-aarch64/qemu-system-alpha"
-          version="$(tr -d '\r\n' < VERSION)"
-          dist_root="$PWD/dist"
-          dist="$dist_root/qemu-system-alpha-linux-aarch64-$version"
-          archive="$PWD/qemu-system-alpha-linux-aarch64.tar.gz"
-
-          ldd "$executable" | tee linux-aarch64-library-dependencies.txt
-          if grep -Fq 'not found' linux-aarch64-library-dependencies.txt; then
-            echo "Linux AArch64 artifact has unresolved shared libraries" >&2
-            exit 1
-          fi
-
-          rm -rf "$dist_root" "$archive"
-          mkdir -p "$dist/share/keymaps"
-
-          install -m 0755 "$executable" "$dist/"
-          install -m 0644 \
-            COPYING \
-            COPYING.LIB \
-            LICENSE \
-            README.rst \
-            linux-aarch64-library-dependencies.txt \
-            "$dist/"
-
-          install -m 0644 \
-            pc-bios/efi-e1000.rom \
-            pc-bios/vgabios-ati.bin \
-            pc-bios/vgabios-stdvga.bin \
-            "$dist/share/"
-
-          install -m 0644 pc-bios/keymaps/* "$dist/share/keymaps/"
-
-          tar -czf "$archive" \
-            -C "$dist_root" \
-            "$(basename "$dist")"
-
-          test -s "$archive"
-          tar -tzf "$archive" >/dev/null
-
-      - name: Upload the Linux AArch64 artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: Linux-AA64
-          path: qemu-system-alpha-linux-aarch64.tar.gz
           if-no-files-found: error
           archive: false
 
