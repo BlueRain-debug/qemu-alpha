@@ -8,6 +8,7 @@
 #include "qapi/error.h"
 #include "qemu/bswap.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
 #include "hw/isa/isa.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
@@ -23,6 +24,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(JensenAha1742, JENSEN_AHA1742)
 
 #define AHA_QUEUE_SIZE 64
 #define AHA_MAX_SG 128
+#define AHA_COMMAND_DELAY_NS (100 * 1000)
 #define AHA_DI 0x0080
 #define AHA_SES 0x0400
 #define AHA_SG 0x1000
@@ -37,6 +39,7 @@ typedef struct AhaCompletion {
 typedef struct AhaRequest {
     JensenAha1742 *s;
     SCSIRequest *req;
+    QEMUTimer *start_timer;
     QTAILQ_ENTRY(AhaRequest) next;
     uint32_t ecb, statusptr, senseptr, transferred;
     uint16_t flags;
@@ -156,6 +159,34 @@ static void aha_cancel(SCSIRequest *req)
     }
     QTAILQ_REMOVE(&r->s->requests, r, next);
     r->s->active--;
+    scsi_req_unref(req);
+}
+
+static void aha_cancel_request(AhaRequest *r)
+{
+    if (r->start_timer) {
+        timer_free(r->start_timer);
+        r->start_timer = NULL;
+        aha_cancel(r->req);
+    } else {
+        scsi_req_cancel(r->req);
+    }
+}
+
+static void aha_execute(void *opaque)
+{
+    AhaRequest *r = opaque;
+    SCSIRequest *req = r->req;
+    int32_t data;
+
+    timer_free(r->start_timer);
+    r->start_timer = NULL;
+    /* Enqueue can complete synchronously; keep req alive across that call. */
+    scsi_req_ref(req);
+    data = scsi_req_enqueue(req);
+    if (data) {
+        scsi_req_continue(req);
+    }
     scsi_req_unref(req);
 }
 
@@ -310,13 +341,14 @@ static void aha_start(JensenAha1742 *s, uint8_t target)
     r->req = req;
     QTAILQ_INSERT_TAIL(&s->requests, r, next);
     s->active++;
-    /* Enqueue can complete synchronously; keep req alive across that call. */
-    scsi_req_ref(req);
-    data = scsi_req_enqueue(req);
-    if (data) {
-        scsi_req_continue(req);
-    }
-    scsi_req_unref(req);
+    /*
+     * Attention submits an ECB to the adapter; it does not execute the SCSI
+     * command inside the host's register write. Keep even a cache hit or
+     * TEST UNIT READY asynchronous, as on the bus-mastering adapter.
+     */
+    r->start_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, aha_execute, r);
+    timer_mod(r->start_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + AHA_COMMAND_DELAY_NS);
     return;
 
 invalid:
@@ -334,7 +366,7 @@ static void aha_reset(DeviceState *dev)
         AhaRequest *r = QTAILQ_FIRST(&s->requests);
 
         r->resetting = true;
-        scsi_req_cancel(r->req);
+        aha_cancel_request(r);
     }
     qemu_set_irq(s->irq, 0);
     memset(s->regs, 0, sizeof(s->regs));
@@ -418,7 +450,7 @@ static void aha_write_byte(JensenAha1742 *s, unsigned reg, uint8_t value)
 
             QTAILQ_FOREACH(r, &s->requests, next) {
                 if (r->ecb == s->mailbox_out) {
-                    scsi_req_cancel(r->req);
+                    aha_cancel_request(r);
                     break;
                 }
             }
