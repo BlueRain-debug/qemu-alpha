@@ -834,8 +834,23 @@ static const MemoryRegionOps s3_vga_ops = {
 static unsigned s3_bank_offset(JensenS3State *s, unsigned bank)
 {
     bool chain4 = s->vga.sr[4] & 8;
-    unsigned size = s->vga.vram_size >> (chain4 ? 0 : 2);
-    return (bank << (chain4 ? 16 : 14)) & (size - 1);
+    /* Unpopulated banks float high; do not alias them onto installed VRAM. */
+    return bank << (chain4 ? 16 : 14);
+}
+
+/* Adapt the S3 banked 128 KiB window to the VGA core's banked 64 KiB map. */
+static hwaddr s3_vga_address(JensenS3State *s, hwaddr addr, unsigned bank)
+{
+    VGACommonState *vga = &s->vga;
+
+    vga->bank_offset = s3_bank_offset(s, bank);
+    if (!(vga->gr[6] & 0x0c)) {
+        /* S3 banks both halves of map 0; QEMU only banks map 1. */
+        vga->bank_offset += addr;
+        vga->gr[6] |= 4;
+        return 0;
+    }
+    return addr;
 }
 
 static bool s3_mmio(JensenS3State *s, hwaddr addr)
@@ -887,14 +902,16 @@ static uint64_t s3_memory_read(void *opaque, hwaddr addr, unsigned size)
     }
     for (i = 0; i < size; i++) {
         uint32_t byte;
-        if (s3_packed(s) && addr + i < 0x10000) {
-            uint32_t offset = (bank * 0x10000 + addr + i) &
-                              (s->vga.vram_size - 1);
-            byte = s->vga.vram_ptr[offset];
+        if (s3_packed(s)) {
+            uint32_t offset = bank * 0x10000 + addr + i;
+            byte = addr + i < 0x10000 && offset < s->vga.vram_size ?
+                   s->vga.vram_ptr[offset] : 0xff;
             trace_jensen_s3_memory(offset, byte, false);
         } else {
-            s->vga.bank_offset = s3_bank_offset(s, bank);
-            byte = vga_mem_readb(&s->vga, addr + i);
+            uint8_t map = s->vga.gr[6];
+            hwaddr offset = s3_vga_address(s, addr + i, bank);
+            byte = vga_mem_readb(&s->vga, offset);
+            s->vga.gr[6] = map;
         }
         value |= byte << (i * 8);
     }
@@ -927,15 +944,18 @@ static void s3_memory_write(void *opaque, hwaddr addr, uint64_t value,
         return;
     }
     for (i = 0; i < size; i++) {
-        if (s3_packed(s) && addr + i < 0x10000) {
-            uint32_t offset = (bank * 0x10000 + addr + i) &
-                              (s->vga.vram_size - 1);
+        if (s3_packed(s)) {
+            uint32_t offset = bank * 0x10000 + addr + i;
             trace_jensen_s3_memory(offset, (value >> (i * 8)) & 0xff, true);
-            s->vga.vram_ptr[offset] = value >> (i * 8);
-            memory_region_set_dirty(&s->vga.vram, offset, 1);
+            if (addr + i < 0x10000 && offset < s->vga.vram_size) {
+                s->vga.vram_ptr[offset] = value >> (i * 8);
+                memory_region_set_dirty(&s->vga.vram, offset, 1);
+            }
         } else {
-            s->vga.bank_offset = s3_bank_offset(s, bank);
-            vga_mem_writeb(&s->vga, addr + i, value >> (i * 8));
+            uint8_t map = s->vga.gr[6];
+            hwaddr offset = s3_vga_address(s, addr + i, bank);
+            vga_mem_writeb(&s->vga, offset, value >> (i * 8));
+            s->vga.gr[6] = map;
         }
     }
 }
