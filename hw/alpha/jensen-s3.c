@@ -138,8 +138,10 @@ static void s3_resolution(VGACommonState *vga, int *width, int *height)
         if (vga->cr[0x43] & 0x80) {
             *width *= 2;
         }
-        /* Bt485 16-bit multiplexing emits two pixels per CRTC clock.
-         * See 86Box's 928/BT48X 15/16-bpp timing calculation. */
+        /*
+         * Bt485 16-bit multiplexing emits two pixels per CRTC clock.
+         * See 86Box's 928/BT48X 15/16-bpp timing calculation.
+         */
         if ((s->dac_command[2] & 0x20) &&
             (s->dac_command[1] & 0x60) == 0x20) {
             *width *= 2;
@@ -861,7 +863,8 @@ static uint64_t s3_memory_read(void *opaque, hwaddr addr, unsigned size)
     uint32_t value = 0;
     unsigned i;
 
-    /* The old 928 MMIO window overlays A0000-AFFFF. Its lower half is
+    /*
+     * The old 928 MMIO window overlays A0000-AFFFF. Its lower half is
      * PIX_TRANS, independent of the VGA bank.
      */
     if (s3_mmio(s, addr)) {
@@ -875,7 +878,8 @@ static uint64_t s3_memory_read(void *opaque, hwaddr addr, unsigned size)
         }
         if (addr >= 0x83b0 && addr < 0x83e0) {
             for (i = 0; i < size; i++) {
-                value |= s3_vga_read(s, ((addr + i) & 0x3ff) - 0x3b0, 1) << (i * 8);
+                value |= s3_vga_read(s, ((addr + i) & 0x3ff) - 0x3b0, 1) <<
+                         (i * 8);
             }
             return value;
         }
