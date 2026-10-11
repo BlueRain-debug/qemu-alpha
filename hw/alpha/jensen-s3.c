@@ -139,12 +139,22 @@ static void s3_resolution(VGACommonState *vga, int *width, int *height)
             *width *= 2;
         }
         /*
-         * Bt485 16-bit multiplexing emits two pixels per CRTC clock.
-         * See 86Box's 928/BT48X 15/16-bpp timing calculation.
+         * The Metheus 928 uses a Bt485 and ICS2494 clock generator.
+         * In enhanced mode the DAC's input format determines how many
+         * pixels it emits per CRTC clock: four for 8-bit multiplexing,
+         * two for 15/16-bit multiplexing. The Bt485 clock doubler changes
+         * the output frequency, not this pixel count. See 86Box's
+         * S3_86C928/BT48X/ICS2494 timing calculation.
          */
-        if ((s->dac_command[2] & 0x20) &&
-            (s->dac_command[1] & 0x60) == 0x20) {
-            *width *= 2;
+        if (s->dac_command[2] & 0x20) {
+            switch (s->dac_command[1] & 0x60) {
+            case 0x40:
+                *width *= 4;
+                break;
+            case 0x20:
+                *width *= 2;
+                break;
+            }
         }
     }
 }
