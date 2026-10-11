@@ -1059,7 +1059,7 @@ static inline uint64_t ev4_xtb_pte_temp_init(uint64_t pte, bool itb)
     ret = deposit64(ret, 11, 1, FIELD_EX64(pte, PTE, SRE));
     ret = deposit64(ret, 12, 1, FIELD_EX64(pte, PTE, URE));
     ret = deposit64(ret, 34, 1, FIELD_EX64(pte, PTE, ASM));
-    ret = deposit64(ret, 13, 20,
+    ret = deposit64(ret, 13, 21,
                     itb ? FIELD_EX64(pte, EV4_ITB_PTE, PFN)
                         : FIELD_EX64(pte, EV4_DTB_PTE, PFN));
     return ret;
@@ -1136,19 +1136,16 @@ static uint64_t ev4_iccsr_read(CPUAlphaState *env, const AlphaIPRegInfo *ri)
     return ret;
 }
 
+/* TB invalidation does not clear the EV4 PTE readback holding registers. */
 static void ev4_itbzap_write(CPUAlphaState *env, const AlphaIPRegInfo *ri,
                              uint64_t value)
 {
-    env->ipr.itb_pte = 0;
-    env->ipr.itb_pte_temp = 0;
     alpha_tlb_flush_all(env, AlphaTLBType_Instruction);
 }
 
 static void ev4_itbasm_write(CPUAlphaState *env, const AlphaIPRegInfo *ri,
                               uint64_t value)
 {
-    env->ipr.itb_pte = 0;
-    env->ipr.itb_pte_temp = 0;
     alpha_tlb_flush_process(env, AlphaTLBType_Instruction);
 }
 
@@ -1157,8 +1154,6 @@ static void ev4_itbis_write(CPUAlphaState *env, const AlphaIPRegInfo *ri,
 {
     AlphaTLBType type = AlphaTLBType_Instruction;
 
-    env->ipr.itb_pte = 0;
-    env->ipr.itb_pte_temp = 0;
     alpha_tlb_flush_single(env, type, value & R_EV4_ITBIS_VA_MASK,
                            alpha_cur_asn(env, type, 0));
 }
@@ -1393,16 +1388,12 @@ static void ev4_dtb_pte_write(CPUAlphaState *env, const AlphaIPRegInfo *ri,
 static void ev4_dtbzap_write(CPUAlphaState *env, const AlphaIPRegInfo *ri,
                              uint64_t value)
 {
-    env->ipr.dtb_pte = 0;
-    env->ipr.dtb_pte_temp = 0;
     alpha_tlb_flush_all(env, AlphaTLBType_Data);
 }
 
 static void ev4_dtbasm_write(CPUAlphaState *env, const AlphaIPRegInfo *ri,
                               uint64_t value)
 {
-    env->ipr.dtb_pte = 0;
-    env->ipr.dtb_pte_temp = 0;
     alpha_tlb_flush_process(env, AlphaTLBType_Data);
 }
 
@@ -1411,8 +1402,6 @@ static void ev4_dtbis_write(CPUAlphaState *env, const AlphaIPRegInfo *ri,
 {
     AlphaTLBType type = AlphaTLBType_Data;
 
-    env->ipr.dtb_pte = 0;
-    env->ipr.dtb_pte_temp = 0;
     alpha_tlb_flush_single(env, type, value & R_EV4_DTBIS_VA_MASK,
                            alpha_cur_asn(env, type, 0));
 }

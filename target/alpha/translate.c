@@ -856,6 +856,7 @@ typedef struct AlphaHWLDSTParams {
     bool locked;
 } AlphaHWLDSTParams;
 
+/* EV4 PHY+ALT selects physical load-lock/store-conditional; RWC is ignored. */
 static const AlphaHWLDSTParams ev4_hw_ld_mmu_idx[8] = {
     [0b000] = { AlphaMMUIdx_Privileged,         false },
     [0b001] = { AlphaMMUIdx_PrivilegedWChk,     false },
@@ -863,8 +864,8 @@ static const AlphaHWLDSTParams ev4_hw_ld_mmu_idx[8] = {
     [0b011] = { AlphaMMUIdx_AltModeWChk,        false },
     [0b100] = { AlphaMMUIdx_Physical,           false },
     [0b101] = { AlphaMMUIdx_Physical,           false },
-    [0b110] = { AlphaMMUIdx_Privileged,         true },
-    [0b111] = { AlphaMMUIdx_PrivilegedWChk,     true },
+    [0b110] = { AlphaMMUIdx_Physical,           true },
+    [0b111] = { AlphaMMUIdx_Physical,           true },
 };
 
 static const AlphaHWLDSTParams ev4_hw_st_mmu_idx[8] = {
@@ -874,8 +875,8 @@ static const AlphaHWLDSTParams ev4_hw_st_mmu_idx[8] = {
     [0b011] = { AlphaMMUIdx_AltMode,            false },
     [0b100] = { AlphaMMUIdx_Physical,           false },
     [0b101] = { AlphaMMUIdx_Physical,           false },
-    [0b110] = { AlphaMMUIdx_Privileged,         true },
-    [0b111] = { AlphaMMUIdx_Privileged,         true },
+    [0b110] = { AlphaMMUIdx_Physical,           true },
+    [0b111] = { AlphaMMUIdx_Physical,           true },
 };
 
 static const AlphaHWLDSTParams ev5_hw_ld_mmu_idx[32] = {
