@@ -27,6 +27,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/rtc/mc146818rtc.h"
 #include "hw/timer/i8254.h"
+#include "hw/timer/i8254_internal.h"
 #include "system/blockdev.h"
 #include "system/reset.h"
 #include "system/runstate.h"
@@ -65,6 +66,13 @@ struct JensenMachineState {
     MemoryRegion rtc_window, kbd_command, vga_rom, chipctrl0;
     AddressSpace kbd_command_as;
     ISAKBDState *kbd;
+    ISADevice *pit;
+    I8257State *dma[2];
+    MemoryRegion isp_ext;
+    int64_t pit2_pause_time;
+    uint8_t dma_count_high[8], dma_ext_mode[8], dma_chain;
+    uint8_t dma_stop[8][3];
+    uint8_t nmi_control, nmi_extended, nmi_mask;
     bool keyboard_locked;
     PFlashCFI01 *flash[2];
     uint8_t hae, sysctl, spare, local_irqs;
@@ -164,19 +172,250 @@ static const MemoryRegionOps jensen_kbd_command_ops = {
     .valid.max_access_size = 1,
 };
 
-static uint64_t jensen_local_read(void *opaque, hwaddr addr, unsigned size)
+/*
+ * 82357 ISP additions, DEC EK-A0638-TD.001 chapters 16 and 18.
+ * The common DMA model still performs legacy transfers. Extended counts,
+ * buffer chaining and ring-buffer transfers are not implemented here.
+ */
+/*
+ * The common PIT leaves mode-0/4 gate inhibition unimplemented. Keep
+ * channel 2's time origin paused on Jensen while its counting gate is low.
+ * Modes 1 and 5 use the gate only as a trigger and must keep counting.
+ */
+static void jensen_pit2_sync(JensenMachineState *s)
+{
+    PITChannelState *ch = &PIT_COMMON(s->pit)->channels[2];
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (!ch->gate && (ch->mode == 0 || ch->mode == 4)) {
+        ch->count_load_time = MIN(ch->count_load_time +
+                                 now - s->pit2_pause_time, now);
+    }
+    s->pit2_pause_time = now;
+}
+
+static void jensen_nmi_update(JensenMachineState *s)
+{
+    bool pending = (s->nmi_extended & 0xe0) || (s->nmi_control & 0xc0);
+
+    qemu_set_irq(qdev_get_gpio_in(DEVICE(s->cpu), ALPHA_CPU_INPUT_IRQ2),
+                 pending && !s->nmi_mask);
+}
+
+static uint64_t jensen_isp_read(void *opaque, hwaddr addr, unsigned size)
 {
     JensenMachineState *s = opaque;
-    return address_space_ldub(&s->io_as, (addr >> 9) & 0xffff,
-                              MEMTXATTRS_UNSPECIFIED, NULL);
+    PITChannelInfo info;
+    unsigned channel;
+
+    jensen_pit2_sync(s);
+
+    switch (addr) {
+    case 0x61:
+        pit_get_channel_info(s->pit, 2, &info);
+        /* Refresh status follows the existing PIT refresh counter. */
+        {
+            PITChannelInfo refresh;
+            pit_get_channel_info(s->pit, 1, &refresh);
+            return s->nmi_control | (info.out << 5) | (refresh.out << 4);
+        }
+    case 0x70:
+        return s->nmi_mask << 7;
+    case 0x461:
+        return s->nmi_extended;
+    case 0x4d4:
+        return s->dma_chain & 0xef;
+    case 0x40a:
+        return 0; /* No chain-buffer interrupts without chained transfers. */
+    }
+    if (addr >= 0x401 && addr <= 0x407 && (addr & 1)) {
+        return s->dma_count_high[(addr - 0x401) / 2];
+    }
+    if (addr == 0x4c6 || addr == 0x4ca || addr == 0x4ce) {
+        return s->dma_count_high[4 + (addr - 0x4c2) / 4];
+    }
+    channel = (addr - 0x4e0) / 4;
+    if (addr >= 0x4e0 && addr <= 0x4fe && channel != 4 &&
+        (addr & 3) < 3) {
+        return s->dma_stop[channel][addr & 3];
+    }
+    return 0xff;
+}
+
+static void jensen_isp_write(void *opaque, hwaddr addr,
+                              uint64_t value, unsigned size)
+{
+    JensenMachineState *s = opaque;
+    unsigned channel;
+
+    switch (addr) {
+    case 0x61:
+        s->nmi_control = value & 0x0f;
+        pit_set_gate(s->pit, 2, value & 1);
+        jensen_nmi_update(s);
+        return;
+    case 0x70:
+        s->nmi_mask = (value >> 7) & 1;
+        jensen_nmi_update(s);
+        return;
+    case 0x461:
+        /* Disabling each source clears its latched pending indication. */
+        s->nmi_extended = (s->nmi_extended & ((value & 0x0e) << 4)) |
+                          (value & 0x0f);
+        jensen_nmi_update(s);
+        return;
+    case 0x462:
+        if (s->nmi_extended & 2) {
+            s->nmi_extended |= 0x20;
+        }
+        jensen_nmi_update(s);
+        return;
+    case 0x40a:
+    case 0x4d4:
+        channel = (value & 3) + (addr == 0x4d4 ? 4 : 0);
+        s->dma_chain = deposit32(s->dma_chain, channel, 1, !!(value & 4));
+        if (value & 4) {
+            qemu_log_mask(LOG_UNIMP,
+                          "Jensen: chained DMA transfers unsupported\n");
+        }
+        return;
+    case 0x40b:
+    case 0x4d6:
+        channel = (value & 3) + (addr == 0x4d6 ? 4 : 0);
+        s->dma_ext_mode[channel] = value & 0xfc;
+        s->dma_chain &= ~(1 << channel);
+        return;
+    }
+    if (addr >= 0x401 && addr <= 0x407 && (addr & 1)) {
+        s->dma_count_high[(addr - 0x401) / 2] = value;
+    } else if (addr == 0x4c6 || addr == 0x4ca || addr == 0x4ce) {
+        s->dma_count_high[4 + (addr - 0x4c2) / 4] = value;
+    } else if (addr >= 0x4e0 && addr <= 0x4fe &&
+               (addr - 0x4e0) / 4 != 4 && (addr & 3) < 3) {
+        s->dma_stop[(addr - 0x4e0) / 4][addr & 3] =
+            value & ((addr & 3) == 0 ? 0xfc : 0xff);
+    }
+}
+
+static const MemoryRegionOps jensen_isp_ops = {
+    .read = jensen_isp_read,
+    .write = jensen_isp_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 1,
+};
+
+/* Side effects on the extended registers when legacy DMA is programmed. */
+static void jensen_dma_legacy_write(JensenMachineState *s, hwaddr port,
+                                     uint8_t value)
+{
+    static const int page_channel[16] = {
+        -1, 2, 3, 1, -1, -1, -1, 0, -1, 6, 7, 5, -1, -1, -1, -1
+    };
+    int channel = -1, controller = -1;
+    unsigned reg = 0;
+
+    jensen_pit2_sync(s);
+
+    if (port < 8) {
+        channel = port / 2;
+        reg = port & 1;
+    } else if (port >= 0xc0 && port < 0xd0 && !(port & 1)) {
+        channel = 4 + (port - 0xc0) / 4;
+        reg = (port >> 1) & 1;
+    } else if (port >= 0x80 && port < 0x90) {
+        channel = page_channel[port & 15];
+    }
+    if (channel >= 0) {
+        if (reg) {
+            s->dma_count_high[channel] = 0;
+        } else {
+            s->dma[channel / 4]->regs[channel & 3].pageh = 0;
+        }
+    }
+    if (port == 0x0d || port == 0xda) {
+        controller = port == 0xda;
+        memset(s->dma_count_high + controller * 4, 0, 4);
+        s->dma_chain &= ~(0x0f << (controller * 4));
+        for (channel = 0; channel < 4; channel++) {
+            s->dma[controller]->regs[channel].pageh = 0;
+        }
+    } else if (port == 0x0b || port == 0xd6) {
+        channel = (value & 3) + (port == 0xd6 ? 4 : 0);
+        s->dma_chain &= ~(1 << channel);
+    }
+}
+
+static uint16_t jensen_pit2_stopped_count(JensenMachineState *s)
+{
+    PITChannelState *ch = &PIT_COMMON(s->pit)->channels[2];
+    int64_t elapsed = MAX(s->pit2_pause_time - ch->count_load_time, 0);
+    uint64_t ticks = muldiv64(elapsed, PIT_FREQ, NANOSECONDS_PER_SECOND);
+
+    return ch->count - ticks;
+}
+
+static uint8_t jensen_io_read_byte(JensenMachineState *s, hwaddr port)
+{
+    PITChannelState *ch = &PIT_COMMON(s->pit)->channels[2];
+    uint16_t count;
+    MemTxResult result;
+    uint8_t value;
+
+    jensen_pit2_sync(s);
+    if (port == 0x0f || port == 0xde) {
+        return s->dma[port == 0xde]->mask & 0x0f;
+    }
+    if (port == 0x42 && !ch->gate && (ch->mode == 0 || ch->mode == 4) &&
+        !ch->status_latched && !ch->count_latched) {
+        count = jensen_pit2_stopped_count(s);
+        switch (ch->read_state) {
+        case 2: /* MSB */
+            return count >> 8;
+        case 3: /* LSB, then MSB */
+            ch->read_state = 4;
+            return count;
+        case 4: /* MSB, then LSB */
+            ch->read_state = 3;
+            return count >> 8;
+        default:
+            return count;
+        }
+    }
+    value = address_space_ldub(&s->io_as, port,
+                               MEMTXATTRS_UNSPECIFIED, &result);
+    return result == MEMTX_OK ? value : 0xff;
+}
+
+static void jensen_io_write_byte(JensenMachineState *s, hwaddr port,
+                                   uint8_t value)
+{
+    PITChannelState *ch = &PIT_COMMON(s->pit)->channels[2];
+    bool loads_count = port == 0x42 && ch->write_state != 3;
+    bool was_latched = ch->count_latched;
+
+    jensen_dma_legacy_write(s, port, value);
+    address_space_stb(&s->io_as, port, value, MEMTXATTRS_UNSPECIFIED, NULL);
+    if (!ch->gate && (ch->mode == 0 || ch->mode == 4)) {
+        if (loads_count) {
+            /* A newly loaded stopped counter has consumed no clocks. */
+            ch->count_load_time = s->pit2_pause_time;
+        }
+        if (port == 0x43 && !was_latched && ch->count_latched) {
+            ch->latched_count = jensen_pit2_stopped_count(s);
+        }
+    }
+}
+
+static uint64_t jensen_local_read(void *opaque, hwaddr addr, unsigned size)
+{
+    return jensen_io_read_byte(opaque, (addr >> 9) & 0xffff);
 }
 
 static void jensen_local_write(void *opaque, hwaddr addr,
                                uint64_t value, unsigned size)
 {
-    JensenMachineState *s = opaque;
-    address_space_stb(&s->io_as, (addr >> 9) & 0xffff, value,
-                      MEMTXATTRS_UNSPECIFIED, NULL);
+    jensen_io_write_byte(opaque, (addr >> 9) & 0xffff, value);
 }
 
 static const MemoryRegionOps jensen_local_ops = {
@@ -224,8 +463,12 @@ static uint64_t jensen_sparse_read(JensenMachineState *s, AddressSpace *as,
     uint64_t value = 0;
     unsigned i;
 
-    if (address_space_read(as, busaddr, MEMTXATTRS_UNSPECIFIED, data, len) !=
-        MEMTX_OK) {
+    if (as == &s->io_as) {
+        for (i = 0; i < len; i++) {
+            data[i] = jensen_io_read_byte(s, busaddr + i);
+        }
+    } else if (address_space_read(as, busaddr, MEMTXATTRS_UNSPECIFIED,
+                                  data, len) != MEMTX_OK) {
         memset(data, 0xff, len); /* Empty EISA slots float high. */
     }
     for (i = 0; i < len; i++) {
@@ -245,8 +488,13 @@ static void jensen_sparse_write(JensenMachineState *s, AddressSpace *as,
     value >>= (busaddr & 3) * 8;
     for (i = 0; i < len; i++) {
         data[i] = value >> (i * 8);
+        if (as == &s->io_as) {
+            jensen_io_write_byte(s, busaddr + i, data[i]);
+        }
     }
-    address_space_write(as, busaddr, MEMTXATTRS_UNSPECIFIED, data, len);
+    if (as != &s->io_as) {
+        address_space_write(as, busaddr, MEMTXATTRS_UNSPECIFIED, data, len);
+    }
 }
 
 static uint64_t jensen_eisa_io_read(void *opaque, hwaddr addr, unsigned size)
@@ -403,6 +651,14 @@ static void jensen_reset(void *opaque)
     s->inta_second = false;
     s->inta_vector = 0;
     s->rtc_index = 0;
+    memset(s->dma_count_high, 0, sizeof(s->dma_count_high));
+    memset(s->dma_ext_mode, 0, sizeof(s->dma_ext_mode));
+    memset(s->dma_stop, 0, sizeof(s->dma_stop));
+    s->dma_chain = 0;
+    s->nmi_control = s->nmi_extended = s->nmi_mask = 0;
+    jensen_nmi_update(s);
+    pit_set_gate(s->pit, 2, 0);
+    s->pit2_pause_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     mc146818rtc_set_cmos_data(s->rtc, 0x69, 0x9d);
     mc146818rtc_set_cmos_data(s->rtc, 0x6a, 0x07);
     s->sysctl = ms->ram_size == 128 * MiB ? 0xa0 : 0x20;
@@ -511,9 +767,15 @@ static void jensen_init(MachineState *machine)
     pic = i8259_init(bus, qdev_get_gpio_in(DEVICE(s->cpu),
                                          ALPHA_CPU_INPUT_IRQ1));
     isa_bus_register_input_irqs(bus, pic);
-    i8254_pit_init(bus, 0x40, 0, NULL);
+    s->pit = i8254_pit_init(bus, 0x40, 0, NULL);
     /* PC/AT-compatible DMA subset of the 82357, including high page ports. */
     i8257_dma_init(OBJECT(machine), bus, true);
+    s->dma[0] = I8257(bus->dma[0]);
+    s->dma[1] = I8257(bus->dma[1]);
+    memory_region_init_io(&s->isp_ext, OBJECT(s), &jensen_isp_ops, s,
+                          "jensen-isp-extended", 0x500);
+    /* The common DMA high-page and PIC ELCR mappings take precedence. */
+    memory_region_add_subregion_overlap(&s->isa_io, 0, &s->isp_ext, -1);
     fdc = isa_new(TYPE_ISA_FDC);
     for (i = 0; i < MAX_FD; i++) {
         floppy_drive[i] = drive_get(IF_FLOPPY, 0, i);
