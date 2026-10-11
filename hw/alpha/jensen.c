@@ -807,6 +807,7 @@ static void jensen_init(MachineState *machine)
     /* The common DMA high-page and PIC ELCR mappings take precedence. */
     memory_region_add_subregion_overlap(&s->isa_io, 0, &s->isp_ext, -1);
     fdc = isa_new(TYPE_ISA_FDC);
+    qdev_prop_set_bit(DEVICE(fdc), "jensen-mode", true);
     for (i = 0; i < MAX_FD; i++) {
         floppy_drive[i] = drive_get(IF_FLOPPY, 0, i);
     }
