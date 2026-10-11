@@ -44,6 +44,8 @@ struct JensenS3State {
     uint16_t multi[16], multi_latch;
     uint8_t dac_command[4], cursor_ram[1024], cursor32_ram[256];
     uint8_t cursor_palette[12];
+    uint32_t hwcursor_fg, hwcursor_bg;
+    uint8_t hwcursor_color_index;
     int cursor_last_y, cursor_last_size;
     uint16_t dac_addr, cursor_x, cursor_y;
     uint8_t dac_component;
@@ -78,10 +80,16 @@ static unsigned s3_pitch(JensenS3State *s)
     return offset * 8;
 }
 
+static bool s3_cursor_external(JensenS3State *s)
+{
+    /* Same Bt485 routing as the Metheus 928 in 86Box. */
+    return s->vga.cr[0x55] & 0x28;
+}
+
 /* Bt485 coordinates include a one-cursor-width/height bias. */
 static unsigned s3_cursor_size(JensenS3State *s)
 {
-    return s->dac_command[3] & 4 ? 64 : 32;
+    return !s3_cursor_external(s) || (s->dac_command[3] & 4) ? 64 : 32;
 }
 
 static uint8_t *s3_cursor_ram(JensenS3State *s)
@@ -91,17 +99,23 @@ static uint8_t *s3_cursor_ram(JensenS3State *s)
 
 static bool s3_cursor_enabled(JensenS3State *s)
 {
-    bool external = s->vga.cr[0x55] & 0x28;
+    if (s3_cursor_external(s)) {
+        return s->dac_command[2] & 3;
+    }
+    return s3_packed(s) && (s->vga.cr[0x45] & 1);
+}
 
-    /* CR55 selects the external DAC cursor instead of the S3 VRAM cursor. */
-    return external && (s->dac_command[2] & 3);
+static int s3_cursor_top(JensenS3State *s)
+{
+    return s3_cursor_external(s) ? (int)s->cursor_y - s3_cursor_size(s) :
+        ((s->vga.cr[0x48] & 7) << 8) | s->vga.cr[0x49];
 }
 
 static void s3_cursor_invalidate(VGACommonState *vga)
 {
     JensenS3State *s = container_of(vga, JensenS3State, vga);
     int size = s3_cursor_size(s);
-    int y = (int)s->cursor_y - size;
+    int y = s3_cursor_top(s);
 
     /*
      * Redraw the framebuffer under both positions before applying the cursor.
@@ -113,6 +127,76 @@ static void s3_cursor_invalidate(VGACommonState *vga)
     s->cursor_last_y = y;
     vga_invalidate_scanlines(vga, MAX(0, y),
                              MAX(0, y + s->cursor_last_size));
+}
+
+/* S3 DB02-C 11.3.13: interleaved 16-bit AND/XOR words in offscreen VRAM. */
+static void s3_vram_cursor_line(JensenS3State *s, uint32_t *pixels, int y,
+                                int width, int bpp)
+{
+    VGACommonState *vga = &s->vga;
+    int row = y - s3_cursor_top(s) + (vga->cr[0x4f] & 63);
+    int x = ((vga->cr[0x46] & 7) << 8) | vga->cr[0x47];
+    int xoff = vga->cr[0x4e] & 63;
+    unsigned step = (bpp == 15 || bpp == 16) && !(vga->cr[0x45] & 4) ? 2 : 1;
+    unsigned base = (((vga->cr[0x4c] << 8) | vga->cr[0x4d]) & 0xfff) * 1024;
+    uint32_t colors[2] = { s->hwcursor_bg, s->hwcursor_fg };
+    int i;
+
+    if (!s3_cursor_enabled(s) || y < s3_cursor_top(s) || row >= 64) {
+        return;
+    }
+    /* 928 true-color cursor X is counted in two-byte units. */
+    if (bpp == 15 || bpp == 16 || bpp == 32) {
+        x >>= 1;
+    }
+    for (i = 0; i < 2; i++) {
+        uint32_t color = colors[i];
+        if (bpp == 8) {
+            const uint8_t *rgb =
+                &vga->palette[vga->cr[i ? 0x0e : 0x0f] * 3];
+            colors[i] = vga->dac_8bit ? rgb_to_pixel32(rgb[0], rgb[1], rgb[2]) :
+                rgb_to_pixel32(c6_to_8(rgb[0]), c6_to_8(rgb[1]),
+                               c6_to_8(rgb[2]));
+        } else if (bpp == 15 || bpp == 16) {
+            unsigned red = (color >> (bpp == 15 ? 10 : 11)) & 31;
+            unsigned green = (color >> 5) & (bpp == 15 ? 31 : 63);
+            unsigned blue = color & 31;
+            colors[i] = rgb_to_pixel32((red << 3) | (red >> 2),
+                bpp == 15 ? (green << 3) | (green >> 2) :
+                            (green << 2) | (green >> 4),
+                (blue << 3) | (blue >> 2));
+        }
+    }
+    for (i = 0; x + i < width && xoff + i * step < 64; i++) {
+        unsigned col = xoff + i * step;
+        unsigned addr = base + row * 16 + (col / 16) * 4;
+        unsigned bit = 7 - (col & 7);
+        unsigned and_bit, xor_bit;
+
+        /* CR45.4 stores the masks at the right of 1280-pixel scanlines. */
+        if (vga->cr[0x45] & 0x10) {
+            if (vga->cr[0x3a] & 0x10) {
+                addr = (addr & ~0xe00) | ((addr & 0x200) << 2) | 0x600;
+            } else if ((vga->gr[5] & 0x60) == 0x20) {
+                addr = (addr & ~0xf00) | ((addr & 0x300) << 2) | 0x300;
+            }
+        }
+        addr += (col & 15) / 8;
+        if (addr + 2 >= vga->vram_size) {
+            continue;
+        }
+        and_bit = (vga->vram_ptr[addr] >> bit) & 1;
+        xor_bit = (vga->vram_ptr[addr + 2] >> bit) & 1;
+        if (vga->cr[0x55] & 0x10) {
+            if (and_bit) {
+                pixels[x + i] = colors[xor_bit];
+            }
+        } else if (!and_bit) {
+            pixels[x + i] = colors[xor_bit];
+        } else if (xor_bit) {
+            pixels[x + i] ^= 0x00ffffff;
+        }
+    }
 }
 
 static void s3_cursor_draw_line(VGACommonState *vga, uint8_t *dest, int y)
@@ -146,6 +230,10 @@ static void s3_cursor_draw_line(VGACommonState *vga, uint8_t *dest, int y)
         }
     }
 
+    if (!s3_cursor_external(s)) {
+        s3_vram_cursor_line(s, pixels, y, width, bpp);
+        return;
+    }
     if (!s3_cursor_enabled(s) || row < 0 || row >= size) {
         return;
     }
@@ -921,6 +1009,9 @@ static uint64_t s3_vga_read(void *opaque, hwaddr addr, unsigned size)
         value = s3_dac_read(s, port);
     } else if ((port == 0x3b5 || port == 0x3d5) && vga->cr_index >= 0x30) {
         value = vga->cr[vga->cr_index];
+        if (vga->cr_index == 0x45) {
+            s->hwcursor_color_index = 0;
+        }
         if (vga->cr_index == 0x30 &&
             (vga->cr[0x38] & 0xcc) != 0x48 &&
             (vga->cr[0x39] & 0xe0) != 0xa0) {
@@ -955,6 +1046,15 @@ static void s3_vga_write(void *opaque, hwaddr addr, uint64_t value,
             return;
         }
         vga->cr[index] = value;
+        if (index == 0x4a || index == 0x4b) {
+            unsigned shift = s->hwcursor_color_index * 8;
+            uint32_t *color = index == 0x4a ? &s->hwcursor_fg : &s->hwcursor_bg;
+            if (shift < 24) {
+                *color = (*color & ~(0xffu << shift)) |
+                         ((value & 0xff) << shift);
+            }
+            s->hwcursor_color_index = (s->hwcursor_color_index + 1) & 3;
+        }
         if (index == 0x50 && (value & 0x30) == 0x30) {
             s->multi[14] &= ~0x10;
         }
@@ -1119,6 +1219,7 @@ static void s3_reset(DeviceState *dev)
     memset(s->dac_command, 0, sizeof(s->dac_command));
     memset(s->cursor_ram, 0, sizeof(s->cursor_ram));
     memset(s->cursor32_ram, 0, sizeof(s->cursor32_ram));
+    s->hwcursor_fg = s->hwcursor_bg = s->hwcursor_color_index = 0;
     s->cursor_last_y = s->cursor_last_size = 0;
     memset(s->cursor_palette, 0, sizeof(s->cursor_palette));
     s->dac_addr = s->cursor_x = s->cursor_y = s->dac_component = 0;
