@@ -1743,6 +1743,18 @@ static void fdctrl_jensen_pio_ack(FDCtrl *fdctrl)
     }
 }
 
+static void fdctrl_jensen_pio_complete(FDCtrl *fdctrl)
+{
+    /*
+     * 82077AA 4.2.5: EOT without DMA terminal count is an implied TC,
+     * reported as abnormal termination with ST1.EN. ARC accepts this
+     * expected end condition; a zero status would make it retry the read.
+     * Keep CHRN on the final sector, as in 86Box's non-DMA EOT path.
+     */
+    fdctrl->status0 &= ~FD_SR0_SEEK;
+    fdctrl_stop_transfer(fdctrl, FD_SR0_ABNTERM, FD_SR1_EC, 0);
+}
+
 /* Data register : 0x05 */
 static uint32_t fdctrl_read_data(FDCtrl *fdctrl)
 {
@@ -1788,10 +1800,11 @@ static uint32_t fdctrl_read_data(FDCtrl *fdctrl)
             /* Result bytes share the FIFO with short DTL payloads. */
             retval = fdctrl->fifo[pos];
             fdctrl->msr &= ~FD_MSR_RQM;
-            fdctrl_stop_transfer(fdctrl, 0x00, 0x00, 0x00);
             if (fdctrl->jensen_mode) {
+                fdctrl_jensen_pio_complete(fdctrl);
                 return retval;
             }
+            fdctrl_stop_transfer(fdctrl, 0x00, 0x00, 0x00);
         }
         break;
 
@@ -2297,13 +2310,15 @@ static void fdctrl_write_data(FDCtrl *fdctrl, uint32_t value)
                 }
                 break;
             }
+            if (fdctrl->jensen_mode &&
+                fdctrl->data_pos == fdctrl->data_len) {
+                fdctrl_jensen_pio_complete(fdctrl);
+                break;
+            }
             if (!fdctrl_seek_to_next_sect(fdctrl, cur_drv)) {
                 if (fdctrl->jensen_mode) {
-                    /* Reaching EOT on the final byte completes the write. */
-                    bool done = fdctrl->data_pos == fdctrl->data_len;
-
-                    fdctrl_stop_transfer(fdctrl, done ? 0 : FD_SR0_ABNTERM,
-                                         done ? 0 : FD_SR1_EC, 0);
+                    fdctrl_stop_transfer(fdctrl, FD_SR0_ABNTERM,
+                                         FD_SR1_EC, 0);
                 }
                 FLOPPY_DPRINTF("error seeking to next sector %d\n",
                                fd_sector(cur_drv));

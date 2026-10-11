@@ -794,7 +794,7 @@ static void jensen_init(MachineState *machine)
                           "jensen-system-board-id", 4);
     memory_region_add_subregion(&s->isa_io, 0xc80, &s->board_id);
     bus = isa_bus_new(NULL, &s->isa_mem, &s->isa_io, &error_fatal);
-    pic = i8259_init(bus, qdev_get_gpio_in(DEVICE(s->cpu),
+    pic = i82357_pic_init(bus, qdev_get_gpio_in(DEVICE(s->cpu),
                                          ALPHA_CPU_INPUT_IRQ1));
     isa_bus_register_input_irqs(bus, pic);
     s->pit = i8254_pit_init(bus, 0x40, 0, NULL);

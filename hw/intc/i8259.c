@@ -38,6 +38,7 @@
 //#define DEBUG_IRQ_LATENCY
 
 #define TYPE_I8259 "isa-i8259"
+#define TYPE_I82357_PIC "isa-82357-pic"
 typedef struct PICClass PICClass;
 DECLARE_CLASS_CHECKERS(PICClass, PIC,
                        TYPE_I8259)
@@ -50,6 +51,7 @@ struct PICClass {
     PICCommonClass parent_class;
 
     DeviceRealize parent_realize;
+    bool eisa_82357;
 };
 
 #ifdef DEBUG_IRQ_LATENCY
@@ -151,6 +153,14 @@ static void pic_set_irq(void *opaque, int irq, int level)
             s->last_irr |= mask;
         } else {
             s->last_irr &= ~mask;
+            if (PIC_GET_CLASS(s)->eisa_82357) {
+                /*
+                 * EK-A0638-TD.001 17-28: even edge requests must remain
+                 * asserted until the first INTA. Withdraw a released source
+                 * without clearing an already acknowledged ISR bit.
+                 */
+                s->irr &= ~mask;
+            }
         }
     }
     pic_update_irq(s);
@@ -244,7 +254,8 @@ static void pic_ioport_write(void *opaque, hwaddr addr64,
             s->init_state = 1;
             s->init4 = val & 1;
             s->single_mode = val & 2;
-            s->ltim = val & 8;
+            /* The EISA ISP uses ELCR; ICW1.LTIM is disabled (17-28). */
+            s->ltim = PIC_GET_CLASS(s)->eisa_82357 ? 0 : val & 8;
         } else if (val & 0x08) {
             if (val & 0x04) {
                 s->poll = 1;
@@ -404,7 +415,8 @@ static void pic_realize(DeviceState *dev, Error **errp)
     pc->parent_realize(dev, errp);
 }
 
-qemu_irq *i8259_init(ISABus *bus, qemu_irq parent_irq_in)
+static qemu_irq *pic_init(ISABus *bus, qemu_irq parent_irq_in,
+                          const char *type)
 {
     qemu_irq *irq_set;
     DeviceState *dev;
@@ -413,7 +425,7 @@ qemu_irq *i8259_init(ISABus *bus, qemu_irq parent_irq_in)
 
     irq_set = g_new0(qemu_irq, ISA_NUM_IRQS);
 
-    isadev = i8259_init_chip(TYPE_I8259, bus, true);
+    isadev = i8259_init_chip(type, bus, true);
     dev = DEVICE(isadev);
 
     qdev_connect_gpio_out(dev, 0, parent_irq_in);
@@ -423,7 +435,7 @@ qemu_irq *i8259_init(ISABus *bus, qemu_irq parent_irq_in)
 
     isa_pic = PIC_COMMON(dev);
 
-    isadev = i8259_init_chip(TYPE_I8259, bus, false);
+    isadev = i8259_init_chip(type, bus, false);
     dev = DEVICE(isadev);
 
     qdev_connect_gpio_out(dev, 0, irq_set[2]);
@@ -434,6 +446,22 @@ qemu_irq *i8259_init(ISABus *bus, qemu_irq parent_irq_in)
     slave_pic = PIC_COMMON(dev);
 
     return irq_set;
+}
+
+qemu_irq *i8259_init(ISABus *bus, qemu_irq parent_irq_in)
+{
+    return pic_init(bus, parent_irq_in, TYPE_I8259);
+}
+
+qemu_irq *i82357_pic_init(ISABus *bus, qemu_irq parent_irq_in)
+{
+    return pic_init(bus, parent_irq_in, TYPE_I82357_PIC);
+}
+
+static void i82357_pic_class_init(ObjectClass *klass, void *data)
+{
+    PIC_CLASS(klass)->eisa_82357 = true;
+    DEVICE_CLASS(klass)->desc = "82357 EISA interrupt controller";
 }
 
 static void i8259_class_init(ObjectClass *klass, void *data)
@@ -453,9 +481,16 @@ static const TypeInfo i8259_info = {
     .class_size = sizeof(PICClass),
 };
 
+static const TypeInfo i82357_pic_info = {
+    .name = TYPE_I82357_PIC,
+    .parent = TYPE_I8259,
+    .class_init = i82357_pic_class_init,
+};
+
 static void pic_register_types(void)
 {
     type_register_static(&i8259_info);
+    type_register_static(&i82357_pic_info);
 }
 
 type_init(pic_register_types)
