@@ -12,20 +12,21 @@
 #define ELF_DATA        ELFDATA2LSB
 #define ELF_ARCH        EM_ALPHA
 
-typedef uint64_t        elf_reg_t;
+/* Keep guest ELF types distinct from the host's <sys/procfs.h> types. */
+typedef uint64_t        alpha_elf_reg_t;
 
-typedef struct elf_gregset {
-        elf_reg_t       r_regs[32];
-} QEMU_PACKED elf_gregset_t;
-QEMU_BUILD_BUG_ON(sizeof(elf_gregset_t) != 256);
+typedef struct alpha_elf_gregset {
+        alpha_elf_reg_t       r_regs[32];
+} QEMU_PACKED alpha_elf_gregset_t;
+QEMU_BUILD_BUG_ON(sizeof(alpha_elf_gregset_t) != 256);
 
-typedef struct elf_fpregset {
-        elf_reg_t       fpr_regs[32];
-        elf_reg_t       fpr_cr;
-} QEMU_PACKED elf_fpregset_t;
-QEMU_BUILD_BUG_ON(sizeof(elf_fpregset_t) != 264);
+typedef struct alpha_elf_fpregset {
+        alpha_elf_reg_t       fpr_regs[32];
+        alpha_elf_reg_t       fpr_cr;
+} QEMU_PACKED alpha_elf_fpregset_t;
+QEMU_BUILD_BUG_ON(sizeof(alpha_elf_fpregset_t) != 264);
 
-typedef struct elf_prstatus {
+typedef struct alpha_elf_prstatus {
         int32_t         pr_version;     /* version number of struct */
         int32_t         pr_pad0;
         uint64_t        pr_statussz;    /* sizeof(prstatus_t) */
@@ -35,29 +36,29 @@ typedef struct elf_prstatus {
         int32_t         pr_osreldate;   /* kernel version */
         int32_t         pr_cursig;      /* current signal */
         int32_t         pr_pid;         /* lwp (thread) ID */
-        elf_gregset_t   pr_reg;         /* general purpose registers */
-} QEMU_PACKED elf_prstatus_t;
-QEMU_BUILD_BUG_ON(sizeof(elf_prstatus_t) != 304);
+        alpha_elf_gregset_t   pr_reg;         /* general purpose registers */
+} QEMU_PACKED alpha_elf_prstatus_t;
+QEMU_BUILD_BUG_ON(sizeof(alpha_elf_prstatus_t) != 304);
 
-typedef struct elf_note {
+typedef struct alpha_elf_note {
         Elf64_Nhdr      n_hdr;
         char            n_name[8];      /* align_up(sizeof("FreeBSD"), 4) */
         union {
-                elf_prstatus_t      un_prstatus;
-                elf_fpregset_t      un_prfpregset;
+                alpha_elf_prstatus_t      un_prstatus;
+                alpha_elf_fpregset_t      un_prfpregset;
         } n_un;
-} QEMU_PACKED elf_note_t;
+} QEMU_PACKED alpha_elf_note_t;
 
 #define ELF_OSRELDATE           604000
 #define ELF_PRSTATUS_VERSION    1
 
 #define ELF_CORE_VENDOR         "FreeBSD"
 
-#define ELF_NOTE_SIZE           offsetof(elf_note_t, n_un.un_prstatus)
-#define ELF_PRSTATUS_SIZE       (ELF_NOTE_SIZE + sizeof(elf_prstatus_t))
-#define ELF_PRFPREG_SIZE        (ELF_NOTE_SIZE + sizeof(elf_fpregset_t))
+#define ELF_NOTE_SIZE           offsetof(alpha_elf_note_t, n_un.un_prstatus)
+#define ELF_PRSTATUS_SIZE       (ELF_NOTE_SIZE + sizeof(alpha_elf_prstatus_t))
+#define ELF_PRFPREG_SIZE        (ELF_NOTE_SIZE + sizeof(alpha_elf_fpregset_t))
 
-static inline void alpha_note_init(elf_note_t *note, DumpState *s,
+static inline void alpha_note_init(alpha_elf_note_t *note, DumpState *s,
                                    const char *name, Elf64_Word type,
                                    Elf64_Word descsz)
 {
@@ -74,8 +75,8 @@ static int alpha_write_elf64_prfpreg(WriteCoreDumpFunction f,
                                      CPUAlphaState *env, int cpuid,
                                      DumpState *s)
 {
-    elf_fpregset_t *fpr;
-    elf_note_t note;
+    alpha_elf_fpregset_t *fpr;
+    alpha_elf_note_t note;
     int ret, i;
 
     alpha_note_init(&note, s, ELF_CORE_VENDOR, NT_PRFPREG, sizeof(*fpr));
@@ -97,17 +98,17 @@ static int alpha_cpu_write_elf64_prstatus(WriteCoreDumpFunction f,
                                           CPUAlphaState *env, int cpuid,
                                           DumpState *s)
 {
-    elf_prstatus_t *status;
-    elf_note_t note;
+    alpha_elf_prstatus_t *status;
+    alpha_elf_note_t note;
     int ret, i;
 
     alpha_note_init(&note, s, ELF_CORE_VENDOR, NT_PRSTATUS, sizeof(*status));
 
     status = &note.n_un.un_prstatus;
     status->pr_version = ELF_PRSTATUS_VERSION;
-    status->pr_statussz = sizeof(elf_prstatus_t);
-    status->pr_gregsetsz = sizeof(elf_gregset_t);
-    status->pr_fpregsetsz = sizeof(elf_fpregset_t);
+    status->pr_statussz = sizeof(alpha_elf_prstatus_t);
+    status->pr_gregsetsz = sizeof(alpha_elf_gregset_t);
+    status->pr_fpregsetsz = sizeof(alpha_elf_fpregset_t);
     status->pr_osreldate = ELF_OSRELDATE;
     status->pr_cursig = 0;
     status->pr_pid = cpuid;
