@@ -74,6 +74,8 @@ struct JensenMachineState {
     uint8_t dma_stop[8][3];
     uint8_t nmi_control, nmi_extended, nmi_mask;
     bool keyboard_locked;
+    bool s3_928;
+    char *s3_romfile;
     PFlashCFI01 *flash[2];
     uint8_t hae, sysctl, spare, local_irqs;
     uint8_t inta_vector;
@@ -463,7 +465,10 @@ static uint64_t jensen_sparse_read(JensenMachineState *s, AddressSpace *as,
     uint64_t value = 0;
     unsigned i;
 
-    if (as == &s->io_as) {
+    if (as == &s->io_as && s->s3_928 && busaddr >= 0x4000 &&
+        (busaddr & 0x3fc) == 0x2e8) {
+        address_space_read(as, busaddr, MEMTXATTRS_UNSPECIFIED, data, len);
+    } else if (as == &s->io_as) {
         for (i = 0; i < len; i++) {
             data[i] = jensen_io_read_byte(s, busaddr + i);
         }
@@ -488,11 +493,13 @@ static void jensen_sparse_write(JensenMachineState *s, AddressSpace *as,
     value >>= (busaddr & 3) * 8;
     for (i = 0; i < len; i++) {
         data[i] = value >> (i * 8);
-        if (as == &s->io_as) {
+        if (as == &s->io_as && !(s->s3_928 && busaddr >= 0x4000 &&
+                               (busaddr & 0x3fc) == 0x2e8)) {
             jensen_io_write_byte(s, busaddr + i, data[i]);
         }
     }
-    if (as != &s->io_as) {
+    if (as != &s->io_as || (s->s3_928 && busaddr >= 0x4000 &&
+                               (busaddr & 0x3fc) == 0x2e8)) {
         address_space_write(as, busaddr, MEMTXATTRS_UNSPECIFIED, data, len);
     }
 }
@@ -816,12 +823,21 @@ static void jensen_init(MachineState *machine)
     serial_mm_init(&s->isa_io, 0x2f8, 0,
                    qemu_allocate_irq(jensen_local_irq, s, 1), 1843200 / 16,
                    serial_hd(1), DEVICE_LITTLE_ENDIAN);
+    if (s->s3_romfile && !s->s3_928) {
+        error_report("s3-romfile requires s3-928=on");
+        exit(EXIT_FAILURE);
+    }
     if (machine->enable_graphics) {
-        vga = isa_vga_init(bus);
+        vga = s->s3_928 ? isa_create_simple(bus, "jensen-s3-928") :
+                          isa_vga_init(bus);
     }
     if (vga) {
-        const char *vga_bios = vga_interface_type == VGA_CIRRUS ?
+        const char *vga_bios = !s->s3_928 && vga_interface_type == VGA_CIRRUS ?
                                "vgabios-cirrus.bin" : "vgabios.bin";
+
+        if (s->s3_928 && s->s3_romfile) {
+            vga_bios = s->s3_romfile;
+        }
 
         /* ARC reads the x86 option ROM through the private EISA bus. */
         memory_region_init_rom(&s->vga_rom, OBJECT(vga), "jensen-vga-rom",
@@ -930,6 +946,34 @@ static void jensen_set_keyboard_locked(Object *obj, bool value, Error **errp)
     JENSEN_MACHINE(obj)->keyboard_locked = value;
 }
 
+static bool jensen_get_s3_928(Object *obj, Error **errp)
+{
+    return JENSEN_MACHINE(obj)->s3_928;
+}
+
+static void jensen_set_s3_928(Object *obj, bool value, Error **errp)
+{
+    JENSEN_MACHINE(obj)->s3_928 = value;
+}
+
+static char *jensen_get_s3_romfile(Object *obj, Error **errp)
+{
+    return g_strdup(JENSEN_MACHINE(obj)->s3_romfile ?: "");
+}
+
+static void jensen_set_s3_romfile(Object *obj, const char *value, Error **errp)
+{
+    JensenMachineState *s = JENSEN_MACHINE(obj);
+
+    if (s->cpu) {
+        error_setg(errp,
+                   "s3-romfile must be set before machine initialization");
+        return;
+    }
+    g_free(s->s3_romfile);
+    s->s3_romfile = *value ? g_strdup(value) : NULL;
+}
+
 static void jensen_finalize(Object *obj)
 {
     JensenMachineState *s = JENSEN_MACHINE(obj);
@@ -938,6 +982,7 @@ static void jensen_finalize(Object *obj)
         fclose(s->rtc_file);
     }
     g_free(s->rtc_ram_file);
+    g_free(s->s3_romfile);
 }
 
 static void jensen_class_init(ObjectClass *oc, void *data)
@@ -956,6 +1001,14 @@ static void jensen_class_init(ObjectClass *oc, void *data)
     mc->max_cpus = 1;
     mc->no_floppy = false;
     mc->no_parallel = true;
+    object_class_property_add_bool(oc, "s3-928", jensen_get_s3_928,
+                                   jensen_set_s3_928);
+    object_class_property_set_description(oc, "s3-928",
+        "Experimental ISA S3 86C928 graphics (default: off)");
+    object_class_property_add_str(oc, "s3-romfile", jensen_get_s3_romfile,
+                                  jensen_set_s3_romfile);
+    object_class_property_set_description(oc, "s3-romfile",
+        "Optional original 86C928 VGA option ROM (requires s3-928=on)");
     object_class_property_add_bool(oc, "keyboard-locked",
                                    jensen_get_keyboard_locked,
                                    jensen_set_keyboard_locked);

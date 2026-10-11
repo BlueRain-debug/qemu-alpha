@@ -47,3 +47,8 @@ jensen_aha_command(uint32_t ecb, unsigned target, unsigned command, unsigned cdb
 jensen_aha_complete(uint32_t ecb, unsigned host, unsigned target, uint32_t residual) "ecb=0x%x host=0x%x target=0x%x residual=%u"
 jensen_aha_ecb(uint32_t ecb, unsigned flags, unsigned flags2, uint32_t data, uint32_t status, uint64_t cdb) "ecb=0x%x flags=0x%x flags2=0x%x data=0x%x status=0x%x cdb=0x%" PRIx64
 jensen_inta_read(uint64_t addr, unsigned size, unsigned vector) "addr=0x%" PRIx64 " size=%u vector=0x%x"
+
+# jensen-s3.c
+jensen_s3_cr(unsigned index, unsigned value, bool write) "index=0x%02x value=0x%02x write=%d"
+jensen_s3_io(unsigned port, uint64_t value, unsigned size, bool write) "port=0x%04x value=0x%" PRIx64 " size=%u write=%d"
+jensen_s3_command(unsigned cmd, unsigned x, unsigned y, unsigned width, unsigned height) "cmd=0x%04x xy=%u,%u size=%u,%u"
