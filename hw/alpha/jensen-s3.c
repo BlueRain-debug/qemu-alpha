@@ -35,28 +35,31 @@ struct JensenS3State {
     VGACommonState vga;
     GraphicHwOps hw_ops;
     MemoryRegion ports, aperture;
-    JensenS3Port accel[18];
+    JensenS3Port accel[19];
     int (*vga_bpp)(VGACommonState *);
     void (*vga_params)(VGACommonState *, VGADisplayParams *);
     void (*vga_resolution)(VGACommonState *, int *, int *);
-    uint16_t reg[16], multi[16], multi_latch;
+    uint32_t reg[17];
+    uint16_t multi[16], multi_latch;
     uint8_t dac_command[4], cursor_ram[1024], cursor_palette[12];
     uint16_t dac_addr, cursor_x, cursor_y;
     uint8_t dac_component;
-    uint32_t progress;
+    uint32_t progress, transfer_data;
+    unsigned transfer_bytes;
+    int line_x, line_y, line_error;
     bool pending, unsupported;
 };
 
 static const uint16_t s3_ports[] = {
     0x42e8, 0x4ae8, 0x82e8, 0x86e8, 0x8ae8, 0x8ee8,
     0x92e8, 0x96e8, 0x9ae8, 0x9ee8, 0xa2e8, 0xa6e8,
-    0xaae8, 0xaee8, 0xb6e8, 0xbae8,
+    0xaae8, 0xaee8, 0xb6e8, 0xbae8, 0xb2e8,
 };
 
 enum {
     SUBSYS, ADVFUNC, CUR_Y, CUR_X, DEST_Y, DEST_X, ERROR_TERM,
     MAJOR, COMMAND, SHORT_STROKE, BACKGROUND, FOREGROUND,
-    WRITE_MASK, READ_MASK, BACK_MIX, FORE_MIX,
+    WRITE_MASK, READ_MASK, BACK_MIX, FORE_MIX, COLOR_COMPARE,
 };
 
 static bool s3_packed(JensenS3State *s)
@@ -66,7 +69,9 @@ static bool s3_packed(JensenS3State *s)
 
 static unsigned s3_pitch(JensenS3State *s)
 {
-    unsigned offset = s->vga.cr[0x13] | ((s->vga.cr[0x51] & 0x30) << 4);
+    unsigned extension = s->vga.cr[0x51] & 0x30;
+    unsigned offset = s->vga.cr[0x13] |
+        (extension ? extension << 4 : (s->vga.cr[0x43] & 4) << 6);
     return offset * 8;
 }
 
@@ -92,8 +97,20 @@ static int s3_bpp(VGACommonState *vga)
     if (!s3_packed(s)) {
         return s->vga_bpp(vga);
     }
-    /* The accelerated model currently implements only indexed 8-bit pixels. */
-    return 8;
+    /* Bt485 24-bit RGB input occupies a 32-bit framebuffer word. */
+    if (!(s->dac_command[2] & 0x20)) {
+        return 8;
+    }
+    switch (s->dac_command[1] & 0x60) {
+    case 0x00:
+        return 32;
+    case 0x20:
+        return s->dac_command[1] & 8 ? 16 : 15;
+    case 0x40:
+        return 8;
+    default:
+        return 0; /* Four-bit VGA shift mode. */
+    }
 }
 
 static void s3_params(VGACommonState *vga, VGADisplayParams *params)
@@ -104,6 +121,10 @@ static void s3_params(VGACommonState *vga, VGADisplayParams *params)
         params->line_offset = s3_pitch(s);
         params->start_addr |= ((vga->cr[0x31] & 0x30) << 12) |
                               ((vga->cr[0x51] & 3) << 18);
+        params->line_compare |= (vga->cr[0x5e] & 0x40) << 4;
+        if ((s->reg[ADVFUNC] & 1) || (vga->cr[0x40] & 8)) {
+            params->line_compare = 0x7fff;
+        }
     }
 }
 
@@ -114,11 +135,20 @@ static void s3_resolution(VGACommonState *vga, int *width, int *height)
     if (s3_packed(s)) {
         *width += (vga->cr[0x5d] & 2) << 10;
         *height += (vga->cr[0x5e] & 2) << 9;
+        if (vga->cr[0x43] & 0x80) {
+            *width *= 2;
+        }
+        /* Bt485 16-bit multiplexing emits two pixels per CRTC clock.
+         * See 86Box's 928/BT48X 15/16-bpp timing calculation. */
+        if ((s->dac_command[2] & 0x20) &&
+            (s->dac_command[1] & 0x60) == 0x20) {
+            *width *= 2;
+        }
     }
 }
 
 /* The sixteen S3 mix functions, independent of the selected pixel source. */
-static uint16_t s3_mix(unsigned mix, uint16_t src, uint16_t dst)
+static uint32_t s3_mix(unsigned mix, uint32_t src, uint32_t dst)
 {
     switch (mix & 15) {
     case 0:
@@ -126,7 +156,7 @@ static uint16_t s3_mix(unsigned mix, uint16_t src, uint16_t dst)
     case 1:
         return 0;
     case 2:
-        return 0xffff;
+        return UINT32_MAX;
     case 3:
         return dst;
     case 4:
@@ -180,7 +210,19 @@ static unsigned s3_engine_pitch(JensenS3State *s)
 
 static unsigned s3_pixel_bytes(JensenS3State *s)
 {
-    return s->vga.cr[0x50] & 0x10 ? 2 : 1;
+    return 1 + ((s->vga.cr[0x50] >> 4) & 3);
+}
+
+/* A pixel can straddle the end of installed VRAM. */
+static uint32_t s3_load_pixel(JensenS3State *s, uint32_t addr)
+{
+    uint32_t value = 0;
+    unsigned i;
+    for (i = 0; i < s3_pixel_bytes(s); i++) {
+        value |= (uint32_t)s->vga.vram_ptr[(addr + i) &
+                 (s->vga.vram_size - 1)] << (i * 8);
+    }
+    return value;
 }
 
 static uint32_t s3_address(JensenS3State *s, int x, int y, bool source)
@@ -190,13 +232,14 @@ static uint32_t s3_address(JensenS3State *s, int x, int y, bool source)
            (s->vga.vram_size - 1);
 }
 
-static void s3_pixel(JensenS3State *s, int x, int y, uint16_t source,
-                     bool foreground, uint16_t cpu)
+static void s3_pixel(JensenS3State *s, int x, int y, uint32_t source,
+                     bool foreground, uint32_t cpu)
 {
     unsigned mix = s->reg[foreground ? FORE_MIX : BACK_MIX];
     uint32_t addr;
     unsigned bytes = s3_pixel_bytes(s);
-    uint16_t old, value, mask = s->reg[WRITE_MASK];
+    uint32_t old, value, mask = s->reg[WRITE_MASK];
+    unsigned i;
     bool inside = x >= s->multi[2] && x <= s->multi[4] &&
                   y >= s->multi[1] && y <= s->multi[3];
     if (!(s->reg[COMMAND] & 0x10) || inside == !!(s->multi[14] & 0x20)) {
@@ -215,28 +258,85 @@ static void s3_pixel(JensenS3State *s, int x, int y, uint16_t source,
     case 3:
         break;
     }
+    if (s->multi[14] & 0x100) {
+        uint32_t planes = bytes == 4 ? UINT32_MAX : (1U << (bytes * 8)) - 1;
+        bool equal = ((source ^ s->reg[COLOR_COMPARE]) & planes) == 0;
+        if (equal != !!(s->multi[14] & 0x80)) {
+            return;
+        }
+    }
     addr = s3_address(s, x, y, false);
-    old = bytes == 2 ? lduw_le_p(s->vga.vram_ptr + addr) :
-                       s->vga.vram_ptr[addr];
+    old = s3_load_pixel(s, addr);
     value = s3_mix(mix, source, old);
     value = (old & ~mask) | (value & mask);
-    if (bytes == 2) {
-        stw_le_p(s->vga.vram_ptr + addr, value);
-    } else {
-        s->vga.vram_ptr[addr] = value;
+    for (i = 0; i < bytes; i++) {
+        uint32_t byte_addr = (addr + i) & (s->vga.vram_size - 1);
+        s->vga.vram_ptr[byte_addr] = value >> (i * 8);
+        memory_region_set_dirty(&s->vga.vram, byte_addr, 1);
     }
-    memory_region_set_dirty(&s->vga.vram, addr, bytes);
 }
 
-static void s3_step(JensenS3State *s, uint16_t cpu, bool foreground)
+static int s3_signed14(uint32_t value)
+{
+    return (int)(value & 0x1fff) - (int)(value & 0x2000);
+}
+
+static const int8_t s3_line_dx[8] = { 1, 1, 0, -1, -1, -1, 0, 1 };
+static const int8_t s3_line_dy[8] = { 0, -1, -1, -1, 0, 1, 1, 1 };
+
+static void s3_line_step(JensenS3State *s, uint32_t cpu, bool foreground)
+{
+    unsigned command = s->reg[COMMAND];
+    unsigned length = s->reg[MAJOR] & 0xfff;
+    bool last = s->progress == length;
+    int dx = command & 0x20 ? 1 : -1;
+    int dy = command & 0x80 ? 1 : -1;
+
+    if (!(last && (command & 4))) {
+        s3_pixel(s, s->line_x, s->line_y, 0, foreground, cpu);
+    }
+    if (!last) {
+        if (command & 8) {
+            unsigned direction = (command >> 5) & 7;
+            s->line_x += s3_line_dx[direction];
+            s->line_y += s3_line_dy[direction];
+        } else {
+            /* The S3 error threshold is MAJ_AXIS_PCNT, as in 86Box. */
+            bool diagonal = s->line_error >= (int)length;
+            if (!(command & 0x40) || diagonal) {
+                s->line_x += dx;
+            }
+            if ((command & 0x40) || diagonal) {
+                s->line_y += dy;
+            }
+            s->line_error = (int16_t)(s->line_error +
+                s3_signed14(s->reg[diagonal ? DEST_X : DEST_Y]));
+        }
+        s->line_x &= 0xfff;
+        s->line_y &= 0xfff;
+    }
+    s->progress++;
+    if (last) {
+        s->reg[CUR_X] = s->line_x;
+        s->reg[CUR_Y] = s->line_y;
+        s->reg[ERROR_TERM] = s->line_error & 0x3fff;
+        s->pending = false;
+    }
+}
+
+static void s3_step(JensenS3State *s, uint32_t cpu, bool foreground)
 {
     unsigned width = (s->reg[MAJOR] & 0xfff) + 1;
     int dx = s->reg[COMMAND] & 0x20 ? 1 : -1;
     int dy = s->reg[COMMAND] & 0x80 ? 1 : -1;
     int x = (s->reg[CUR_X] & 0xfff) + (s->progress % width) * dx;
     int y = (s->reg[CUR_Y] & 0xfff) + (s->progress / width) * dy;
-    uint16_t source = 0;
+    uint32_t source = 0;
     unsigned op = s->reg[COMMAND] >> 13;
+    if (op == 1) {
+        s3_line_step(s, cpu, foreground);
+        return;
+    }
     if (op == 6 || op == 7) {
         uint32_t addr;
         int dest_x = (s->reg[DEST_X] & 0xfff) + (s->progress % width) * dx;
@@ -246,18 +346,29 @@ static void s3_step(JensenS3State *s, uint16_t cpu, bool foreground)
             y = (s->reg[CUR_Y] & 0xfff) + (dest_y & 7);
         }
         addr = s3_address(s, x, y, true);
-        source = s3_pixel_bytes(s) == 2 ?
-                 lduw_le_p(s->vga.vram_ptr + addr) : s->vga.vram_ptr[addr];
+        source = s3_load_pixel(s, addr);
         x = dest_x;
         y = dest_y;
         if ((s->multi[10] & 0xc0) == 0xc0) {
-            foreground = (source & s->reg[READ_MASK]) == s->reg[READ_MASK];
+            uint32_t mask = s->reg[READ_MASK];
+            if (s3_pixel_bytes(s) < 4) {
+                mask &= (1U << (s3_pixel_bytes(s) * 8)) - 1;
+            }
+            foreground = (source & mask) == mask;
             source = foreground;
         }
     }
     s3_pixel(s, x, y, source, foreground, cpu);
     s->progress++;
     if (s->progress == width * ((s->multi[0] & 0xfff) + 1)) {
+        if (!(s->reg[COMMAND] & 0x100)) {
+            unsigned height = (s->multi[0] & 0xfff) + 1;
+            if (op == 2) {
+                s->reg[CUR_Y] = (s->reg[CUR_Y] + height * dy) & 0xfff;
+            } else if (op == 6 || op == 7) {
+                s->reg[DEST_Y] = (s->reg[DEST_Y] + height * dy) & 0xfff;
+            }
+        }
         s->pending = false;
     }
 }
@@ -268,6 +379,10 @@ static void s3_command(JensenS3State *s)
     s->progress = 0;
     s->pending = false;
     s->unsupported = false;
+    s->transfer_data = s->transfer_bytes = 0;
+    s->line_x = s->reg[CUR_X] & 0xfff;
+    s->line_y = s->reg[CUR_Y] & 0xfff;
+    s->line_error = s3_signed14(s->reg[ERROR_TERM]);
     trace_jensen_s3_command(s->reg[COMMAND], s->reg[CUR_X], s->reg[CUR_Y],
                             s->reg[MAJOR] + 1, s->multi[0] + 1);
     trace_jensen_s3_state(s->reg[COMMAND], s->reg[CUR_X], s->reg[CUR_Y],
@@ -279,14 +394,18 @@ static void s3_command(JensenS3State *s)
     if (op == 0) {
         return;
     }
-    if ((op != 2 && op != 6 && op != 7) || (s->vga.cr[0x50] & 0x20) ||
-        (s->multi[14] & 0x100) ||
-        ((s->reg[COMMAND] & 0x100) &&
-         (!(s->reg[COMMAND] & 1) || (s->reg[COMMAND] & 0x600) >= 0x400))) {
+    if (op != 1 && op != 2 && op != 6 && op != 7) {
         s->unsupported = true;
         qemu_log_mask(LOG_UNIMP,
                       "Jensen S3: unsupported command/depth %04x/%02x\n",
                       s->reg[COMMAND], s->vga.cr[0x50]);
+        return;
+    }
+    if ((s->reg[COMMAND] & 0x101) == 0x100 && op != 2) {
+        s->unsupported = true;
+        qemu_log_mask(LOG_UNIMP,
+                      "Jensen S3: unsupported CPU read command %04x\n",
+                      s->reg[COMMAND]);
         return;
     }
     s->pending = true;
@@ -302,31 +421,98 @@ static void s3_transfer(JensenS3State *s, uint32_t value, unsigned size)
     unsigned i, bits = MIN(size * 8,
                            8U << ((s->reg[COMMAND] >> 9) & 3));
     unsigned bytes = s3_pixel_bytes(s);
-    bool mono = (s->multi[10] & 0xc0) == 0x80 ||
-                (s->reg[COMMAND] & 2);
+    bool mono = ((s->multi[10] & 0xc0) == 0x80 ||
+                (s->reg[COMMAND] & 2)) &&
+                !((s->reg[FORE_MIX] & 0x60) == 0x40 &&
+                  (s->reg[BACK_MIX] & 0x60) == 0x40);
     unsigned width = (s->reg[MAJOR] & 0xfff) + 1;
     unsigned row = s->progress / width;
-    if (!s->pending || !(s->reg[COMMAND] & 0x100)) {
+    if (!s->pending || (s->reg[COMMAND] & 0x101) != 0x101) {
         return;
     }
     if ((s->reg[COMMAND] & 0x1000) && bits >= 16 &&
         (mono || bytes == 1)) {
         value = ((value & 0xff00ff00) >> 8) | ((value & 0x00ff00ff) << 8);
     }
-    for (i = 0; i < (mono ? bits : bits / (8 * bytes)) && s->pending; i++) {
-        uint16_t pixel = 0;
-
-        if (!mono) {
-            /* BYTE_SWAP selects byte order, not the bits of a 16-bpp pixel. */
-            unsigned offset = bytes == 1 ? bits - 8 - i * 8 : i * 16;
-            pixel = value >> offset;
+    for (i = 0; i < (mono ? bits : bits / 8) && s->pending; i++) {
+        if (mono) {
+            s3_step(s, 0, !!(value & (1U << (bits - 1 - i))));
+        } else {
+            unsigned offset = bytes == 1 ? bits - 8 - i * 8 : i * 8;
+            s->transfer_data |= ((value >> offset) & 0xff) <<
+                                (s->transfer_bytes * 8);
+            if (++s->transfer_bytes < bytes) {
+                continue;
+            }
+            s3_step(s, s->transfer_data, true);
+            s->transfer_data = s->transfer_bytes = 0;
         }
-        s3_step(s, pixel, !mono || !!(value & (1U << (bits - 1 - i))));
-        /* Every CPU row is padded to the configured transfer width. */
-        if (s->progress / width != row) {
+        /* CPU rectangle rows are padded to the transfer width. */
+        if ((s->reg[COMMAND] >> 13) != 1 && s->progress / width != row) {
             break;
         }
     }
+}
+
+static uint32_t s3_receive(JensenS3State *s, unsigned size)
+{
+    unsigned bits = MIN(size * 8, 8U << ((s->reg[COMMAND] >> 9) & 3));
+    unsigned bytes = s3_pixel_bytes(s);
+    unsigned width = (s->reg[MAJOR] & 0xfff) + 1;
+    unsigned row = s->progress / width;
+    bool mono = (s->multi[10] & 0xc0) == 0xc0;
+    uint32_t value = 0;
+    unsigned i;
+
+    if (!s->pending || (s->reg[COMMAND] & 0x101) != 0x100) {
+        return 0;
+    }
+    for (i = 0; i < (mono ? bits : bits / 8); i++) {
+        if (!s->transfer_bytes && !s->pending) {
+            break;
+        }
+        if (!s->transfer_bytes) {
+            int dx = s->reg[COMMAND] & 0x20 ? 1 : -1;
+            int dy = s->reg[COMMAND] & 0x80 ? 1 : -1;
+            int x = (s->reg[CUR_X] + (s->progress % width) * dx) & 0xfff;
+            int y = (s->reg[CUR_Y] + (s->progress / width) * dy) & 0xfff;
+            s->transfer_data = s3_load_pixel(s, s3_address(s, x, y, false));
+            s->transfer_bytes = bytes;
+        }
+        if (mono) {
+            uint32_t mask = s->reg[READ_MASK];
+            if (bytes < 4) {
+                mask &= (1U << (bytes * 8)) - 1;
+            }
+            value |= (uint32_t)((s->transfer_data & mask) == mask) <<
+                     (bits - 1 - i);
+            s->transfer_bytes = 0;
+        } else {
+            unsigned offset = bytes == 1 ? bits - 8 - i * 8 : i * 8;
+            value |= (s->transfer_data & 0xff) << offset;
+            s->transfer_data >>= 8;
+            s->transfer_bytes--;
+        }
+        if (!s->transfer_bytes) {
+            s->progress++;
+            if (s->progress == width * ((s->multi[0] & 0xfff) + 1)) {
+                s->pending = false;
+            }
+            if (s->progress / width != row) {
+                break;
+            }
+        }
+    }
+    if ((s->reg[COMMAND] & 0x1000) && bits >= 16 && (mono || bytes == 1)) {
+        value = ((value & 0xff00ff00) >> 8) | ((value & 0x00ff00ff) << 8);
+    }
+    return value;
+}
+
+static bool s3_color_register(unsigned index)
+{
+    return index == FOREGROUND || index == BACKGROUND ||
+           index == WRITE_MASK || index == READ_MASK || index == COLOR_COMPARE;
 }
 
 static uint64_t s3_accel_read(void *opaque, hwaddr addr, unsigned size)
@@ -337,13 +523,33 @@ static uint64_t s3_accel_read(void *opaque, hwaddr addr, unsigned size)
     if (!(s->vga.cr[0x40] & 1)) {
         return MAKE_64BIT_MASK(0, size * 8);
     }
-    if ((port & ~3) == 0xbee8) {
-        value = s->multi[s->multi[15] & 15];
+    if ((port & ~3) == 0xe2e8) {
+        value = s3_receive(s, size);
+        trace_jensen_s3_io(port, value, size, false);
+        return value;
+    } else if ((port & ~3) == 0xbee8) {
+        static const uint8_t selectors[7] = { 0, 1, 2, 3, 4, 10, 14 };
+        unsigned index = s->multi[15] & 7;
+        value = index < 7 ? s->multi[selectors[index]] : s->reg[COMMAND];
+        if (size >= 2 || (port & 1)) {
+            s->multi[15] = (index + 1) & 7;
+        }
     } else {
         for (i = 0; i < ARRAY_SIZE(s3_ports); i++) {
             if ((port & ~3) == s3_ports[i]) {
                 value = i == COMMAND ?
-                    ((s->pending || s->unsupported) ? 0x200 : 0) : s->reg[i];
+                    ((s->pending || s->unsupported) ? 0x200 : 0) |
+                    ((s->pending && !(s->reg[COMMAND] & 1)) ? 0x100 : 0) :
+                    s->reg[i];
+                if (s3_color_register(i)) {
+                    if (size <= 2 && s3_pixel_bytes(s) == 4 &&
+                        (s->multi[14] & 0x10)) {
+                        value >>= 16;
+                    }
+                    if (size >= 2 || (port & 1)) {
+                        s->multi[14] ^= 0x10;
+                    }
+                }
                 break;
             }
         }
@@ -362,7 +568,7 @@ static void s3_short_stroke(JensenS3State *s, uint16_t word)
     int y = s->reg[CUR_Y] & 0xfff;
 
     if ((s->reg[COMMAND] >> 13) != 0 || !(s->reg[COMMAND] & 8) ||
-        (s->reg[COMMAND] & 0x100) || (s->vga.cr[0x50] & 0x20)) {
+        (s->reg[COMMAND] & 0x100)) {
         s->unsupported = true;
         qemu_log_mask(LOG_UNIMP, "Jensen S3: unsupported short vector %04x\n",
                       s->reg[COMMAND]);
@@ -413,9 +619,23 @@ static void s3_accel_write(void *opaque, hwaddr addr, uint64_t value,
     }
     for (i = 0; i < ARRAY_SIZE(s3_ports); i++) {
         if ((port & ~3) == s3_ports[i]) {
-            s->reg[i] = (s->reg[i] &
-                         ~(MAKE_64BIT_MASK(0, size * 8) << shift)) |
-                        (value << shift);
+            if (s3_color_register(i)) {
+                if (s3_pixel_bytes(s) == 4 && size <= 2 &&
+                    (s->multi[14] & 0x10)) {
+                    shift += 16;
+                }
+                s->reg[i] = (s->reg[i] &
+                             ~(MAKE_64BIT_MASK(0, size * 8) << shift)) |
+                            (value << shift);
+                if (size == 2 || (port & 1)) {
+                    s->multi[14] ^= 0x10;
+                }
+            } else {
+                s->reg[i] = (s->reg[i] &
+                             ~(MAKE_64BIT_MASK(0, size * 8) << shift)) |
+                            (value << shift);
+                s->reg[i] &= 0xffff;
+            }
             if (i == COMMAND && (size >= 2 || shift == 8)) {
                 s3_command(s);
             } else if (i == SHORT_STROKE && (size >= 2 || shift == 8)) {
@@ -454,7 +674,11 @@ static const MemoryRegionOps s3_accel_ops = {
 
 static unsigned s3_dac_index(JensenS3State *s, unsigned port)
 {
-    return (port & 3) | ((s->vga.cr[0x55] & 3) << 2);
+    unsigned select = s->vga.cr[0x55] & 3;
+    if (!select) {
+        select = (s->vga.cr[0x43] & 2) >> 1;
+    }
+    return (port & 3) | (select << 2);
 }
 
 static uint8_t s3_dac_read(JensenS3State *s, unsigned port)
@@ -488,6 +712,7 @@ static uint8_t s3_dac_read(JensenS3State *s, unsigned port)
 static void s3_dac_write(JensenS3State *s, unsigned port, uint8_t value)
 {
     unsigned index = s3_dac_index(s, port);
+    trace_jensen_s3_dac(index, value);
     switch (index) {
     case 0:
     case 3:
@@ -572,6 +797,7 @@ static void s3_vga_write(void *opaque, hwaddr addr, uint64_t value,
     VGACommonState *vga = &s->vga;
     unsigned port = addr + 0x3b0;
     unsigned index = vga->cr_index;
+    trace_jensen_s3_vga_io(port, value);
     if (port >= 0x3c6 && port <= 0x3c9) {
         s3_dac_write(s, port, value);
     } else if (port == 0x3b4 || port == 0x3d4) {
@@ -586,6 +812,9 @@ static void s3_vga_write(void *opaque, hwaddr addr, uint64_t value,
             return;
         }
         vga->cr[index] = value;
+        if (index == 0x50 && (value & 0x30) == 0x30) {
+            s->multi[14] &= ~0x10;
+        }
         vga->full_update_gfx = true;
     } else {
         vga_ioport_write(vga, port, value);
@@ -607,16 +836,65 @@ static unsigned s3_bank_offset(JensenS3State *s, unsigned bank)
     return (bank << (chain4 ? 16 : 14)) & (size - 1);
 }
 
+static bool s3_mmio(JensenS3State *s, hwaddr addr)
+{
+    return addr < 0x10000 &&
+           ((s->vga.cr[0x53] & 0x10) || (s->reg[ADVFUNC] & 0x20));
+}
+
+static unsigned s3_mmio_port(unsigned addr)
+{
+    switch (addr & ~3) {
+    case 0x8504:
+        return 0x42e8 + (addr & 3);
+    case 0x850c:
+        return 0x4ae8 + (addr & 3);
+    default:
+        return addr;
+    }
+}
+
 static uint64_t s3_memory_read(void *opaque, hwaddr addr, unsigned size)
 {
     JensenS3State *s = opaque;
     unsigned bank = (s->vga.cr[0x35] & 15) | ((s->vga.cr[0x51] & 12) << 2);
-    if (s3_packed(s) && addr < 0x10000) {
-        addr = (bank * 0x10000 + addr) & (s->vga.vram_size - 1);
-        return s->vga.vram_ptr[addr];
+    uint32_t value = 0;
+    unsigned i;
+
+    /* The old 928 MMIO window overlays A0000-AFFFF. Its lower half is
+     * PIX_TRANS, independent of the VGA bank.
+     */
+    if (s3_mmio(s, addr)) {
+        if (addr < 0x8000) {
+            if (size == 4 && (s->reg[COMMAND] & 0x600) == 0x200) {
+                value = s3_accel_read(s, 0xe2e8, 2);
+                value |= s3_accel_read(s, 0xe2e8, 2) << 16;
+                return value;
+            }
+            return s3_accel_read(s, 0xe2e8, size);
+        }
+        if (addr >= 0x83b0 && addr < 0x83e0) {
+            for (i = 0; i < size; i++) {
+                value |= s3_vga_read(s, ((addr + i) & 0x3ff) - 0x3b0, 1) << (i * 8);
+            }
+            return value;
+        }
+        return s3_accel_read(s, s3_mmio_port(addr), size);
     }
-    s->vga.bank_offset = s3_bank_offset(s, bank);
-    return vga_mem_readb(&s->vga, addr);
+    for (i = 0; i < size; i++) {
+        uint32_t byte;
+        if (s3_packed(s) && addr + i < 0x10000) {
+            uint32_t offset = (bank * 0x10000 + addr + i) &
+                              (s->vga.vram_size - 1);
+            byte = s->vga.vram_ptr[offset];
+            trace_jensen_s3_memory(offset, byte, false);
+        } else {
+            s->vga.bank_offset = s3_bank_offset(s, bank);
+            byte = vga_mem_readb(&s->vga, addr + i);
+        }
+        value |= byte << (i * 8);
+    }
+    return value;
 }
 
 static void s3_memory_write(void *opaque, hwaddr addr, uint64_t value,
@@ -624,13 +902,37 @@ static void s3_memory_write(void *opaque, hwaddr addr, uint64_t value,
 {
     JensenS3State *s = opaque;
     unsigned bank = (s->vga.cr[0x35] & 15) | ((s->vga.cr[0x51] & 12) << 2);
-    if (s3_packed(s) && addr < 0x10000) {
-        addr = (bank * 0x10000 + addr) & (s->vga.vram_size - 1);
-        s->vga.vram_ptr[addr] = value;
-        memory_region_set_dirty(&s->vga.vram, addr, 1);
-    } else {
-        s->vga.bank_offset = s3_bank_offset(s, bank);
-        vga_mem_writeb(&s->vga, addr, value);
+    unsigned i;
+
+    if (s3_mmio(s, addr)) {
+        if (addr < 0x8000) {
+            if (size == 4 && (s->reg[COMMAND] & 0x600) == 0x200) {
+                s3_accel_write(s, 0xe2e8, value & 0xffff, 2);
+                s3_accel_write(s, 0xe2e8, value >> 16, 2);
+            } else {
+                s3_accel_write(s, 0xe2e8, value, size);
+            }
+        } else if (addr >= 0x83b0 && addr < 0x83e0) {
+            for (i = 0; i < size; i++) {
+                s3_vga_write(s, ((addr + i) & 0x3ff) - 0x3b0,
+                              value >> (i * 8), 1);
+            }
+        } else {
+            s3_accel_write(s, s3_mmio_port(addr), value, size);
+        }
+        return;
+    }
+    for (i = 0; i < size; i++) {
+        if (s3_packed(s) && addr + i < 0x10000) {
+            uint32_t offset = (bank * 0x10000 + addr + i) &
+                              (s->vga.vram_size - 1);
+            trace_jensen_s3_memory(offset, (value >> (i * 8)) & 0xff, true);
+            s->vga.vram_ptr[offset] = value >> (i * 8);
+            memory_region_set_dirty(&s->vga.vram, offset, 1);
+        } else {
+            s->vga.bank_offset = s3_bank_offset(s, bank);
+            vga_mem_writeb(&s->vga, addr + i, value >> (i * 8));
+        }
     }
 }
 
@@ -639,7 +941,7 @@ static const MemoryRegionOps s3_memory_ops = {
     .write = s3_memory_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = { .min_access_size = 1, .max_access_size = 4 },
-    .impl = { .min_access_size = 1, .max_access_size = 1 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
 };
 
 static void s3_reset(DeviceState *dev)
@@ -654,6 +956,7 @@ static void s3_reset(DeviceState *dev)
     memset(s->cursor_palette, 0, sizeof(s->cursor_palette));
     s->dac_addr = s->cursor_x = s->cursor_y = s->dac_component = 0;
     s->progress = 0;
+    s->transfer_data = s->transfer_bytes = 0;
     s->pending = s->unsupported = false;
     s->vga.cr[0x30] = 0x91; /* 86C928D */
     s->vga.cr[0x36] = 0x8f; /* ISA, 2 MiB, 8-bit ROM */
@@ -693,7 +996,8 @@ static void s3_realize(DeviceState *dev, Error **errp)
     for (i = 0; i < ARRAY_SIZE(s->accel); i++) {
         JensenS3Port *p = &s->accel[i];
         p->state = s;
-        p->port = i < 16 ? s3_ports[i] : i == 16 ? 0xbee8 : 0xe2e8;
+        p->port = i < ARRAY_SIZE(s3_ports) ? s3_ports[i] :
+                  i == ARRAY_SIZE(s3_ports) ? 0xbee8 : 0xe2e8;
         memory_region_init_io(&p->mr, OBJECT(dev), &s3_accel_ops, p,
                               "jensen-s3-engine", 4);
         memory_region_add_subregion(isa_address_space_io(isa), p->port, &p->mr);
