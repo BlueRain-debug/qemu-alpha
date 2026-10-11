@@ -365,6 +365,7 @@ jobs:
             mingw-w64-ucrt-x86_64-pixman
             mingw-w64-ucrt-x86_64-pkgconf
             mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-python-pip
             mingw-w64-ucrt-x86_64-python-setuptools
             mingw-w64-ucrt-x86_64-python-wheel
             mingw-w64-ucrt-x86_64-SDL2
