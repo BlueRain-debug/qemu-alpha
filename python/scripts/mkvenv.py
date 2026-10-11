@@ -615,7 +615,10 @@ def pip_install(
     if not online:
         full_args += ["--no-index"]
     if wheels_dir:
-        full_args += ["--find-links", f"file://{str(wheels_dir)}"]
+        # file://$path is only well-formed when $path starts with a slash.
+        # A Windows drive path (e.g. file://D:/a) has no valid authority, so
+        # pip ignores the location entirely. Generate a proper URI instead.
+        full_args += ["--find-links", str(Path(wheels_dir).resolve().as_uri())]
     full_args += list(args)
     subprocess.run(
         full_args,
