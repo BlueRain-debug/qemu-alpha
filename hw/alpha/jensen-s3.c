@@ -33,6 +33,7 @@ typedef struct JensenS3Port {
 struct JensenS3State {
     ISADevice parent_obj;
     VGACommonState vga;
+    GraphicHwOps hw_ops;
     MemoryRegion ports, aperture;
     JensenS3Port accel[18];
     int (*vga_bpp)(VGACommonState *);
@@ -67,6 +68,22 @@ static unsigned s3_pitch(JensenS3State *s)
 {
     unsigned offset = s->vga.cr[0x13] | ((s->vga.cr[0x51] & 0x30) << 4);
     return offset * 8;
+}
+
+/* Enhanced scanout bypasses the VGA Graphics Controller shift mode. */
+static void s3_update_display(void *opaque)
+{
+    VGACommonState *vga = opaque;
+    JensenS3State *s = container_of(vga, JensenS3State, vga);
+    uint8_t mode = vga->gr[5];
+
+    if (s3_packed(s) &&
+        ((s->reg[ADVFUNC] & 1) || (vga->cr[0x40] & 8))) {
+        vga->gr[5] = (mode & ~0x60) | 0x40;
+    }
+    /* The VGA renderer is synchronous under the BQL. Keep guest readback. */
+    vga->hw_ops->gfx_update(vga);
+    vga->gr[5] = mode;
 }
 
 static int s3_bpp(VGACommonState *vga)
@@ -655,7 +672,10 @@ static void s3_realize(DeviceState *dev, Error **errp)
     if (!vga_common_init(vga, OBJECT(dev), errp)) {
         return;
     }
-    vga->legacy_address_space = isa_address_space(isa);
+    /* Keep all banked accesses in s3_memory_ops: the generic VGA chain-4
+     * alias has higher priority and does not follow S3 CR35/CR51 banks.
+     * Leaving legacy_address_space NULL disables only that optimization.
+     */
     s->vga_bpp = vga->get_bpp;
     s->vga_params = vga->get_params;
     s->vga_resolution = vga->get_resolution;
@@ -678,7 +698,9 @@ static void s3_realize(DeviceState *dev, Error **errp)
                               "jensen-s3-engine", 4);
         memory_region_add_subregion(isa_address_space_io(isa), p->port, &p->mr);
     }
-    vga->con = graphic_console_init(dev, 0, vga->hw_ops, vga);
+    s->hw_ops = *vga->hw_ops;
+    s->hw_ops.gfx_update = s3_update_display;
+    vga->con = graphic_console_init(dev, 0, &s->hw_ops, vga);
 }
 
 static const VMStateDescription s3_vmstate = {
