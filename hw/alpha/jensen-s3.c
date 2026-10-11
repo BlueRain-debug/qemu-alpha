@@ -20,6 +20,7 @@
 #include "hw/isa/isa.h"
 #include "../display/vga_int.h"
 #include "trace.h"
+#include "ui/pixel_ops.h"
 
 #define TYPE_JENSEN_S3 "jensen-s3-928"
 OBJECT_DECLARE_SIMPLE_TYPE(JensenS3State, JENSEN_S3)
@@ -41,7 +42,9 @@ struct JensenS3State {
     void (*vga_resolution)(VGACommonState *, int *, int *);
     uint32_t reg[17];
     uint16_t multi[16], multi_latch;
-    uint8_t dac_command[4], cursor_ram[1024], cursor_palette[12];
+    uint8_t dac_command[4], cursor_ram[1024], cursor32_ram[256];
+    uint8_t cursor_palette[12];
+    int cursor_last_y, cursor_last_size;
     uint16_t dac_addr, cursor_x, cursor_y;
     uint8_t dac_component;
     uint32_t progress, transfer_data;
@@ -73,6 +76,110 @@ static unsigned s3_pitch(JensenS3State *s)
     unsigned offset = s->vga.cr[0x13] |
         (extension ? extension << 4 : (s->vga.cr[0x43] & 4) << 6);
     return offset * 8;
+}
+
+/* Bt485 coordinates include a one-cursor-width/height bias. */
+static unsigned s3_cursor_size(JensenS3State *s)
+{
+    return s->dac_command[3] & 4 ? 64 : 32;
+}
+
+static uint8_t *s3_cursor_ram(JensenS3State *s)
+{
+    return s->dac_command[3] & 4 ? s->cursor_ram : s->cursor32_ram;
+}
+
+static bool s3_cursor_enabled(JensenS3State *s)
+{
+    bool external = s->vga.cr[0x55] & 0x28;
+
+    /* CR55 selects the external DAC cursor instead of the S3 VRAM cursor. */
+    return external && (s->dac_command[2] & 3);
+}
+
+static void s3_cursor_invalidate(VGACommonState *vga)
+{
+    JensenS3State *s = container_of(vga, JensenS3State, vga);
+    int size = s3_cursor_size(s);
+    int y = (int)s->cursor_y - size;
+
+    /*
+     * Redraw the framebuffer under both positions before applying the cursor.
+     * This also keeps XOR pixels stable on repeated refreshes with clean VRAM.
+     */
+    vga_invalidate_scanlines(vga, MAX(0, s->cursor_last_y),
+                             MAX(0, s->cursor_last_y + s->cursor_last_size));
+    s->cursor_last_size = s3_cursor_enabled(s) ? size : 0;
+    s->cursor_last_y = y;
+    vga_invalidate_scanlines(vga, MAX(0, y),
+                             MAX(0, y + s->cursor_last_size));
+}
+
+static void s3_cursor_draw_line(VGACommonState *vga, uint8_t *dest, int y)
+{
+    JensenS3State *s = container_of(vga, JensenS3State, vga);
+    int size = s3_cursor_size(s);
+    int x = (int)s->cursor_x - size;
+    int row = y - ((int)s->cursor_y - size);
+    unsigned pitch = size / 8;
+    unsigned plane = pitch * size;
+    unsigned mode = s->dac_command[2] & 3;
+    uint8_t *ram = s3_cursor_ram(s);
+    uint32_t colors[4], *pixels = (uint32_t *)dest;
+    int first = MAX(0, -x);
+    int width = surface_width(qemu_console_surface(vga->con));
+    int last = MIN((int)size, width - x);
+    int bpp = vga->get_bpp(vga);
+    int i;
+
+    /*
+     * Allocated VGA surfaces truncate 5/6-bit channels, whereas shared
+     * RGB555/RGB565 surfaces expand them in pixman. Preserve the latter's
+     * colors when using a shadow surface for safe cursor composition.
+     */
+    if (bpp == 15 || bpp == 16) {
+        for (i = 0; i < width; i++) {
+            uint32_t pixel = pixels[i];
+            pixels[i] = pixel | ((pixel >> 5) & 0x00070007) |
+                ((pixel >> (bpp == 15 ? 5 : 6)) &
+                 (bpp == 15 ? 0x00000700 : 0x00000300));
+        }
+    }
+
+    if (!s3_cursor_enabled(s) || row < 0 || row >= size) {
+        return;
+    }
+    for (i = 1; i <= 3; i++) {
+        const uint8_t *rgb = &s->cursor_palette[i * 3];
+        colors[i] = vga->dac_8bit ? rgb_to_pixel32(rgb[0], rgb[1], rgb[2]) :
+            rgb_to_pixel32(c6_to_8(rgb[0]), c6_to_8(rgb[1]), c6_to_8(rgb[2]));
+    }
+    /* MSB-first, two separate one-bit planes, as in 86Box's Bt48x DAC. */
+    for (i = first; i < last; i++) {
+        unsigned offset = row * pitch + i / 8;
+        unsigned bit = 7 - (i & 7);
+        unsigned value = ((ram[offset] >> bit) & 1) |
+                         (((ram[offset + plane] >> bit) & 1) << 1);
+        switch (mode) {
+        case 1: /* Three colors: zero is transparent. */
+            if (value) {
+                pixels[x + i] = colors[value];
+            }
+            break;
+        case 2: /* Windows: background, foreground, transparent, invert. */
+            if (value < 2) {
+                pixels[x + i] = colors[value + 1];
+            } else if (value == 3) {
+                pixels[x + i] ^= 0x00ffffff;
+            }
+            break;
+        case 3: /* X Windows: plane 1 enables the pixel. */
+            if (value & 2) {
+                pixels[x + i] = colors[(value & 1) + 1];
+            }
+            break;
+        }
+    }
 }
 
 /* Enhanced scanout bypasses the VGA Graphics Controller shift mode. */
@@ -696,7 +803,20 @@ static unsigned s3_dac_index(JensenS3State *s, unsigned port)
 static uint8_t s3_dac_read(JensenS3State *s, unsigned port)
 {
     unsigned index = s3_dac_index(s, port);
+    uint8_t value;
+
     switch (index) {
+    case 4:
+    case 7:
+        return s->dac_addr;
+    case 5:
+        value = s->cursor_palette[((s->dac_addr - 1) & 3) * 3 +
+                                  s->dac_component++];
+        if (s->dac_component == 3) {
+            s->dac_component = 0;
+            s->dac_addr = (s->dac_addr + 1) & 1023;
+        }
+        return s->vga.dac_8bit ? value : value & 63;
     case 6:
         return s->dac_command[0];
     case 8:
@@ -705,9 +825,13 @@ static uint8_t s3_dac_read(JensenS3State *s, unsigned port)
         return s->dac_command[2];
     case 10:
         return (s->dac_command[0] & 0x80) && (s->dac_addr & 0x3f) == 1 ?
-                   s->dac_command[3] : 0x60; /* Bt485 status */
+                   (s->dac_command[3] & ~3) | (s->dac_addr >> 8) :
+                   0x60; /* Bt485 status */
     case 11:
-        return s->cursor_ram[s->dac_addr++ & 1023];
+        value = s3_cursor_ram(s)[(s->dac_addr - 1) &
+                                (s3_cursor_size(s) == 64 ? 1023 : 255)];
+        s->dac_addr = (s->dac_addr + 1) & 1023;
+        return value;
     case 12:
         return s->cursor_x;
     case 13:
@@ -732,6 +856,10 @@ static void s3_dac_write(JensenS3State *s, unsigned port, uint8_t value)
     case 7:
         s->dac_addr = value | ((s->dac_command[3] & 3) << 8);
         s->dac_component = 0;
+        /* Read counters point one byte beyond the next returned entry. */
+        if (index == 3 || index == 7) {
+            s->dac_addr = (s->dac_addr + 1) & 1023;
+        }
         if (index < 4) {
             vga_ioport_write(&s->vga, port, value);
         }
@@ -740,7 +868,7 @@ static void s3_dac_write(JensenS3State *s, unsigned port, uint8_t value)
         s->cursor_palette[(s->dac_addr & 3) * 3 + s->dac_component++] = value;
         if (s->dac_component == 3) {
             s->dac_component = 0;
-            s->dac_addr++;
+            s->dac_addr = (s->dac_addr + 1) & 255;
         }
         break;
     case 6:
@@ -756,10 +884,13 @@ static void s3_dac_write(JensenS3State *s, unsigned port, uint8_t value)
     case 10:
         if ((s->dac_command[0] & 0x80) && (s->dac_addr & 0x3f) == 1) {
             s->dac_command[3] = value;
+            s->dac_addr = (s->dac_addr & 255) | ((value & 3) << 8);
         }
         break;
     case 11:
-        s->cursor_ram[s->dac_addr++ & 1023] = value;
+        s3_cursor_ram(s)[s->dac_addr &
+                         (s3_cursor_size(s) == 64 ? 1023 : 255)] = value;
+        s->dac_addr = (s->dac_addr + 1) & 1023;
         break;
     case 12:
         s->cursor_x = (s->cursor_x & 0xf00) | value;
@@ -987,6 +1118,8 @@ static void s3_reset(DeviceState *dev)
     s->multi_latch = 0;
     memset(s->dac_command, 0, sizeof(s->dac_command));
     memset(s->cursor_ram, 0, sizeof(s->cursor_ram));
+    memset(s->cursor32_ram, 0, sizeof(s->cursor32_ram));
+    s->cursor_last_y = s->cursor_last_size = 0;
     memset(s->cursor_palette, 0, sizeof(s->cursor_palette));
     s->dac_addr = s->cursor_x = s->cursor_y = s->dac_component = 0;
     s->progress = 0;
@@ -1019,6 +1152,10 @@ static void s3_realize(DeviceState *dev, Error **errp)
     vga->get_bpp = s3_bpp;
     vga->get_params = s3_params;
     vga->get_resolution = s3_resolution;
+    vga->cursor_invalidate = s3_cursor_invalidate;
+    vga->cursor_draw_line = s3_cursor_draw_line;
+    /* Cursor composition must never write into a shared guest VRAM surface. */
+    vga->force_shadow = true;
     memory_region_init_io(&s->ports, OBJECT(dev), &s3_vga_ops, s,
                           "jensen-s3-vga", 0x30);
     memory_region_add_subregion(isa_address_space_io(isa), 0x3b0, &s->ports);
