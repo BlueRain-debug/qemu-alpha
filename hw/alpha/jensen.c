@@ -638,12 +638,35 @@ static void jensen_local_irq(void *opaque, int n, int level)
                  (s->local_irqs & 12) != 0);
 }
 
-static void jensen_reset(void *opaque)
+/* Complete the interrupt-controller handoff normally done by SROM$357_INIT. */
+static void jensen_srom_init_pic(JensenMachineState *s)
 {
-    JensenMachineState *s = opaque;
-    MachineState *ms = MACHINE(s);
+    static const struct {
+        uint16_t port;
+        uint8_t value;
+    } init[] = {
+        /* Initialize the slave first (EK-A0638-TD.001, 17-11). */
+        { 0xa0, 0x11 }, { 0xa1, 0x10 }, { 0xa1, 2 }, { 0xa1, 1 },
+        { 0xa1, 0xff },
+        { 0x20, 0x11 }, { 0x21, 0x08 }, { 0x21, 4 }, { 0x21, 1 },
+        { 0x21, 0xff },
+    };
+
+    /* SRM PALcode maps vectors 8..23 to the sixteen EISA IRQs. */
+    for (unsigned i = 0; i < ARRAY_SIZE(init); i++) {
+        address_space_stb(&s->io_as, init[i].port, init[i].value,
+                          MEMTXATTRS_UNSPECIFIED, NULL);
+    }
+}
+
+static void jensen_reset(MachineState *ms, ResetType type)
+{
+    JensenMachineState *s = JENSEN_MACHINE(ms);
     CPUAlphaState *env = &s->cpu->env;
     g_autofree uint8_t *scratch = g_malloc0(3 * MiB);
+
+    /* SROM runs after hardware reset; device reset must not undo its setup. */
+    qemu_devices_reset(type);
 
     /* Ensure fresh console scratch RAM for the SROM handoff (10-12). */
     cpu_physical_memory_write(0, scratch, 3 * MiB);
@@ -664,6 +687,7 @@ static void jensen_reset(void *opaque)
     s->dma_chain = 0;
     s->nmi_control = s->nmi_extended = s->nmi_mask = 0;
     jensen_nmi_update(s);
+    jensen_srom_init_pic(s);
     pit_set_gate(s->pit, 2, 0);
     s->pit2_pause_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     mc146818rtc_set_cmos_data(s->rtc, 0x69, 0x9d);
@@ -760,7 +784,6 @@ static void jensen_init(MachineState *machine)
     s->cpu = ALPHA_CPU(object_new(machine->cpu_type));
     qdev_connect_clock_in(DEVICE(s->cpu), "cpu-refclk", refclk);
     qdev_realize_and_unref(DEVICE(s->cpu), NULL, &error_fatal);
-    qemu_register_reset(jensen_reset, s);
     memory_region_add_subregion(get_system_memory(), 0, machine->ram);
 
     memory_region_init(&s->isa_io, OBJECT(s), "jensen-isa-io", 0x10000);
@@ -994,6 +1017,7 @@ static void jensen_class_init(ObjectClass *oc, void *data)
 
     mc->desc = "DECpc AXP 150 / DEC 2000 (Jensen, experimental)";
     mc->init = jensen_init;
+    mc->reset = jensen_reset;
     mc->default_cpu_type = ALPHA_CPU_TYPE_NAME("ev4");
     mc->valid_cpu_types = cpu_types;
     mc->default_ram_size = 64 * MiB;

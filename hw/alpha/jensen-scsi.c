@@ -356,11 +356,8 @@ invalid:
     g_free(r);
 }
 
-static void aha_reset(DeviceState *dev)
+static void aha_reset_adapter(JensenAha1742 *s)
 {
-    JensenAha1742 *s = JENSEN_AHA1742(dev);
-    static const uint8_t irq_code[] = { 9, 10, 11, 12, 0, 14, 15, 0 };
-    unsigned code;
 
     while (!QTAILQ_EMPTY(&s->requests)) {
         AhaRequest *r = QTAILQ_FIRST(&s->requests);
@@ -369,6 +366,20 @@ static void aha_reset(DeviceState *dev)
         aha_cancel_request(r);
     }
     qemu_set_irq(s->irq, 0);
+    /* G2CNTRL.HRST resets the adapter, not the EISA configuration. */
+    memset(s->regs + 0x50, 0, sizeof(s->regs) - 0x50);
+    s->mailbox_out = 0;
+    s->out_full = s->hard_reset = false;
+    s->head = s->count = 0;
+}
+
+static void aha_reset(DeviceState *dev)
+{
+    JensenAha1742 *s = JENSEN_AHA1742(dev);
+    static const uint8_t irq_code[] = { 9, 10, 11, 12, 0, 14, 15, 0 };
+    unsigned code;
+
+    aha_reset_adapter(s);
     memset(s->regs, 0, sizeof(s->regs));
     s->regs[4] = 1;
     s->regs[0x40] = 0x80;
@@ -379,9 +390,6 @@ static void aha_reset(DeviceState *dev)
     }
     s->regs[0x42] = code | 0x10;
     s->regs[0x43] = 7;
-    s->mailbox_out = 0;
-    s->out_full = s->hard_reset = false;
-    s->head = s->count = 0;
     s->irq = isa_get_irq(ISA_DEVICE(s), s->irq_num);
 }
 
@@ -459,7 +467,7 @@ static void aha_write_byte(JensenAha1742 *s, unsigned reg, uint8_t value)
         }
     } else if (reg == 0x55) {
         if (value & 0x80) {
-            aha_reset(DEVICE(s));
+            aha_reset_adapter(s);
             s->hard_reset = true;
         } else {
             s->hard_reset = false;
