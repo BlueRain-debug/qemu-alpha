@@ -52,3 +52,4 @@ jensen_inta_read(uint64_t addr, unsigned size, unsigned vector) "addr=0x%" PRIx6
 jensen_s3_cr(unsigned index, unsigned value, bool write) "index=0x%02x value=0x%02x write=%d"
 jensen_s3_io(unsigned port, uint64_t value, unsigned size, bool write) "port=0x%04x value=0x%" PRIx64 " size=%u write=%d"
 jensen_s3_command(unsigned cmd, unsigned x, unsigned y, unsigned width, unsigned height) "cmd=0x%04x xy=%u,%u size=%u,%u"
+jensen_s3_state(unsigned cmd, unsigned sx, unsigned sy, unsigned dx, unsigned dy, unsigned width, unsigned height, unsigned pixel, unsigned mixes, unsigned format_mask) "cmd=0x%04x src=%u,%u dst=%u,%u size=%u,%u pix=0x%03x mixes=0x%08x format_mask=0x%08x"

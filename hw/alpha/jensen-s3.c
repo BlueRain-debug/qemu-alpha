@@ -253,6 +253,12 @@ static void s3_command(JensenS3State *s)
     s->unsupported = false;
     trace_jensen_s3_command(s->reg[COMMAND], s->reg[CUR_X], s->reg[CUR_Y],
                             s->reg[MAJOR] + 1, s->multi[0] + 1);
+    trace_jensen_s3_state(s->reg[COMMAND], s->reg[CUR_X], s->reg[CUR_Y],
+                         s->reg[DEST_X], s->reg[DEST_Y],
+                         (s->reg[MAJOR] & 0xfff) + 1,
+                         (s->multi[0] & 0xfff) + 1, s->multi[10],
+                         s->reg[FORE_MIX] | (s->reg[BACK_MIX] << 16),
+                         s->reg[WRITE_MASK] | (s->vga.cr[0x50] << 16));
     if (op == 0) {
         return;
     }
@@ -286,14 +292,21 @@ static void s3_transfer(JensenS3State *s, uint32_t value, unsigned size)
     if (!s->pending || !(s->reg[COMMAND] & 0x100)) {
         return;
     }
-    if (s->reg[COMMAND] & 0x1000 && bits >= 16) {
+    if ((s->reg[COMMAND] & 0x1000) && bits >= 16 &&
+        (mono || bytes == 1)) {
         value = ((value & 0xff00ff00) >> 8) | ((value & 0x00ff00ff) << 8);
     }
     for (i = 0; i < (mono ? bits : bits / (8 * bytes)) && s->pending; i++) {
-        s3_step(s, value >> (i * 8 * bytes),
-                !mono || !!(value & (1U << (bits - 1 - i))));
-        /* CPU rows are rounded up to the configured transfer width. */
-        if (mono && s->progress / width != row) {
+        uint16_t pixel = 0;
+
+        if (!mono) {
+            /* BYTE_SWAP selects byte order, not the bits of a 16-bpp pixel. */
+            unsigned offset = bytes == 1 ? bits - 8 - i * 8 : i * 16;
+            pixel = value >> offset;
+        }
+        s3_step(s, pixel, !mono || !!(value & (1U << (bits - 1 - i))));
+        /* Every CPU row is padded to the configured transfer width. */
+        if (s->progress / width != row) {
             break;
         }
     }
