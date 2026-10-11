@@ -68,6 +68,8 @@ struct JensenMachineState {
     bool keyboard_locked;
     PFlashCFI01 *flash[2];
     uint8_t hae, sysctl, spare, local_irqs;
+    uint8_t inta_vector;
+    bool inta_second;
     MC146818RtcState *rtc;
     uint8_t rtc_index, rtc_ram[JENSEN_RTC_RAM_SIZE];
     char *rtc_ram_file;
@@ -340,7 +342,19 @@ static const MemoryRegionOps jensen_reg_ops = {
 
 static uint64_t jensen_inta_read(void *opaque, hwaddr addr, unsigned size)
 {
-    return pic_read_irq(isa_pic);
+    JensenMachineState *s = opaque;
+    unsigned vector;
+
+    /* 82357 INTA uses two bus cycles (EK-A0638-TD.001, 17-8/17-9). */
+    if (!s->inta_second) {
+        s->inta_vector = pic_read_irq(isa_pic);
+        vector = 0xff; /* The first cycle does not drive the vector. */
+    } else {
+        vector = s->inta_vector;
+    }
+    s->inta_second = !s->inta_second;
+    trace_jensen_inta_read(addr, size, vector);
+    return vector;
 }
 
 static void jensen_inta_write(void *opaque, hwaddr addr,
@@ -386,6 +400,8 @@ static void jensen_reset(void *opaque)
     s->hae = 0;
     s->spare = 0;
     s->local_irqs = 0;
+    s->inta_second = false;
+    s->inta_vector = 0;
     s->rtc_index = 0;
     mc146818rtc_set_cmos_data(s->rtc, 0x69, 0x9d);
     mc146818rtc_set_cmos_data(s->rtc, 0x6a, 0x07);

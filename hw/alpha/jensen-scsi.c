@@ -237,6 +237,8 @@ static void aha_start(JensenAha1742 *s, uint8_t target)
     addr = ldl_le_p(ecb + 8);
     length = ldl_le_p(ecb + 12);
     trace_jensen_aha_command(r->ecb, target, lduw_le_p(ecb), ecb[36], length);
+    trace_jensen_aha_ecb(r->ecb, r->flags, lduw_le_p(ecb + 4), addr,
+                        r->statusptr, ldq_le_p(ecb + 36));
     if (r->flags & 1) {
         /* Chaining needs its own queue semantics; do not silently accept it. */
         goto invalid;
