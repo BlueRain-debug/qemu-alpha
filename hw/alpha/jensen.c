@@ -62,7 +62,10 @@ struct JensenMachineState {
     MemoryRegion local, eisa_io, eisa_mem, flash_window[2];
     MemoryRegion inta, hae_reg, sysctl_reg, spare_reg, board_id;
     AddressSpace io_as, mem_as, flash_as[2], rtc_as;
-    MemoryRegion rtc_window;
+    MemoryRegion rtc_window, kbd_command, vga_rom, chipctrl0;
+    AddressSpace kbd_command_as;
+    ISAKBDState *kbd;
+    bool keyboard_locked;
     PFlashCFI01 *flash[2];
     uint8_t hae, sysctl, spare, local_irqs;
     MC146818RtcState *rtc;
@@ -123,6 +126,37 @@ static void jensen_rtc_write(void *opaque, hwaddr addr,
 static const MemoryRegionOps jensen_rtc_ops = {
     .read = jensen_rtc_read,
     .write = jensen_rtc_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 1,
+};
+
+/* Jensen wires P17 high and P16 to the front-panel key-lock switch (1-11). */
+static uint64_t jensen_kbd_command_read(void *opaque, hwaddr addr,
+                                       unsigned size)
+{
+    JensenMachineState *s = opaque;
+
+    return address_space_ldub(&s->kbd_command_as, 0x64,
+                              MEMTXATTRS_UNSPECIFIED, NULL);
+}
+
+static void jensen_kbd_command_write(void *opaque, hwaddr addr,
+                                     uint64_t value, unsigned size)
+{
+    JensenMachineState *s = opaque;
+
+    address_space_stb(&s->kbd_command_as, 0x64, value,
+                      MEMTXATTRS_UNSPECIFIED, NULL);
+    if (value == 0xc0) {
+        /* Replace the input-port reply queued by the common i8042 model. */
+        s->kbd->kbd.cbdata = s->keyboard_locked ? 0x80 : 0xc0;
+    }
+}
+
+static const MemoryRegionOps jensen_kbd_command_ops = {
+    .read = jensen_kbd_command_read,
+    .write = jensen_kbd_command_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid.min_access_size = 1,
     .valid.max_access_size = 1,
@@ -413,7 +447,7 @@ static void jensen_init(MachineState *machine)
     JensenMachineState *s = JENSEN_MACHINE(machine);
     Clock *refclk;
     ISABus *bus;
-    ISADevice *rtc, *kbd, *fdc;
+    ISADevice *rtc, *kbd, *fdc, *vga = NULL;
     DriveInfo *floppy_drive[MAX_FD];
     unsigned i;
     qemu_irq *pic;
@@ -483,7 +517,17 @@ static void jensen_init(MachineState *machine)
     memory_region_init_io(&s->rtc_window, OBJECT(s), &jensen_rtc_ops, s,
                           "jensen-vl82c106-rtc", 2);
     memory_region_add_subregion_overlap(&s->isa_io, 0x170, &s->rtc_window, 1);
+    /* VL82C106 control register 0 is also accessible at port 0x102 (24-9). */
+    memory_region_init_io(&s->chipctrl0, OBJECT(s), &jensen_reg_ops,
+                          &s->rtc->cmos_data[0x69], "jensen-chipctrl0", 1);
+    memory_region_add_subregion(&s->isa_io, 0x102, &s->chipctrl0);
     kbd = isa_create_simple(bus, TYPE_I8042);
+    s->kbd = I8042(kbd);
+    address_space_init(&s->kbd_command_as, &s->kbd->io[1],
+                       "jensen-kbd-command-device");
+    memory_region_init_io(&s->kbd_command, OBJECT(s), &jensen_kbd_command_ops,
+                          s, "jensen-kbd-command", 1);
+    memory_region_add_subregion_overlap(&s->isa_io, 0x64, &s->kbd_command, 1);
     qdev_connect_gpio_out(DEVICE(kbd), 0,
                           qemu_allocate_irq(jensen_local_irq, s, 2));
     qdev_connect_gpio_out(DEVICE(kbd), 1,
@@ -495,7 +539,19 @@ static void jensen_init(MachineState *machine)
                    qemu_allocate_irq(jensen_local_irq, s, 1), 1843200 / 16,
                    serial_hd(1), DEVICE_LITTLE_ENDIAN);
     if (machine->enable_graphics) {
-        isa_vga_init(bus);
+        vga = isa_vga_init(bus);
+    }
+    if (vga) {
+        const char *vga_bios = vga_interface_type == VGA_CIRRUS ?
+                               "vgabios-cirrus.bin" : "vgabios.bin";
+
+        /* ARC reads the x86 option ROM through the private EISA bus. */
+        memory_region_init_rom(&s->vga_rom, OBJECT(vga), "jensen-vga-rom",
+                               64 * KiB, &error_fatal);
+        memory_region_add_subregion(&s->isa_mem, 0xc0000, &s->vga_rom);
+        if (rom_add_file_mr(vga_bios, &s->vga_rom, -1) < 0) {
+            exit(EXIT_FAILURE);
+        }
     }
 
     for (i = 0; i < 2; i++) {
@@ -586,6 +642,16 @@ static void jensen_set_rtc_ram_file(Object *obj, const char *value,
     s->rtc_ram_file = *value ? g_strdup(value) : NULL;
 }
 
+static bool jensen_get_keyboard_locked(Object *obj, Error **errp)
+{
+    return JENSEN_MACHINE(obj)->keyboard_locked;
+}
+
+static void jensen_set_keyboard_locked(Object *obj, bool value, Error **errp)
+{
+    JENSEN_MACHINE(obj)->keyboard_locked = value;
+}
+
 static void jensen_finalize(Object *obj)
 {
     JensenMachineState *s = JENSEN_MACHINE(obj);
@@ -612,6 +678,11 @@ static void jensen_class_init(ObjectClass *oc, void *data)
     mc->max_cpus = 1;
     mc->no_floppy = false;
     mc->no_parallel = true;
+    object_class_property_add_bool(oc, "keyboard-locked",
+                                   jensen_get_keyboard_locked,
+                                   jensen_set_keyboard_locked);
+    object_class_property_set_description(oc, "keyboard-locked",
+        "Front-panel key-lock switch (default: unlocked)");
     object_class_property_add_str(oc, "rtc-ram-file", jensen_get_rtc_ram_file,
                                   jensen_set_rtc_ram_file);
     object_class_property_set_description(oc, "rtc-ram-file",
