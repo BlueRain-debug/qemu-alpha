@@ -1313,8 +1313,9 @@ static const AlphaIPRegInfo ev4_ibox_ip_reginfo[] = {
       .fieldoffset = offsetof(CPUAlphaState, ipr.pal_base),
       .writefn = pal_base_write, .raw_writefn = raw_write },
     { .name = "HIRR", .ipr = EV4_IPR_HIRR,
-      .type = ALPHA_IP_NO_RAW, .access = IPR_R,
-      .readfn = ev4_irr_read },
+      .type = ALPHA_IP_NO_RAW, .access = IPR_RW,
+      /* Read-only hardware state; Jensen's NT bootstrap writes zero here. */
+      .readfn = ev4_irr_read, .writefn = alpha_ip_write_ignore },
     { .name = "SIRR", .ipr = EV4_IPR_SIRR,
       .access = IPR_RW,
       .resetvalue = 0,
