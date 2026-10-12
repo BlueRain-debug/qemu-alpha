@@ -642,16 +642,14 @@ static void glue(gen_ieee_, name)(DisasContext *s,              \
 GEN_IEEE_CONVERT(cvtqs)
 GEN_IEEE_CONVERT(cvtqt)
 
-static void gen_ieee_cvtql(DisasContext *s, int rb, int rc)
+static void gen_ieee_cvtql(DisasContext *s, int rb, int rc, int qualifier)
 {
     TCGv_i64 vb, vc;
     TCGv_i32 qual;
-    int fn11;
 
-    fn11 = get_fn11(s->insn);
     vb = read_fpu_reg(s, rb);
     vc = fpu_reg(s, rc);
-    qual = tcg_constant_i32(fn11 & QUAL_MASK);
+    qual = tcg_constant_i32(qualifier);
     gen_helper_ieee_cvtql(vc, tcg_env, vb, qual);
     gen_helper_check_float_exceptions(tcg_env, qual);
 }
@@ -856,6 +854,7 @@ typedef struct AlphaHWLDSTParams {
     bool locked;
 } AlphaHWLDSTParams;
 
+/* EV4 PHY+ALT selects physical load-lock/store-conditional; RWC is ignored. */
 static const AlphaHWLDSTParams ev4_hw_ld_mmu_idx[8] = {
     [0b000] = { AlphaMMUIdx_Privileged,         false },
     [0b001] = { AlphaMMUIdx_PrivilegedWChk,     false },
@@ -863,8 +862,8 @@ static const AlphaHWLDSTParams ev4_hw_ld_mmu_idx[8] = {
     [0b011] = { AlphaMMUIdx_AltModeWChk,        false },
     [0b100] = { AlphaMMUIdx_Physical,           false },
     [0b101] = { AlphaMMUIdx_Physical,           false },
-    [0b110] = { AlphaMMUIdx_Privileged,         true },
-    [0b111] = { AlphaMMUIdx_PrivilegedWChk,     true },
+    [0b110] = { AlphaMMUIdx_Physical,           true },
+    [0b111] = { AlphaMMUIdx_Physical,           true },
 };
 
 static const AlphaHWLDSTParams ev4_hw_st_mmu_idx[8] = {
@@ -874,8 +873,8 @@ static const AlphaHWLDSTParams ev4_hw_st_mmu_idx[8] = {
     [0b011] = { AlphaMMUIdx_AltMode,            false },
     [0b100] = { AlphaMMUIdx_Physical,           false },
     [0b101] = { AlphaMMUIdx_Physical,           false },
-    [0b110] = { AlphaMMUIdx_Privileged,         true },
-    [0b111] = { AlphaMMUIdx_Privileged,         true },
+    [0b110] = { AlphaMMUIdx_Physical,           true },
+    [0b111] = { AlphaMMUIdx_Physical,           true },
 };
 
 static const AlphaHWLDSTParams ev5_hw_ld_mmu_idx[32] = {
@@ -2738,6 +2737,37 @@ static bool trans_sqrtt(DisasContext *s, arg_sqrtt *a)
     return true;
 }
 
+static bool trans_cvtql(DisasContext *s, arg_cvtql *a)
+{
+    if (!fp_access_check(s)) {
+        return false;
+    }
+    if (unlikely(a->ra != 31)) {
+        return false;
+    }
+    gen_ieee_cvtql(s, a->rb, a->rc, get_fn11(s->insn) & QUAL_MASK);
+    return true;
+}
+
+static bool trans_cvtql_nt(DisasContext *s, arg_cvtql_nt *a)
+{
+    if (!fp_access_check(s)) {
+        return false;
+    }
+    if (unlikely(a->ra != 31)) {
+        return false;
+    }
+    /*
+     * Windows NT 3.5 build 756 WINSRV uses function 0x330. Although the
+     * Alpha manuals do not list this encoding, retain it for NT compatibility
+     * as CVTQL/V (0x130). Ignore the extra QUAL_I bit: CVTQL does not support
+     * inexact traps, but integer overflow must still raise an exception.
+     */
+    gen_ieee_cvtql(s, a->rb, a->rc, QUAL_V);
+    return true;
+}
+
+
 #define GEN_IEEE_OP1(name)                              \
 static bool glue(trans_, name)(DisasContext *s,         \
                                glue(arg_, name) *a)     \
@@ -2778,10 +2808,8 @@ GEN_IEEE_OP2(cmptle)
 GEN_IEEE_OP1(cvttq)
 GEN_IEEE_OP1(cvtqs)
 GEN_IEEE_OP1(cvtqt)
-GEN_IEEE_OP1(cvtql)
 GEN_IEEE_OP1(cvtst)
 GEN_IEEE_OP1(cvtts)
-
 
 #define GEN_VAX_OP1(name)                               \
 static bool glue(trans_, name)(DisasContext *s,         \

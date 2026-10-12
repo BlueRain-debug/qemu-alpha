@@ -568,7 +568,7 @@ static void alpha_update_exception_state_ev4(CPUAlphaState *env,
     if (flags.load_insn) {
         uint32_t insn = cpu_ldl_code(env, env->pc + diff);
 
-        SET_FIELD(exc_sum, EV4_MMCSR, RA, get_ra(insn));
+        SET_FIELD(mm_stat, EV4_MMCSR, RA, get_ra(insn));
         SET_FIELD(mm_stat, EV4_MMCSR, OPCODE, get_opc(insn));
     }
 
@@ -1059,7 +1059,7 @@ static inline uint64_t ev4_xtb_pte_temp_init(uint64_t pte, bool itb)
     ret = deposit64(ret, 11, 1, FIELD_EX64(pte, PTE, SRE));
     ret = deposit64(ret, 12, 1, FIELD_EX64(pte, PTE, URE));
     ret = deposit64(ret, 34, 1, FIELD_EX64(pte, PTE, ASM));
-    ret = deposit64(ret, 13, 20,
+    ret = deposit64(ret, 13, 21,
                     itb ? FIELD_EX64(pte, EV4_ITB_PTE, PFN)
                         : FIELD_EX64(pte, EV4_DTB_PTE, PFN));
     return ret;
@@ -1136,19 +1136,16 @@ static uint64_t ev4_iccsr_read(CPUAlphaState *env, const AlphaIPRegInfo *ri)
     return ret;
 }
 
+/* TB invalidation does not clear the EV4 PTE readback holding registers. */
 static void ev4_itbzap_write(CPUAlphaState *env, const AlphaIPRegInfo *ri,
                              uint64_t value)
 {
-    env->ipr.itb_pte = 0;
-    env->ipr.itb_pte_temp = 0;
     alpha_tlb_flush_all(env, AlphaTLBType_Instruction);
 }
 
 static void ev4_itbasm_write(CPUAlphaState *env, const AlphaIPRegInfo *ri,
                               uint64_t value)
 {
-    env->ipr.itb_pte = 0;
-    env->ipr.itb_pte_temp = 0;
     alpha_tlb_flush_process(env, AlphaTLBType_Instruction);
 }
 
@@ -1157,8 +1154,6 @@ static void ev4_itbis_write(CPUAlphaState *env, const AlphaIPRegInfo *ri,
 {
     AlphaTLBType type = AlphaTLBType_Instruction;
 
-    env->ipr.itb_pte = 0;
-    env->ipr.itb_pte_temp = 0;
     alpha_tlb_flush_single(env, type, value & R_EV4_ITBIS_VA_MASK,
                            alpha_cur_asn(env, type, 0));
 }
@@ -1318,8 +1313,9 @@ static const AlphaIPRegInfo ev4_ibox_ip_reginfo[] = {
       .fieldoffset = offsetof(CPUAlphaState, ipr.pal_base),
       .writefn = pal_base_write, .raw_writefn = raw_write },
     { .name = "HIRR", .ipr = EV4_IPR_HIRR,
-      .type = ALPHA_IP_NO_RAW, .access = IPR_R,
-      .readfn = ev4_irr_read },
+      .type = ALPHA_IP_NO_RAW, .access = IPR_RW,
+      /* Read-only hardware state; Jensen's NT bootstrap writes zero here. */
+      .readfn = ev4_irr_read, .writefn = alpha_ip_write_ignore },
     { .name = "SIRR", .ipr = EV4_IPR_SIRR,
       .access = IPR_RW,
       .resetvalue = 0,
@@ -1393,16 +1389,12 @@ static void ev4_dtb_pte_write(CPUAlphaState *env, const AlphaIPRegInfo *ri,
 static void ev4_dtbzap_write(CPUAlphaState *env, const AlphaIPRegInfo *ri,
                              uint64_t value)
 {
-    env->ipr.dtb_pte = 0;
-    env->ipr.dtb_pte_temp = 0;
     alpha_tlb_flush_all(env, AlphaTLBType_Data);
 }
 
 static void ev4_dtbasm_write(CPUAlphaState *env, const AlphaIPRegInfo *ri,
                               uint64_t value)
 {
-    env->ipr.dtb_pte = 0;
-    env->ipr.dtb_pte_temp = 0;
     alpha_tlb_flush_process(env, AlphaTLBType_Data);
 }
 
@@ -1411,8 +1403,6 @@ static void ev4_dtbis_write(CPUAlphaState *env, const AlphaIPRegInfo *ri,
 {
     AlphaTLBType type = AlphaTLBType_Data;
 
-    env->ipr.dtb_pte = 0;
-    env->ipr.dtb_pte_temp = 0;
     alpha_tlb_flush_single(env, type, value & R_EV4_DTBIS_VA_MASK,
                            alpha_cur_asn(env, type, 0));
 }
@@ -1632,11 +1622,13 @@ static void register_ev4_ipregs(AlphaCPU *cpu)
 }
 
 /* These assumptions should not be violated. */
+#pragma GCC diagnostic ignored "-Wenum-compare"
 QEMU_BUILD_BUG_ON(R_EV5_IFAULT_VA_FORM_VA_MASK != R_EV5_VA_FORM_VA_MASK);
 QEMU_BUILD_BUG_ON(R_EV5_IFAULT_VA_FORM_VPTB_MASK != R_EV5_VA_FORM_VPTB_MASK);
 QEMU_BUILD_BUG_ON(R_EV5_IFAULT_VA_FORM_NT_VA_MASK != R_EV5_VA_FORM_NT_VA_MASK);
 QEMU_BUILD_BUG_ON(R_EV5_IFAULT_VA_FORM_NT_VPTB_MASK !=
                   R_EV5_VA_FORM_NT_VPTB_MASK);
+#pragma GCC diagnostic pop
 
 static uint64_t ev5_va_form(CPUAlphaState *env, bool ifetch)
 {
@@ -2248,12 +2240,14 @@ static void register_ev5_ipregs(AlphaCPU *cpu)
 }
 
 /* These assumptions should not be violated. */
+#pragma GCC diagnostic ignored "-Wenum-compare"
 QEMU_BUILD_BUG_ON(R_EV6_IVA_FORM_VA_MASK != R_EV6_VA_FORM_VA_MASK);
 QEMU_BUILD_BUG_ON(R_EV6_IVA_FORM_VPTB_MASK != R_EV6_VA_FORM_VPTB_MASK);
 QEMU_BUILD_BUG_ON(R_EV6_IVA_FORM_48_VA_MASK != R_EV6_VA_FORM_48_VA_MASK);
 QEMU_BUILD_BUG_ON(R_EV6_IVA_FORM_48_VPTB_MASK != R_EV6_VA_FORM_48_VPTB_MASK);
 QEMU_BUILD_BUG_ON(R_EV6_IVA_FORM_32_VA_MASK != R_EV6_VA_FORM_32_VA_MASK);
 QEMU_BUILD_BUG_ON(R_EV6_IVA_FORM_32_VPTB_MASK != R_EV6_VA_FORM_32_VPTB_MASK);
+#pragma GCC diagnostic pop
 
 static uint64_t ev6_va_form(CPUAlphaState *env, bool ifetch)
 {

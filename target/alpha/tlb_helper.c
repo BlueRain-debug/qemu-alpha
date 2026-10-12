@@ -594,13 +594,14 @@ void alpha_tlb_flush_single(CPUAlphaState *env, AlphaTLBType type, vaddr addr,
         qemu_log_mask(CPU_LOG_MMU, "%s: %s TLB invalidate single hit: "
                       "addr=0x" TARGET_FMT_lx " asn=0x%02x\n",
                       __func__, tlb_str(type), (target_ulong)addr, asn);
-
-        /*
-         * It's faster to just blow the entire TLB away than spend time
-         * invalidating a range.
-         */
-        tlb_flush_by_mmuidx(env_cpu(env), all_tlbmask());
     }
+
+    /*
+     * QEMU may still cache a translation after its hardware TLB entry has
+     * been replaced. Invalidate that shadow even if the hardware lookup
+     * misses, or a subsequent remap can keep accessing the old page.
+     */
+    tlb_flush_by_mmuidx(env_cpu(env), all_tlbmask());
 }
 
 static inline uint64_t pte_pfn_ev4(CPUAlphaState *env, AlphaTLBType type,

@@ -29,6 +29,7 @@
 #include "qemu/timer.h"
 #include "qemu/log.h"
 #include "hw/isa/i8259_internal.h"
+#include "hw/qdev-properties.h"
 #include "trace.h"
 #include "qom/object.h"
 
@@ -151,6 +152,15 @@ static void pic_set_irq(void *opaque, int irq, int level)
             s->last_irr |= mask;
         } else {
             s->last_irr &= ~mask;
+            if (s->edge_irq_withdrawal) {
+                /*
+                 * 8259A datasheet p.18: both edge and level requests must
+                 * remain high through the first INTA. Withdrawal cancels
+                 * the pending request, not an already acknowledged ISR bit.
+                 * Legacy QEMU pulse sources require the compatibility mode.
+                 */
+                s->irr &= ~mask;
+            }
         }
     }
     pic_update_irq(s);
@@ -244,7 +254,8 @@ static void pic_ioport_write(void *opaque, hwaddr addr64,
             s->init_state = 1;
             s->init4 = val & 1;
             s->single_mode = val & 2;
-            s->ltim = val & 8;
+            /* EISA ISPs can disable LTIM in favor of per-input ELCR. */
+            s->ltim = s->ltim_supported ? val & 8 : 0;
         } else if (val & 0x08) {
             if (val & 0x04) {
                 s->poll = 1;
@@ -436,6 +447,18 @@ qemu_irq *i8259_init(ISABus *bus, qemu_irq parent_irq_in)
     return irq_set;
 }
 
+/*
+ * Default to the historical latch behavior: devices such as HPET deliver
+ * zero-duration QEMU IRQ pulses. Boards whose sources hold the physical IRQ
+ * until service may enable hardware request withdrawal without losing pulses
+ * on unrelated machines. LTIM remains supported by ordinary 8259A devices.
+ */
+static const Property pic_properties[] = {
+    DEFINE_PROP_BOOL("edge-irq-withdrawal", PICCommonState,
+                     edge_irq_withdrawal, false),
+    DEFINE_PROP_BOOL("ltim-supported", PICCommonState, ltim_supported, true),
+};
+
 static void i8259_class_init(ObjectClass *klass, void *data)
 {
     PICClass *k = PIC_CLASS(klass);
@@ -443,6 +466,7 @@ static void i8259_class_init(ObjectClass *klass, void *data)
 
     device_class_set_parent_realize(dc, pic_realize, &k->parent_realize);
     device_class_set_legacy_reset(dc, pic_reset);
+    device_class_set_props(dc, pic_properties);
 }
 
 static const TypeInfo i8259_info = {

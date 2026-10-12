@@ -301,6 +301,9 @@ fcmovge         010111 ..... .....  00000101101 .....   @float
 fcmovle         010111 ..... .....  00000101110 .....   @float
 fcmovgt         010111 ..... .....  00000101111 .....   @float
 {
+  # Undocumented encoding used by Windows NT; see trans_cvtql_nt.
+  cvtql_nt      010111 ..... .....  01100110000 ..... \
+                &fp     ra=%ra rb=%rb rc=%rc qual=1 rm=0
   cvtql         010111 ..... .....  10100110000 ..... \
                 &fp     ra=%ra rb=%rb rc=%rc qual=5 rm=0
   cvtql         010111 ..... .....  00100110000 ..... \

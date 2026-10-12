@@ -24,3 +24,19 @@ config AM29F016
 
 config TIGBUS
     bool
+
+config JENSEN
+    bool
+    default y
+    depends on ALPHA
+    select ISA_BUS
+    select I8259
+    select I8254
+    select MC146818RTC
+    select SERIAL_MM
+    select PCKBD
+    select VGA_ISA
+    select PFLASH_CFI01
+    select I8257
+    select FDC_ISA
+    select SCSI

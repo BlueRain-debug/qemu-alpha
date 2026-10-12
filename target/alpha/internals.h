@@ -490,9 +490,7 @@ static inline uint64_t alpha_cur_vptb(CPUAlphaState *env, bool ifetch)
     case IMPLVER_2106x:
         return 0;
     case IMPLVER_21164: {
-        const uint64_t vptb_mask = ALPHA_BITMASK(63, 30);
-
-        QEMU_BUILD_BUG_ON(vptb_mask != R_EV5_MVPTBR_VPTB_MASK);
+        QEMU_BUILD_BUG_ON(ALPHA_BITMASK(63, 30) != R_EV5_MVPTBR_VPTB_MASK);
         if (ifetch) {
             return env->ipr.ivptbr & R_EV5_MVPTBR_VPTB_MASK;
         } else {
@@ -502,7 +500,7 @@ static inline uint64_t alpha_cur_vptb(CPUAlphaState *env, bool ifetch)
     case IMPLVER_21264: {
         const uint64_t vptb_mask = ALPHA_BITMASK(47, 30);
 
-        QEMU_BUILD_BUG_ON(vptb_mask != R_EV6_I_CTL_VPTB_MASK);
+        QEMU_BUILD_BUG_ON(ALPHA_BITMASK(47, 30) != R_EV6_I_CTL_VPTB_MASK);
         if (ifetch) {
             return sextract64(env->ipr.i_ctl & vptb_mask, 0, 48);
         } else {

@@ -310,8 +310,14 @@ static void es40_class_init(ObjectClass *oc, void *data)
         ALPHA_CPU_TYPE_NAME("ev68cb"),
         NULL
     };
+    static GlobalProperty isa_defaults[] = {
+        { "isa-i8259", "edge-irq-withdrawal", "on" },
+        { "isa-fdc", "strict-pio", "on" },
+    };
     MachineClass *mc = MACHINE_CLASS(oc);
 
+    compat_props_add(mc->compat_props, isa_defaults,
+                     G_N_ELEMENTS(isa_defaults));
     mc->desc = "Compaq AlphaServer ES40";
     mc->init = es40_machine_init;
     mc->block_default_type = IF_IDE;

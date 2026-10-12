@@ -1021,7 +1021,7 @@ static bool qtest_qom_has_concrete_type(const char *parent_typename,
     QObject *qobj;
     QString *qstr;
     QDict *devinfo;
-    int idx;
+    int idx __attribute__ ((unused));
 
     if (!list) {
         QDict *resp;
