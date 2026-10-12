@@ -18,7 +18,7 @@
 #include "hw/i2c/pm_smbus.h"
 #include "hw/ide/pci.h"
 #include "hw/intc/i8259.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
 #include "hw/isa/apm.h"
 #include "hw/isa/isa.h"
 #include "hw/pci/pci.h"

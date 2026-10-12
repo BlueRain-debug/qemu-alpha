@@ -21,7 +21,7 @@
 #include "hw/input/i8042.h"
 #include "hw/intc/i8259.h"
 #include "hw/isa/isa.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
 #include "hw/loader.h"
 #include "hw/qdev-clock.h"
 #include "hw/qdev-properties.h"

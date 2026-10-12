@@ -7,7 +7,7 @@
 #include "qemu/module.h"
 #include "qemu/range.h"
 #include "hw/ide/pci.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
 #include "hw/southbridge/m1543.h"
 #include "hw/pci/pci.h"
 #include "migration/vmstate.h"

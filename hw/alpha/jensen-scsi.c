@@ -10,7 +10,7 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "hw/isa/isa.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
 #include "hw/qdev-properties.h"
 #include "hw/scsi/scsi.h"
 #include "scsi/constants.h"

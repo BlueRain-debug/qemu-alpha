@@ -12,7 +12,7 @@
 #include "hw/i2c/bitbang_i2c.h"
 #include "hw/intc/intc.h"
 #include "hw/intc/i8259.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
 #include "hw/qdev-properties.h"
 #include "hw/pci/pci_host.h"
 #include "hw/pci/pci_device.h"
