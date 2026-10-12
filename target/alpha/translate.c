@@ -8,6 +8,7 @@
 #include "qemu/log.h"
 #include "exec/helper-proto.h"
 #include "exec/helper-gen.h"
+#include "exec/target_page.h"
 #include "accel/tcg/cpu-loop.h"
 #include "translate.h"
 #include "cpu.h"
@@ -95,7 +96,8 @@ void alpha_translate_code(CPUState *cpu, TranslationBlock *tb,
     DisasContext dc = {};
     const TranslatorOps *ops = &alpha_translator_ops;
 
-    translator_loop(cpu, tb, max_insns, pc, host_pc, ops, &dc.base);
+    translator_loop(cpu, tb, max_insns, pc, host_pc, ops, &dc.base,
+                    TCG_TYPE_VA);
 }
 
 static target_long jmp_diff(DisasContext *s, target_long diff)
@@ -3892,7 +3894,7 @@ static void alpha_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
     if (tb_cflags(dcbase->tb) & CF_PCREL) {
         pc_arg &= ~TARGET_PAGE_MASK;
     }
-    tcg_gen_insn_start(pc_arg);
+    tcg_gen_insn_start(pc_arg, 0, 0);
     dc->insn_start_updated = false;
 }
 
@@ -3907,7 +3909,7 @@ static void alpha_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     assert((s->base.pc_next & 3) == 0);
 
     s->pc_curr = pc;
-    s->insn = insn = translator_ldl(env, dcbase, pc);
+    s->insn = insn = translator_ldl_end(env, dcbase, pc, MO_LE);
     s->base.pc_next = pc + 4;
 
     if (unlikely(!decode(s, insn))) {

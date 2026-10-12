@@ -6,6 +6,7 @@
 #include "qemu/osdep.h"
 #include "monitor/monitor.h"
 #include "monitor/hmp.h"
+#include "qobject/qdict.h"
 #include "cpu.h"
 #include "internals.h"
 
@@ -125,3 +126,5 @@ const MonitorDef alpha_monitor_defs[] = {
     { "f31", offsetof(CPUAlphaState, fpregs[31]) },
     { NULL },
 };
+
+#endif /* CONFIG_HMP */

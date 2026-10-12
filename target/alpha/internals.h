@@ -124,7 +124,6 @@ typedef struct GetPhysAddrResult {
 
 uint32_t alpha_ldl_phys(CPUState *cs, hwaddr addr);
 uint64_t alpha_ldq_phys(CPUState *cs, hwaddr addr);
-void alpha_stl_phys_notdirty(CPUState *cs, hwaddr addr, uint32_t val);
 void alpha_stl_phys(CPUState *cs, hwaddr addr, uint32_t val);
 void alpha_stq_phys(CPUState *cs, hwaddr addr, uint64_t val);
 

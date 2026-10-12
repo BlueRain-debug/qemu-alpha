@@ -577,11 +577,6 @@ static const TypeInfo m1543_superio_info = {
 #define ACPI_ENABLE     0xf1
 #define ACPI_DISABLE    0xf0
 
-static bool m1543_pmu_vmstate_need_smbus(void *opaque, int version_id)
-{
-    return pm_smbus_vmstate_needed();
-}
-
 #define VMSTATE_GPE_ARRAY(_field, _state)                            \
  {                                                                   \
      .name       = (stringify(_field)),                              \
@@ -602,8 +597,7 @@ static const VMStateDescription vmstate_acpi = {
         VMSTATE_UINT16(ar.pm1.evt.en, M1543PMUState),
         VMSTATE_UINT16(ar.pm1.cnt.cnt, M1543PMUState),
         VMSTATE_STRUCT(apm, M1543PMUState, 0, vmstate_apm, APMState),
-        VMSTATE_STRUCT_TEST(smb, M1543PMUState, m1543_pmu_vmstate_need_smbus,
-                            1, pmsmb_vmstate, PMSMBus),
+        VMSTATE_STRUCT(smb, M1543PMUState, 1, pmsmb_vmstate, PMSMBus),
         VMSTATE_TIMER_PTR(ar.tmr.timer, M1543PMUState),
         VMSTATE_INT64(ar.tmr.overflow_time, M1543PMUState),
         VMSTATE_GPE_ARRAY(ar.gpe.sts, M1543PMUState),

@@ -11,6 +11,15 @@
 #include "qom/qom-qobject.h"
 #include "cpu.h"
 
+CpuModelExpansionInfo *
+qmp_query_cpu_model_expansion(CpuModelExpansionType type,
+                              CpuModelInfo *model,
+                              Error **errp)
+{
+    error_setg(errp, "CPU model expansion is not supported on this target");
+    return NULL;
+}
+
 static void alpha_cpu_defs_entry(gpointer data, gpointer user_data)
 {
     ObjectClass *oc = data;
@@ -21,6 +30,7 @@ static void alpha_cpu_defs_entry(gpointer data, gpointer user_data)
     typename = object_class_get_name(oc);
     info = g_malloc0(sizeof(*info));
     info->name = cpu_model_from_type(typename);
+    info->q_typename = g_strdup(typename);
 
     QAPI_LIST_PREPEND(*first, info);
 }

@@ -51,7 +51,7 @@ uint32_t alpha_ldl_phys(CPUState *cs, hwaddr addr)
     MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
     AddressSpace *as = alpha_cpu_address_space(cs, attrs);
 
-    return address_space_ldl(as, addr, attrs, NULL);
+    return address_space_ldl_le(as, addr, attrs, NULL);
 }
 
 uint64_t alpha_ldq_phys(CPUState *cs, hwaddr addr)
@@ -59,15 +59,7 @@ uint64_t alpha_ldq_phys(CPUState *cs, hwaddr addr)
     MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
     AddressSpace *as = alpha_cpu_address_space(cs, attrs);
 
-    return address_space_ldq(as, addr, attrs, NULL);
-}
-
-void alpha_stl_phys_notdirty(CPUState *cs, hwaddr addr, uint32_t val)
-{
-    MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
-    AddressSpace *as = alpha_cpu_address_space(cs, attrs);
-
-    address_space_stl_notdirty(as, addr, val, attrs, NULL);
+    return address_space_ldq_le(as, addr, attrs, NULL);
 }
 
 void alpha_stl_phys(CPUState *cs, hwaddr addr, uint32_t val)
@@ -75,7 +67,7 @@ void alpha_stl_phys(CPUState *cs, hwaddr addr, uint32_t val)
     MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
     AddressSpace *as = alpha_cpu_address_space(cs, attrs);
 
-    address_space_stl(as, addr, val, attrs, NULL);
+    address_space_stl_le(as, addr, val, attrs, NULL);
 }
 
 void alpha_stq_phys(CPUState *cs, hwaddr addr, uint64_t val)
@@ -83,7 +75,7 @@ void alpha_stq_phys(CPUState *cs, hwaddr addr, uint64_t val)
     MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
     AddressSpace *as = alpha_cpu_address_space(cs, attrs);
 
-    address_space_stq(as, addr, val, attrs, NULL);
+    address_space_stq_le(as, addr, val, attrs, NULL);
 }
 
 static void ev4_excp_init(AlphaCPU *cpu)
@@ -757,7 +749,9 @@ void alpha_cpu_dump_state(CPUState *cs, FILE *f, int flags)
     }
 }
 
+#ifdef CONFIG_HMP
 extern const MonitorDef alpha_monitor_defs[];
+#endif
 #include "hw/core/sysemu-cpu-ops.h"
 
 static const struct SysemuCPUOps alpha_sysemu_ops = {
@@ -773,14 +767,26 @@ static const struct SysemuCPUOps alpha_sysemu_ops = {
 
 #include "accel/tcg/cpu-ops.h"
 
+static TCGTBCPUState alpha_get_tb_cpu_state(CPUState *cs)
+{
+    TCGTBCPUState state = {};
+
+    cpu_get_tb_cpu_state(cpu_env(cs), &state.pc, &state.cs_base, &state.flags);
+    return state;
+}
+
 static const TCGCPUOps alpha_tcg_ops = {
+    .mttcg_supported = true,
     .initialize = alpha_translate_init,
     .translate_code = alpha_translate_code,
+    .get_tb_cpu_state = alpha_get_tb_cpu_state,
     .synchronize_from_tb = alpha_synchronize_from_tb,
     .restore_state_to_opc = alpha_restore_state_to_opc,
     .mmu_index = alpha_cpu_mmu_index,
 
     .tlb_fill = alpha_cpu_tlb_fill,
+    .pointer_wrap = cpu_pointer_wrap_notreached,
+    .cpu_exec_reset = cpu_reset,
     .cpu_exec_interrupt = alpha_cpu_exec_interrupt,
     .cpu_exec_halt = alpha_cpu_exec_halt,
     .do_interrupt = alpha_cpu_do_interrupt,

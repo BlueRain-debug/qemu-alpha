@@ -459,7 +459,7 @@ static const Property pic_properties[] = {
     DEFINE_PROP_BOOL("ltim-supported", PICCommonState, ltim_supported, true),
 };
 
-static void i8259_class_init(ObjectClass *klass, void *data)
+static void i8259_class_init(ObjectClass *klass, const void *data)
 {
     PICClass *k = PIC_CLASS(klass);
     DeviceClass *dc = DEVICE_CLASS(klass);
