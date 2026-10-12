@@ -3686,6 +3686,7 @@ if have_system or have_user
   trace_events_subdirs += [
     'accel/tcg',
     'hw/core',
+    'target/alpha',
     'target/arm',
     'target/arm/hvf',
     'target/arm/tcg',

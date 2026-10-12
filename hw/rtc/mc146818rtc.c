@@ -43,9 +43,15 @@
 #include "qapi/error.h"
 #include "qapi/qapi-events-misc.h"
 #include "qapi/visitor.h"
-#include "trace.h"
 
+//#define DEBUG_CMOS
 //#define DEBUG_COALESCED
+
+#ifdef DEBUG_CMOS
+# define CMOS_DPRINTF(format, ...)      printf(format, ## __VA_ARGS__)
+#else
+# define CMOS_DPRINTF(format, ...)      do { } while (0)
+#endif
 
 #ifdef DEBUG_COALESCED
 # define DPRINTF_C(format, ...)      printf(format, ## __VA_ARGS__)
@@ -77,13 +83,12 @@ static inline bool rtc_running(MC146818RtcState *s)
             (s->cmos_data[RTC_REG_A] & 0x70) <= 0x20);
 }
 
-/*
- * Note: get_rtc_ns_since_last_update() does not include the base_rtc seconds
- * value.  This does not matter if the caller only needs the nanoseconds part.
- */
-static uint64_t get_rtc_ns_since_last_update(MC146818RtcState *s)
+static uint64_t get_guest_rtc_ns(MC146818RtcState *s)
 {
-    return qemu_clock_get_ns(rtc_clock) - s->last_update + s->offset;
+    uint64_t guest_clock = qemu_clock_get_ns(rtc_clock);
+
+    return s->base_rtc * NANOSECONDS_PER_SECOND +
+        guest_clock - s->last_update + s->offset;
 }
 
 static void rtc_coalesced_timer_update(MC146818RtcState *s)
@@ -107,7 +112,7 @@ void rtc_reset_reinjection(MC146818RtcState *rtc)
 static bool rtc_policy_slew_deliver_irq(MC146818RtcState *s)
 {
     kvm_reset_irq_delivered();
-    qemu_irq_raise(s->irq);
+    qemu_irq_raise(s->irq[0]);
     return kvm_get_irq_delivered();
 }
 
@@ -130,15 +135,45 @@ static void rtc_coalesced_timer(void *opaque)
 
 static uint32_t rtc_periodic_clock_ticks(MC146818RtcState *s)
 {
-    int period_code;
-
-    if (!(s->cmos_data[RTC_REG_B] & REG_B_PIE)) {
-        return 0;
-     }
-
-    period_code = s->cmos_data[RTC_REG_A] & 0x0f;
+    int period_code = s->cmos_data[RTC_REG_A] & 0x0f;
 
     return periodic_period_to_clock(period_code);
+}
+
+static void square_wave_timer_update(MC146818RtcState *s, int64_t current_time,
+                                     uint32_t old_period, bool period_change)
+{
+    uint32_t period;
+    int64_t cur_clock, next_irq_clock, lost_clock = 0;
+
+    period = rtc_periodic_clock_ticks(s);
+    if (!period) {
+        timer_del(s->square_wave_timer);
+        return;
+    }
+
+    /* compute 32 khz clock */
+    cur_clock =
+        muldiv64(current_time, RTC_CLOCK_RATE, NANOSECONDS_PER_SECOND);
+
+    /*
+     * if the square wave timer's update is due to period re-configuration,
+     * we should count the clock since last interrupt.
+     */
+    if (old_period && period_change) {
+        int64_t last_periodic_clock, next_periodic_clock;
+
+        next_periodic_clock = muldiv64(s->next_square_wave_time,
+                                RTC_CLOCK_RATE, NANOSECONDS_PER_SECOND);
+        last_periodic_clock = next_periodic_clock - old_period;
+        lost_clock = cur_clock - last_periodic_clock;
+        assert(lost_clock >= 0);
+    }
+
+    lost_clock = MIN(lost_clock, period);
+    next_irq_clock = cur_clock + period - lost_clock;
+    s->next_square_wave_time = periodic_clock_to_ns(next_irq_clock) + 1;
+    timer_mod(s->square_wave_timer, s->next_square_wave_time);
 }
 
 /*
@@ -220,6 +255,19 @@ static void periodic_timer_update(MC146818RtcState *s, int64_t current_time,
     timer_mod(s->periodic_timer, s->next_periodic_time);
 }
 
+static void rtc_square_wave_timer(void *opaque)
+{
+    MC146818RtcState *s = opaque;
+
+    square_wave_timer_update(s, s->next_square_wave_time, s->period, false);
+    if (s->cmos_data[RTC_REG_B] & REG_B_SQWE) {
+        qemu_set_irq(s->irq[1], s->square_wave_edge);
+        s->square_wave_edge = !s->square_wave_edge;
+    } else {
+        qemu_irq_lower(s->irq[1]);
+    }
+}
+
 static void rtc_periodic_timer(void *opaque)
 {
     MC146818RtcState *s = opaque;
@@ -238,7 +286,7 @@ static void rtc_periodic_timer(void *opaque)
                           s->irq_coalesced);
             }
         } else
-            qemu_irq_raise(s->irq);
+            qemu_irq_raise(s->irq[0]);
     }
 }
 
@@ -259,7 +307,7 @@ static void check_update_timer(MC146818RtcState *s)
         return;
     }
 
-    guest_nsec = get_rtc_ns_since_last_update(s) % NANOSECONDS_PER_SECOND;
+    guest_nsec = get_guest_rtc_ns(s) % NANOSECONDS_PER_SECOND;
     next_update_time = qemu_clock_get_ns(rtc_clock)
         + NANOSECONDS_PER_SECOND - guest_nsec;
 
@@ -419,7 +467,7 @@ static void rtc_update_timer(void *opaque)
     s->cmos_data[RTC_REG_C] |= irqs;
     if ((new_irqs & s->cmos_data[RTC_REG_B]) != 0) {
         s->cmos_data[RTC_REG_C] |= REG_C_IRQF;
-        qemu_irq_raise(s->irq);
+        qemu_irq_raise(s->irq[0]);
     }
     check_update_timer(s);
 }
@@ -430,11 +478,13 @@ static void cmos_ioport_write(void *opaque, hwaddr addr,
     MC146818RtcState *s = opaque;
     uint32_t old_period;
     bool update_periodic_timer;
+    bool update_square_wave_timer;
 
     if ((addr & 1) == 0) {
         s->cmos_index = data & 0x7f;
     } else {
-        trace_mc146818_rtc_ioport_write(s->cmos_index, data);
+        CMOS_DPRINTF("cmos: write index=0x%02x val=0x%02" PRIx64 "\n",
+                     s->cmos_index, data);
         switch(s->cmos_index) {
         case RTC_SECONDS_ALARM:
         case RTC_MINUTES_ALARM:
@@ -462,6 +512,7 @@ static void cmos_ioport_write(void *opaque, hwaddr addr,
             break;
         case RTC_REG_A:
             update_periodic_timer = (s->cmos_data[RTC_REG_A] ^ data) & 0x0f;
+            update_square_wave_timer = update_periodic_timer;
             old_period = rtc_periodic_clock_ticks(s);
 
             if ((data & 0x60) == 0x60) {
@@ -491,12 +542,19 @@ static void cmos_ioport_write(void *opaque, hwaddr addr,
                 periodic_timer_update(s, qemu_clock_get_ns(rtc_clock),
                                       old_period, true);
             }
+            if (update_square_wave_timer) {
+                square_wave_timer_update(s, qemu_clock_get_ns(rtc_clock),
+                                         old_period, true);
+            }
 
             check_update_timer(s);
             break;
         case RTC_REG_B:
             update_periodic_timer = (s->cmos_data[RTC_REG_B] ^ data)
                                        & REG_B_PIE;
+            update_square_wave_timer = (s->cmos_data[RTC_REG_B] ^ data)
+                                           & REG_B_SQWE;
+
             old_period = rtc_periodic_clock_ticks(s);
 
             if (data & REG_B_SET) {
@@ -511,7 +569,7 @@ static void cmos_ioport_write(void *opaque, hwaddr addr,
                 /* if disabling set mode, update the time */
                 if ((s->cmos_data[RTC_REG_B] & REG_B_SET) &&
                     (s->cmos_data[RTC_REG_A] & 0x70) <= 0x20) {
-                    s->offset = get_rtc_ns_since_last_update(s) % NANOSECONDS_PER_SECOND;
+                    s->offset = get_guest_rtc_ns(s) % NANOSECONDS_PER_SECOND;
                     rtc_set_time(s);
                 }
             }
@@ -519,16 +577,20 @@ static void cmos_ioport_write(void *opaque, hwaddr addr,
              * becomes enabled, raise an interrupt immediately.  */
             if (data & s->cmos_data[RTC_REG_C] & REG_C_MASK) {
                 s->cmos_data[RTC_REG_C] |= REG_C_IRQF;
-                qemu_irq_raise(s->irq);
+                qemu_irq_raise(s->irq[0]);
             } else {
                 s->cmos_data[RTC_REG_C] &= ~REG_C_IRQF;
-                qemu_irq_lower(s->irq);
+                qemu_irq_lower(s->irq[0]);
             }
             s->cmos_data[RTC_REG_B] = data;
 
             if (update_periodic_timer) {
                 periodic_timer_update(s, qemu_clock_get_ns(rtc_clock),
                                       old_period, true);
+            }
+            if (update_square_wave_timer) {
+                square_wave_timer_update(s, qemu_clock_get_ns(rtc_clock),
+                                         old_period, true);
             }
 
             check_update_timer(s);
@@ -624,8 +686,10 @@ static void rtc_update_time(MC146818RtcState *s)
 {
     struct tm ret;
     time_t guest_sec;
+    int64_t guest_nsec;
 
-    guest_sec = s->base_rtc + get_rtc_ns_since_last_update(s) / NANOSECONDS_PER_SECOND;
+    guest_nsec = get_guest_rtc_ns(s);
+    guest_sec = guest_nsec / NANOSECONDS_PER_SECOND;
     gmtime_r(&guest_sec, &ret);
 
     /* Is SET flag of Register B disabled? */
@@ -636,7 +700,7 @@ static void rtc_update_time(MC146818RtcState *s)
 
 static int update_in_progress(MC146818RtcState *s)
 {
-    uint64_t guest_nsec;
+    int64_t guest_nsec;
 
     if (!rtc_running(s)) {
         return 0;
@@ -651,7 +715,7 @@ static int update_in_progress(MC146818RtcState *s)
         }
     }
 
-    guest_nsec = get_rtc_ns_since_last_update(s);
+    guest_nsec = get_guest_rtc_ns(s);
     /* UIP bit will be set at last 244us of every second. */
     if ((guest_nsec % NANOSECONDS_PER_SECOND) >=
         (NANOSECONDS_PER_SECOND - UIP_HOLD_LENGTH)) {
@@ -695,7 +759,7 @@ static uint64_t cmos_ioport_read(void *opaque, hwaddr addr,
             break;
         case RTC_REG_C:
             ret = s->cmos_data[s->cmos_index];
-            qemu_irq_lower(s->irq);
+            qemu_irq_lower(s->irq[0]);
             s->cmos_data[RTC_REG_C] = 0x00;
             if (ret & (REG_C_UF | REG_C_AF)) {
                 check_update_timer(s);
@@ -718,20 +782,21 @@ static uint64_t cmos_ioport_read(void *opaque, hwaddr addr,
             ret = s->cmos_data[s->cmos_index];
             break;
         }
-        trace_mc146818_rtc_ioport_read(s->cmos_index, ret);
+        CMOS_DPRINTF("cmos: read index=0x%02x val=0x%02x\n",
+                     s->cmos_index, ret);
         return ret;
     }
 }
 
 void mc146818rtc_set_cmos_data(MC146818RtcState *s, int addr, int val)
 {
-    assert(addr >= 0 && addr < ARRAY_SIZE(s->cmos_data));
-    s->cmos_data[addr] = val;
+    if (addr >= 0 && addr <= 127)
+        s->cmos_data[addr] = val;
 }
 
 int mc146818rtc_get_cmos_data(MC146818RtcState *s, int addr)
 {
-    assert(addr >= 0 && addr < ARRAY_SIZE(s->cmos_data));
+    assert(addr >= 0 && addr <= 127);
     return s->cmos_data[addr];
 }
 
@@ -780,6 +845,10 @@ static int rtc_post_load(void *opaque, int version_id)
             now > (s->next_periodic_time + get_max_clock_jump())) {
             periodic_timer_update(s, qemu_clock_get_ns(rtc_clock), s->period, false);
         }
+        if (now < s->next_square_wave_time ||
+            now > (s->next_square_wave_time + get_max_clock_jump())) {
+            square_wave_timer_update(s, qemu_clock_get_ns(rtc_clock), s->period, false);
+        }
     }
 
     if (version_id >= 2) {
@@ -807,10 +876,29 @@ static const VMStateDescription vmstate_rtc_irq_reinject_on_ack_count = {
     }
 };
 
+static bool rtc_square_wave_needed(void *opaque)
+{
+    MC146818RtcState *s = (MC146818RtcState *)opaque;
+    return s->next_square_wave_time != 0;
+}
+
+static const VMStateDescription vmstate_rtc_square_wave = {
+    .name = "mc146818rtc/square_wave",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = rtc_square_wave_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_TIMER_PTR(square_wave_timer, MC146818RtcState),
+        VMSTATE_INT64(next_square_wave_time, MC146818RtcState),
+        VMSTATE_BOOL(square_wave_edge, MC146818RtcState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_rtc = {
     .name = "mc146818rtc",
     .version_id = 3,
-    .minimum_version_id = 3,
+    .minimum_version_id = 1,
     .pre_save = rtc_pre_save,
     .post_load = rtc_post_load,
     .fields = (const VMStateField[]) {
@@ -820,17 +908,18 @@ static const VMStateDescription vmstate_rtc = {
         VMSTATE_TIMER_PTR(periodic_timer, MC146818RtcState),
         VMSTATE_INT64(next_periodic_time, MC146818RtcState),
         VMSTATE_UNUSED(3*8),
-        VMSTATE_UINT32(irq_coalesced, MC146818RtcState),
-        VMSTATE_UINT32(period, MC146818RtcState),
-        VMSTATE_UINT64(base_rtc, MC146818RtcState),
-        VMSTATE_UINT64(last_update, MC146818RtcState),
-        VMSTATE_INT64(offset, MC146818RtcState),
-        VMSTATE_TIMER_PTR(update_timer, MC146818RtcState),
-        VMSTATE_UINT64(next_alarm_time, MC146818RtcState),
+        VMSTATE_UINT32_V(irq_coalesced, MC146818RtcState, 2),
+        VMSTATE_UINT32_V(period, MC146818RtcState, 2),
+        VMSTATE_UINT64_V(base_rtc, MC146818RtcState, 3),
+        VMSTATE_UINT64_V(last_update, MC146818RtcState, 3),
+        VMSTATE_INT64_V(offset, MC146818RtcState, 3),
+        VMSTATE_TIMER_PTR_V(update_timer, MC146818RtcState, 3),
+        VMSTATE_UINT64_V(next_alarm_time, MC146818RtcState, 3),
         VMSTATE_END_OF_LIST()
     },
     .subsections = (const VMStateDescription * const []) {
         &vmstate_rtc_irq_reinject_on_ack_count,
+        &vmstate_rtc_square_wave,
         NULL
     }
 };
@@ -903,8 +992,10 @@ static void rtc_realizefn(DeviceState *dev, Error **errp)
         return;
     }
 
+    s->square_wave_timer = timer_new_ns(rtc_clock, rtc_square_wave_timer, s);
     s->periodic_timer = timer_new_ns(rtc_clock, rtc_periodic_timer, s);
     s->update_timer = timer_new_ns(rtc_clock, rtc_update_timer, s);
+    periodic_timer_update(s, qemu_clock_get_ns(rtc_clock), 0, true);
     check_update_timer(s);
 
     s->suspend_notifier.notify = rtc_notify_suspend;
@@ -920,7 +1011,11 @@ static void rtc_realizefn(DeviceState *dev, Error **errp)
     memory_region_add_subregion(&s->io, 0, &s->coalesced_io);
     memory_region_add_coalescing(&s->coalesced_io, 0, 1);
 
-    qdev_init_gpio_out(dev, &s->irq, 1);
+    qdev_set_legacy_instance_id(dev, s->io_base, 3);
+
+    object_property_add_tm(OBJECT(s), "date", rtc_get_date);
+
+    qdev_init_gpio_out(dev, s->irq, 2);
 }
 
 MC146818RtcState *mc146818_rtc_init(ISABus *bus, int base_year,
@@ -969,6 +1064,7 @@ static void rtc_reset_enter(Object *obj, ResetType type)
     s->cmos_data[RTC_REG_C] &= ~(REG_C_UF | REG_C_IRQF | REG_C_PF | REG_C_AF);
     check_update_timer(s);
 
+    s->square_wave_edge = false;
 
     if (s->lost_tick_policy == LOST_TICK_POLICY_SLEW) {
         s->irq_coalesced = 0;
@@ -980,7 +1076,7 @@ static void rtc_reset_hold(Object *obj, ResetType type)
 {
     MC146818RtcState *s = MC146818_RTC(obj);
 
-    qemu_irq_lower(s->irq);
+    qemu_irq_lower(s->irq[0]);
 }
 
 static void rtc_build_aml(AcpiDevAmlIf *adev, Aml *scope)
@@ -1005,7 +1101,7 @@ static void rtc_build_aml(AcpiDevAmlIf *adev, Aml *scope)
     aml_append(scope, dev);
 }
 
-static void rtc_class_initfn(ObjectClass *klass, const void *data)
+static void rtc_class_initfn(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     ResettableClass *rc = RESETTABLE_CLASS(klass);
@@ -1018,8 +1114,6 @@ static void rtc_class_initfn(ObjectClass *klass, const void *data)
     adevc->build_dev_aml = rtc_build_aml;
     device_class_set_props(dc, mc146818rtc_properties);
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
-
-    object_class_property_add_tm(klass, "date", rtc_get_date);
 }
 
 static const TypeInfo mc146818rtc_info = {
@@ -1027,7 +1121,7 @@ static const TypeInfo mc146818rtc_info = {
     .parent        = TYPE_ISA_DEVICE,
     .instance_size = sizeof(MC146818RtcState),
     .class_init    = rtc_class_initfn,
-    .interfaces = (const InterfaceInfo[]) {
+    .interfaces = (InterfaceInfo[]) {
         { TYPE_ACPI_DEV_AML_IF },
         { },
     },

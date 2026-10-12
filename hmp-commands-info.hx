@@ -106,6 +106,18 @@ SRST
     Show the cpu registers.
 ERST
 
+#if defined(TARGET_ALPHA)
+    {
+        .name       = "iprs",
+        .args_type  = "cpustate_all:-a,vcpu:i?",
+        .params     = "[-a|vcpu]",
+        .help       = "show the cpu internal processor registers (-a: show IPR info for all cpus;"
+                      " vcpu: specific vCPU to query; show the current CPU's IPRs if"
+                      " no argument is specified)",
+        .cmd        = hmp_info_iprs,
+    },
+#endif
+
     {
         .name       = "lapic",
         .args_type  = "apic-id:i?",

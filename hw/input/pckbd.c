@@ -278,6 +278,13 @@ static uint64_t kbd_read_status(void *opaque, hwaddr addr,
     return val;
 }
 
+static void kbd_ctrl_reset(KBDState *s)
+{
+    s->status |= KBD_STAT_OBF;
+    s->outport |= KBD_OUT_OBF;
+    s->obsrc = KBD_OBSRC_CTRL;
+}
+
 static void kbd_queue(KBDState *s, int b, int aux)
 {
     if (s->extended_state) {
@@ -357,6 +364,7 @@ static void kbd_write_command(void *opaque, hwaddr addr,
         break;
     case KBD_CCMD_SELF_TEST:
         s->status |= KBD_STAT_SELFTEST;
+        kbd_ctrl_reset(s);
         kbd_queue(s, 0x55, 0);
         break;
     case KBD_CCMD_KBD_TEST:

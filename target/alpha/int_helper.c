@@ -1,29 +1,17 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- *  Helpers for integer and multimedia instructions.
- *
- *  Copyright (c) 2007 Jocelyn Mayer
- *
- * This library is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation; either
- * version 2.1 of the License, or (at your option) any later version.
- *
- * This library is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, see <http://www.gnu.org/licenses/>.
+ * Helpers for integer and multimedia instructions.
  */
 
 #include "qemu/osdep.h"
-#include "cpu.h"
+#include "exec/exec-all.h"
 #include "exec/helper-proto.h"
 #include "qemu/host-utils.h"
+#include "cpu.h"
+#include "internals.h"
+#include "syndrome.h"
 
-
-uint64_t helper_zapnot(uint64_t val, uint64_t mskb)
+uint64_t HELPER(zapnot)(uint64_t val, uint64_t mskb)
 {
     uint64_t mask;
 
@@ -35,19 +23,19 @@ uint64_t helper_zapnot(uint64_t val, uint64_t mskb)
     mask |= -(mskb & 0x20) & 0x0000ff0000000000ull;
     mask |= -(mskb & 0x40) & 0x00ff000000000000ull;
     mask |= -(mskb & 0x80) & 0xff00000000000000ull;
-
     return val & mask;
 }
 
-uint64_t helper_zap(uint64_t val, uint64_t mask)
+uint64_t HELPER(zap)(uint64_t val, uint64_t mask)
 {
-    return helper_zapnot(val, ~mask);
+    return HELPER(zapnot)(val, ~mask);
 }
 
-uint64_t helper_cmpbe0(uint64_t a)
+uint64_t HELPER(cmpbe0)(uint64_t a)
 {
     uint64_t m = 0x7f7f7f7f7f7f7f7fULL;
     uint64_t c = ~(((a & m) + m) | a | m);
+
     /* a.......b.......c.......d.......e.......f.......g.......h....... */
     c |= c << 7;
     /* ab......bc......cd......de......ef......fg......gh......h....... */
@@ -58,7 +46,7 @@ uint64_t helper_cmpbe0(uint64_t a)
     return c >> 56;
 }
 
-uint64_t helper_cmpbge(uint64_t a, uint64_t b)
+uint64_t HELPER(cmpbge)(uint64_t a, uint64_t b)
 {
     uint64_t mask = 0x00ff00ff00ff00ffULL;
     uint64_t test = 0x0100010001000100ULL;
@@ -70,8 +58,10 @@ uint64_t helper_cmpbge(uint64_t a, uint64_t b)
     ah = (a >> 8) & mask;
     bh = (b >> 8) & mask;
 
-    /* "Compare".  If a byte in B is greater than a byte in A,
-       it will clear the test bit.  */
+    /*
+     * "Compare".  If a byte in B is greater than a byte in A,
+     * it will clear the test bit.
+     */
     cl = ((al | test) - bl) & test;
     ch = ((ah | test) - bh) & test;
 
@@ -87,7 +77,7 @@ uint64_t helper_cmpbge(uint64_t a, uint64_t b)
     return cl >> 50;
 }
 
-uint64_t helper_minub8(uint64_t op1, uint64_t op2)
+uint64_t HELPER(minub8)(uint64_t op1, uint64_t op2)
 {
     uint64_t res = 0;
     uint8_t opa, opb, opr;
@@ -102,7 +92,7 @@ uint64_t helper_minub8(uint64_t op1, uint64_t op2)
     return res;
 }
 
-uint64_t helper_minsb8(uint64_t op1, uint64_t op2)
+uint64_t HELPER(minsb8)(uint64_t op1, uint64_t op2)
 {
     uint64_t res = 0;
     int8_t opa, opb;
@@ -118,7 +108,7 @@ uint64_t helper_minsb8(uint64_t op1, uint64_t op2)
     return res;
 }
 
-uint64_t helper_minuw4(uint64_t op1, uint64_t op2)
+uint64_t HELPER(minuw4)(uint64_t op1, uint64_t op2)
 {
     uint64_t res = 0;
     uint16_t opa, opb, opr;
@@ -133,7 +123,7 @@ uint64_t helper_minuw4(uint64_t op1, uint64_t op2)
     return res;
 }
 
-uint64_t helper_minsw4(uint64_t op1, uint64_t op2)
+uint64_t HELPER(minsw4)(uint64_t op1, uint64_t op2)
 {
     uint64_t res = 0;
     int16_t opa, opb;
@@ -149,7 +139,7 @@ uint64_t helper_minsw4(uint64_t op1, uint64_t op2)
     return res;
 }
 
-uint64_t helper_maxub8(uint64_t op1, uint64_t op2)
+uint64_t HELPER(maxub8)(uint64_t op1, uint64_t op2)
 {
     uint64_t res = 0;
     uint8_t opa, opb, opr;
@@ -164,7 +154,7 @@ uint64_t helper_maxub8(uint64_t op1, uint64_t op2)
     return res;
 }
 
-uint64_t helper_maxsb8(uint64_t op1, uint64_t op2)
+uint64_t HELPER(maxsb8)(uint64_t op1, uint64_t op2)
 {
     uint64_t res = 0;
     int8_t opa, opb;
@@ -180,7 +170,7 @@ uint64_t helper_maxsb8(uint64_t op1, uint64_t op2)
     return res;
 }
 
-uint64_t helper_maxuw4(uint64_t op1, uint64_t op2)
+uint64_t HELPER(maxuw4)(uint64_t op1, uint64_t op2)
 {
     uint64_t res = 0;
     uint16_t opa, opb, opr;
@@ -195,7 +185,7 @@ uint64_t helper_maxuw4(uint64_t op1, uint64_t op2)
     return res;
 }
 
-uint64_t helper_maxsw4(uint64_t op1, uint64_t op2)
+uint64_t HELPER(maxsw4)(uint64_t op1, uint64_t op2)
 {
     uint64_t res = 0;
     int16_t opa, opb;
@@ -211,7 +201,7 @@ uint64_t helper_maxsw4(uint64_t op1, uint64_t op2)
     return res;
 }
 
-uint64_t helper_perr(uint64_t op1, uint64_t op2)
+uint64_t HELPER(perr)(uint64_t op1, uint64_t op2)
 {
     uint64_t res = 0;
     uint8_t opa, opb, opr;
@@ -230,35 +220,40 @@ uint64_t helper_perr(uint64_t op1, uint64_t op2)
     return res;
 }
 
-uint64_t helper_pklb(uint64_t op1)
+uint64_t HELPER(pklb)(uint64_t op1)
 {
-    return (op1 & 0xff) | ((op1 >> 24) & 0xff00);
+    return (op1 & 0x00ff) | ((op1 >> 24) & 0xff00);
 }
 
-uint64_t helper_pkwb(uint64_t op1)
+uint64_t HELPER(pkwb)(uint64_t op1)
 {
-    return ((op1 & 0xff)
-            | ((op1 >> 8) & 0xff00)
-            | ((op1 >> 16) & 0xff0000)
-            | ((op1 >> 24) & 0xff000000));
+    return (((op1 >>  0) & 0x000000ff) |
+            ((op1 >>  8) & 0x0000ff00) |
+            ((op1 >> 16) & 0x00ff0000) |
+            ((op1 >> 24) & 0xff000000));
 }
 
-uint64_t helper_unpkbl(uint64_t op1)
+uint64_t HELPER(unpkbl)(uint64_t op1)
 {
-    return (op1 & 0xff) | ((op1 & 0xff00) << 24);
+    return (op1 & 0x00ff) | ((op1 & 0xff00) << 24);
 }
 
-uint64_t helper_unpkbw(uint64_t op1)
+uint64_t HELPER(unpkbw)(uint64_t op1)
 {
-    return ((op1 & 0xff)
-            | ((op1 & 0xff00) << 8)
-            | ((op1 & 0xff0000) << 16)
-            | ((op1 & 0xff000000) << 24));
+    return (((op1 & 0x000000ff) <<  0) |
+            ((op1 & 0x0000ff00) <<  8) |
+            ((op1 & 0x00ff0000) << 16) |
+            ((op1 & 0xff000000) << 24));
 }
 
-void helper_check_overflow(CPUAlphaState *env, uint64_t op1, uint64_t op2)
+void HELPER(check_overflow)(CPUAlphaState *env, uint64_t op1, uint64_t op2)
 {
+    uint32_t iss = 0;
+
     if (unlikely(op1 != op2)) {
-        arith_excp(env, GETPC(), EXC_M_IOV, 0);
+        SET_FIELD(iss, ARITH_ISS, IOV, 1);
+        SET_FIELD(iss, ARITH_ISS, INT, 1);
+        do_raise_exception_ra(env, EXCP_ARITH, syn_arith(iss),
+                              GETPC());
     }
 }
