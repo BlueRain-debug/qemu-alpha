@@ -125,6 +125,7 @@ void ne2000_reset(NE2000State *s)
 {
     int i;
 
+    s->cmd = E8390_NODMA | E8390_STOP;   /* 0x21, DP8390 reset state */
     s->isr = ENISR_RESET;
     memcpy(s->mem, &s->c.macaddr, 6);
     s->mem[14] = 0x57;
@@ -433,8 +434,7 @@ static uint32_t ne2000_ioport_read(void *opaque, uint32_t addr)
 static inline void ne2000_mem_writeb(NE2000State *s, uint32_t addr,
                                      uint32_t val)
 {
-    if (addr < 32 ||
-        (addr >= NE2000_PMEM_START && addr < NE2000_MEM_SIZE)) {
+    if (addr < NE2000_MEM_SIZE) {
         s->mem[addr] = val;
     }
 }
@@ -443,8 +443,7 @@ static inline void ne2000_mem_writew(NE2000State *s, uint32_t addr,
                                      uint32_t val)
 {
     addr &= ~1; /* XXX: check exact behaviour if not even */
-    if (addr < 32 ||
-        (addr >= NE2000_PMEM_START && addr < NE2000_MEM_SIZE)) {
+    if (addr < NE2000_MEM_SIZE) {
         *(uint16_t *)(s->mem + addr) = cpu_to_le16(val);
     }
 }
@@ -453,17 +452,14 @@ static inline void ne2000_mem_writel(NE2000State *s, uint32_t addr,
                                      uint32_t val)
 {
     addr &= ~1; /* XXX: check exact behaviour if not even */
-    if (addr < 32
-        || (addr >= NE2000_PMEM_START
-            && addr + sizeof(uint32_t) <= NE2000_MEM_SIZE)) {
+    if (addr + sizeof(uint32_t) <= NE2000_MEM_SIZE) {
         stl_le_p(s->mem + addr, val);
     }
 }
 
 static inline uint32_t ne2000_mem_readb(NE2000State *s, uint32_t addr)
 {
-    if (addr < 32 ||
-        (addr >= NE2000_PMEM_START && addr < NE2000_MEM_SIZE)) {
+    if (addr < NE2000_MEM_SIZE) {
         return s->mem[addr];
     } else {
         return 0xff;
@@ -473,8 +469,7 @@ static inline uint32_t ne2000_mem_readb(NE2000State *s, uint32_t addr)
 static inline uint32_t ne2000_mem_readw(NE2000State *s, uint32_t addr)
 {
     addr &= ~1; /* XXX: check exact behaviour if not even */
-    if (addr < 32 ||
-        (addr >= NE2000_PMEM_START && addr < NE2000_MEM_SIZE)) {
+    if (addr < NE2000_MEM_SIZE) {
         return le16_to_cpu(*(uint16_t *)(s->mem + addr));
     } else {
         return 0xffff;
@@ -484,9 +479,7 @@ static inline uint32_t ne2000_mem_readw(NE2000State *s, uint32_t addr)
 static inline uint32_t ne2000_mem_readl(NE2000State *s, uint32_t addr)
 {
     addr &= ~1; /* XXX: check exact behaviour if not even */
-    if (addr < 32
-        || (addr >= NE2000_PMEM_START
-            && addr + sizeof(uint32_t) <= NE2000_MEM_SIZE)) {
+    if (addr + sizeof(uint32_t) <= NE2000_MEM_SIZE) {
         return ldl_le_p(s->mem + addr);
     } else {
         return 0xffffffff;
@@ -547,6 +540,43 @@ static uint32_t ne2000_asic_ioport_read(void *opaque, uint32_t addr)
     }
 #ifdef DEBUG_NE2000
     printf("NE2000: asic read val=0x%04x\n", ret);
+#endif
+    return ret;
+}
+
+static void ne2000_asic_ioport_writeb(void *opaque, uint32_t addr, uint32_t val)
+{
+    NE2000State *s = opaque;
+
+#ifdef DEBUG_NE2000
+    printf("NE2000: asic writeb val=0x%02x\n", val);
+#endif
+    if (s->rcnt == 0)
+        return;
+    ne2000_mem_writeb(s, s->rsar, val);
+    ne2000_dma_update(s, 1);
+}
+
+static uint32_t ne2000_asic_ioport_readb(void *opaque, uint32_t addr)
+{
+    NE2000State *s = opaque;
+    int ret;
+
+    if (s->rsar < 32) {
+        /*
+         * The station address PROM is stored in local memory with every
+         * byte duplicated, so a 16-bit remote DMA access sees each byte
+         * twice.  An 8-bit access walks the PROM itself, one byte at a
+         * time.
+         */
+        ret = ne2000_mem_readb(s, (s->rsar & 0x0f) << 1);
+    } else {
+        ret = ne2000_mem_readb(s, s->rsar);
+    }
+    ne2000_dma_update(s, 1);
+
+#ifdef DEBUG_NE2000
+    printf("NE2000: asic readb val=0x%02x\n", ret);
 #endif
     return ret;
 }
@@ -638,8 +668,10 @@ static uint64_t ne2000_read(void *opaque, hwaddr addr,
 
     if (addr < 0x10 && size == 1) {
         val = ne2000_ioport_read(s, addr);
-    } else if (addr == 0x10) {
-        if (size <= 2) {
+    } else if (addr >= 0x10 && addr < 0x1f) {
+        if (size == 1) {
+            val = ne2000_asic_ioport_readb(s, addr);
+        } else if (size <= 2) {
             val = ne2000_asic_ioport_read(s, addr);
         } else {
             val = ne2000_asic_ioport_readl(s, addr);
@@ -662,8 +694,10 @@ static void ne2000_write(void *opaque, hwaddr addr,
     trace_ne2000_write(addr, data);
     if (addr < 0x10 && size == 1) {
         ne2000_ioport_write(s, addr, data);
-    } else if (addr == 0x10) {
-        if (size <= 2) {
+    } else if (addr >= 0x10 && addr < 0x1f) {
+        if (size == 1) {
+            ne2000_asic_ioport_writeb(s, addr, data);
+        } else if (size <= 2) {
             ne2000_asic_ioport_write(s, addr, data);
         } else {
             ne2000_asic_ioport_writel(s, addr, data);

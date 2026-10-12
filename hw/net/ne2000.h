@@ -4,8 +4,10 @@
 #include "qemu/units.h"
 #include "net/net.h"
 
-#define NE2000_PMEM_SIZE    (32 * KiB)
-#define NE2000_PMEM_START   (16 * KiB)
+/* #define NE2000_PMEM_SIZE    (32 * KiB)
+#define NE2000_PMEM_START   (16 * KiB) */
+#define NE2000_PMEM_SIZE    (64 * KiB)
+#define NE2000_PMEM_START   (0)
 #define NE2000_PMEM_END     (NE2000_PMEM_SIZE+NE2000_PMEM_START)
 #define NE2000_MEM_SIZE     NE2000_PMEM_END
 
