@@ -118,6 +118,11 @@ ERST
     },
 #endif
 
+SRST
+  ``info iprs``
+    Show the cpu internal processor registers.
+ERST
+
     {
         .name       = "lapic",
         .args_type  = "apic-id:i?",
