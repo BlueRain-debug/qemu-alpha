@@ -21,6 +21,7 @@
 #include "../display/vga_int.h"
 #include "trace.h"
 #include "ui/pixel_ops.h"
+#include "ui/console.h"
 
 #define TYPE_JENSEN_S3 "jensen-s3-928"
 OBJECT_DECLARE_SIMPLE_TYPE(JensenS3State, JENSEN_S3)
@@ -271,7 +272,7 @@ static void s3_cursor_draw_line(VGACommonState *vga, uint8_t *dest, int y)
 }
 
 /* Enhanced scanout bypasses the VGA Graphics Controller shift mode. */
-static void s3_update_display(void *opaque)
+static bool s3_update_display(void *opaque)
 {
     VGACommonState *vga = opaque;
     JensenS3State *s = container_of(vga, JensenS3State, vga);
@@ -284,6 +285,7 @@ static void s3_update_display(void *opaque)
     /* The VGA renderer is synchronous under the BQL. Keep guest readback. */
     vga->hw_ops->gfx_update(vga);
     vga->gr[5] = mode;
+    return true;
 }
 
 static int s3_bpp(VGACommonState *vga)
@@ -1276,7 +1278,7 @@ static void s3_realize(DeviceState *dev, Error **errp)
     }
     s->hw_ops = *vga->hw_ops;
     s->hw_ops.gfx_update = s3_update_display;
-    vga->con = graphic_console_init(dev, 0, &s->hw_ops, vga);
+    vga->con = qemu_graphic_console_create(dev, 0, &s->hw_ops, vga);
 }
 
 static const VMStateDescription s3_vmstate = {
@@ -1284,7 +1286,7 @@ static const VMStateDescription s3_vmstate = {
     .unmigratable = true,
 };
 
-static void s3_class_init(ObjectClass *klass, void *data)
+static void s3_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     dc->realize = s3_realize;

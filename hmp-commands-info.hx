@@ -106,7 +106,6 @@ SRST
     Show the cpu registers.
 ERST
 
-#if defined(TARGET_ALPHA)
     {
         .name       = "iprs",
         .args_type  = "cpustate_all:-a,vcpu:i?",
@@ -115,8 +114,8 @@ ERST
                       " vcpu: specific vCPU to query; show the current CPU's IPRs if"
                       " no argument is specified)",
         .cmd        = hmp_info_iprs,
+        .arch_bitmask = QEMU_ARCH_ALPHA,
     },
-#endif
 
 SRST
   ``info iprs``

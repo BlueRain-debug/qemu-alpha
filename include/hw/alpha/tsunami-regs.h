@@ -1,7 +1,7 @@
 #ifndef _ALPHA_TSUNAMI_REGS_H
 #define _ALPHA_TSUNAMI_REGS_H
 
-#include "hw/registerfields.h"
+#include "hw/core/registerfields.h"
 
 /*
  * Tsunami register definitions.

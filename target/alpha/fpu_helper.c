@@ -11,7 +11,7 @@
  */
 
 #include "qemu/osdep.h"
-#include "exec/exec-all.h"
+#include "accel/tcg/cpu-loop.h"
 #include "exec/helper-proto.h"
 #include "fpu_helper.h"
 #include "cpu.h"

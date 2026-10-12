@@ -11,12 +11,12 @@
 #include "qemu/option.h"
 #include "qemu/units.h"
 #include "qapi/error.h"
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "hw/block/flash.h"
 #include "hw/block/block.h"
 #include "hw/alpha/tigbus.h"
 #include "hw/alpha/am29f016.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "system/block-backend.h"
 #include "migration/vmstate.h"
 #include "system/blockdev.h"
@@ -79,7 +79,7 @@ static void pflash_am29f016_realize(DeviceState *dev, Error **errp)
     memory_region_add_subregion(iomem, 0, sysbus_mmio_get_region(sbd, 0));
 }
 
-static void pflash_am29f016_class_init(ObjectClass *klass, void *data)
+static void pflash_am29f016_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 

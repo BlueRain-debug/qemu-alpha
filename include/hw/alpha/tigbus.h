@@ -3,9 +3,9 @@
 #ifndef _ALPHA_TIGBUS_H
 #define _ALPHA_TIGBUS_H
 
-#include "hw/qdev-properties.h"
-#include "hw/sysbus.h"
-#include "exec/address-spaces.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/core/sysbus.h"
+#include "system/address-spaces.h"
 #include "qom/object.h"
 
 #define TYPE_TIG_BUS "tig-bus"

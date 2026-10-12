@@ -8,12 +8,13 @@
  */
 
 #include "qemu/osdep.h"
+#include "system/physmem.h"
 #include "qemu/datadir.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "qemu/units.h"
 #include "qapi/error.h"
-#include "hw/boards.h"
+#include "hw/core/boards.h"
 #include "hw/block/flash.h"
 #include "hw/block/fdc.h"
 #include "hw/dma/i8257.h"
@@ -22,9 +23,9 @@
 #include "hw/intc/i8259.h"
 #include "hw/isa/isa.h"
 #include "hw/core/irq.h"
-#include "hw/loader.h"
-#include "hw/qdev-clock.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/loader.h"
+#include "hw/core/qdev-clock.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/rtc/mc146818rtc.h"
 #include "hw/timer/i8254.h"
 #include "hw/timer/i8254_internal.h"
@@ -214,11 +215,11 @@ static uint64_t jensen_isp_read(void *opaque, hwaddr addr, unsigned size)
 
     switch (addr) {
     case 0x61:
-        pit_get_channel_info(s->pit, 2, &info);
+        pit_get_channel_info(PIT_COMMON(s->pit), 2, &info);
         /* Refresh status follows the existing PIT refresh counter. */
         {
             PITChannelInfo refresh;
-            pit_get_channel_info(s->pit, 1, &refresh);
+            pit_get_channel_info(PIT_COMMON(s->pit), 1, &refresh);
             return s->nmi_control | (info.out << 5) | (refresh.out << 4);
         }
     case 0x70:
@@ -253,7 +254,7 @@ static void jensen_isp_write(void *opaque, hwaddr addr,
     switch (addr) {
     case 0x61:
         s->nmi_control = value & 0x0f;
-        pit_set_gate(s->pit, 2, value & 1);
+        pit_set_gate(PIT_COMMON(s->pit), 2, value & 1);
         jensen_nmi_update(s);
         return;
     case 0x70:
@@ -669,9 +670,9 @@ static void jensen_reset(MachineState *ms, ResetType type)
     qemu_devices_reset(type);
 
     /* Ensure fresh console scratch RAM for the SROM handoff (10-12). */
-    cpu_physical_memory_write(0, scratch, 3 * MiB);
+    physical_memory_write(0, scratch, 3 * MiB);
     /* Reload the SROM handoff from the current Flash on every reset. */
-    cpu_physical_memory_write(JENSEN_BOOT_BASE,
+    physical_memory_write(JENSEN_BOOT_BASE,
         memory_region_get_ram_ptr(pflash_cfi01_get_memory(s->flash[1])),
         JENSEN_BOOT_SIZE);
     cpu_reset(CPU(s->cpu));
@@ -688,7 +689,7 @@ static void jensen_reset(MachineState *ms, ResetType type)
     s->nmi_control = s->nmi_extended = s->nmi_mask = 0;
     jensen_nmi_update(s);
     jensen_srom_init_pic(s);
-    pit_set_gate(s->pit, 2, 0);
+    pit_set_gate(PIT_COMMON(s->pit), 2, 0);
     s->pit2_pause_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     mc146818rtc_set_cmos_data(s->rtc, 0x69, 0x9d);
     mc146818rtc_set_cmos_data(s->rtc, 0x6a, 0x07);
@@ -1009,7 +1010,7 @@ static void jensen_finalize(Object *obj)
     g_free(s->s3_romfile);
 }
 
-static void jensen_class_init(ObjectClass *oc, void *data)
+static void jensen_class_init(ObjectClass *oc, const void *data)
 {
     static const char * const cpu_types[] = {
         ALPHA_CPU_TYPE_NAME("ev4"), NULL

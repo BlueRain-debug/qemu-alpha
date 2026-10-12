@@ -22,7 +22,7 @@
 #include "hw/isa/apm.h"
 #include "hw/isa/isa.h"
 #include "hw/pci/pci.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/southbridge/m1543.h"
 #include "hw/timer/i8254.h"
 #include "hw/usb/hcd-uhci.h"
@@ -536,7 +536,7 @@ static void m1543_superio_initfn(Object *obj)
                           "m1543-superio", 2);
 }
 
-static void m1543_superio_class_init(ObjectClass *klass, void *data)
+static void m1543_superio_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     ISASuperIOClass *sc = ISA_SUPERIO_CLASS(klass);
@@ -756,7 +756,7 @@ static void m1543_pmu_init(Object *obj)
     qdev_init_gpio_out(DEVICE(obj), &s->irq, 1);
 }
 
-static void m1543_pmu_class_init(ObjectClass *klass, void *data)
+static void m1543_pmu_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
@@ -1241,7 +1241,7 @@ static const Property m1543_pci_props[] = {
                      M1543PCIState, alt_pci_irq_routing, false),
 };
 
-static void m1543_pci_class_init(ObjectClass *klass, void *data)
+static void m1543_pci_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);

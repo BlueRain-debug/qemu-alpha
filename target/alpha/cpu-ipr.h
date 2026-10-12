@@ -6,7 +6,7 @@
 #ifndef _ALPHA_CPU_IPR_H
 #define _ALPHA_CPU_IPR_H
 
-#include "hw/registerfields.h"
+#include "hw/core/registerfields.h"
 
 /* Bit definitions for CC */
 FIELD(CC, COUNTER_BOT, 0, 4)

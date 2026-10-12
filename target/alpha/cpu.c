@@ -9,15 +9,19 @@
 #include "qemu/module.h"
 #include "qemu/qemu-print.h"
 #include "qapi/error.h"
-#include "exec/exec-all.h"
+#include "accel/tcg/cpu-loop.h"
 #include "fpu/softfloat-helpers.h"
-#include "hw/boards.h"
-#include "hw/clock.h"
-#include "hw/qdev-clock.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/boards.h"
+#include "hw/core/clock.h"
+#include "hw/core/qdev-clock.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/intc/intc.h"
 #include "tcg/tcg.h"
 #include "cpu.h"
+#include "exec/target_page.h"
+#include "exec/watchpoint.h"
+#include "exec/translation-block.h"
+#include "monitor/hmp.h"
 #include "internals.h"
 #include "ipregs.h"
 #include "trace.h"
@@ -579,7 +583,7 @@ void alpha_emulate_srom_reset(CPUState *cs)
     alpha_cpu_set_reg_value(env, IR_A5, 0);
 }
 
-static void alpha_cpu_disas_set_info(CPUState *cs, disassemble_info *info)
+static void alpha_cpu_disas_set_info(const CPUState *cs, disassemble_info *info)
 {
     AlphaCPU *cpu = ALPHA_CPU(cs);
     const gchar *flavor;
@@ -664,8 +668,7 @@ static void alpha_cpu_realizefn(DeviceState *dev, Error **errp)
     /* Use pc-relative instructions in system-mode */
     tcg_cflags_set(cs, CF_PCREL);
 
-    cpu_exec_realizefn(cs, &local_err);
-    if (local_err != NULL) {
+    if (!cpu_common_realize(cs, &local_err)) {
         error_propagate(errp, local_err);
         return;
     }
@@ -754,14 +757,18 @@ void alpha_cpu_dump_state(CPUState *cs, FILE *f, int flags)
     }
 }
 
+extern const MonitorDef alpha_monitor_defs[];
 #include "hw/core/sysemu-cpu-ops.h"
 
 static const struct SysemuCPUOps alpha_sysemu_ops = {
     .has_work = alpha_cpu_has_work,
-    .get_phys_page_debug = alpha_cpu_get_phys_page_debug,
+    .get_phys_addr_debug = alpha_cpu_get_phys_page_debug,
     .write_elf32_note = alpha_cpu_write_elf32_note,
     .write_elf64_note = alpha_cpu_write_elf64_note,
     .legacy_vmsd = &vmstate_alpha_cpu,
+#ifdef CONFIG_HMP
+    .monitor_defs = alpha_monitor_defs,
+#endif
 };
 
 #include "accel/tcg/cpu-ops.h"
@@ -771,6 +778,7 @@ static const TCGCPUOps alpha_tcg_ops = {
     .translate_code = alpha_translate_code,
     .synchronize_from_tb = alpha_synchronize_from_tb,
     .restore_state_to_opc = alpha_restore_state_to_opc,
+    .mmu_index = alpha_cpu_mmu_index,
 
     .tlb_fill = alpha_cpu_tlb_fill,
     .cpu_exec_interrupt = alpha_cpu_exec_interrupt,
@@ -817,14 +825,14 @@ static void alpha_cpu_instance_init(Object *obj)
     alpha_cpu_post_init(obj);
 }
 
-static void alpha_cpu_register_class_init(ObjectClass *oc, void *data)
+static void alpha_cpu_register_class_init(ObjectClass *oc, const void *data)
 {
     AlphaCPUClass *acc = ALPHA_CPU_CLASS(oc);
 
     acc->info = data;
 }
 
-static void alpha_cpu_class_init(ObjectClass *oc, void *data)
+static void alpha_cpu_class_init(ObjectClass *oc, const void *data)
 {
     AlphaCPUClass *acc = ALPHA_CPU_CLASS(oc);
     CPUClass *cc = CPU_CLASS(acc);
@@ -840,7 +848,7 @@ static void alpha_cpu_class_init(ObjectClass *oc, void *data)
                                        &acc->parent_phases);
 
     cc->class_by_name = alpha_cpu_class_by_name;
-    cc->mmu_index = alpha_cpu_mmu_index;
+
     cc->dump_state = alpha_cpu_dump_state;
     cc->set_pc = alpha_cpu_set_pc;
     cc->get_pc = alpha_cpu_get_pc;

@@ -8,7 +8,7 @@
 #include "qemu/log.h"
 #include "exec/helper-proto.h"
 #include "exec/helper-gen.h"
-#include "exec/exec-all.h"
+#include "accel/tcg/cpu-loop.h"
 #include "translate.h"
 #include "cpu.h"
 #include "ipregs.h"

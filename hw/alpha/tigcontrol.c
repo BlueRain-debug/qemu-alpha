@@ -3,10 +3,10 @@
 #include "qemu/osdep.h"
 #include "qemu/units.h"
 #include "qemu/log.h"
-#include "hw/registerfields.h"
+#include "hw/core/registerfields.h"
 #include "hw/alpha/tigbus.h"
 #include "hw/alpha/tigcontrol.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
@@ -333,7 +333,7 @@ static void tig_control_init(Object *obj)
                           "tig-control", sizeof(s->regs));
 }
 
-static void tig_control_class_init(ObjectClass *klass, void *data)
+static void tig_control_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 

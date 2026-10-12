@@ -5,7 +5,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/southbridge/m1543.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
 #include "hcd-uhci.h"
 
 static void m1543_usb_uhci_realize(PCIDevice *dev, Error **errp)

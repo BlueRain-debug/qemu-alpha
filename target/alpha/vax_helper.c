@@ -10,7 +10,7 @@
    Alpha Program Office.  */
 
 #include "qemu/osdep.h"
-#include "exec/exec-all.h"
+#include "accel/tcg/cpu-loop.h"
 #include "exec/helper-proto.h"
 #include "fpu/softfloat-macros.h"
 #include "vax_helper.h"

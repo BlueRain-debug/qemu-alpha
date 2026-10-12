@@ -11,7 +11,7 @@ static const Property tigbus_device_properties[] = {
     DEFINE_PROP_UINT8("cs", TigBusDevice, cs_index, -1),
 };
 
-static void tigbus_device_class_init(ObjectClass *klass, void *data)
+static void tigbus_device_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
@@ -139,7 +139,7 @@ static bool tigbus_check_address(BusState *b, DeviceState *dev, Error **errp)
     return true;
 }
 
-static void tigbus_class_init(ObjectClass *klass, void *data)
+static void tigbus_class_init(ObjectClass *klass, const void *data)
 {
     BusClass *bc = BUS_CLASS(klass);
 

@@ -11,10 +11,10 @@
 #include "qemu/timer.h"
 #include "hw/isa/isa.h"
 #include "hw/core/irq.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/scsi/scsi.h"
 #include "scsi/constants.h"
-#include "exec/address-spaces.h"
+#include "system/address-spaces.h"
 #include "system/dma.h"
 #include "migration/vmstate.h"
 #include "trace.h"
@@ -548,7 +548,7 @@ static const VMStateDescription aha_vmstate = {
     .unmigratable = true,
 };
 
-static void aha_class_init(ObjectClass *oc, void *data)
+static void aha_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 

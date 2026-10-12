@@ -4,15 +4,14 @@
  */
 
 #include "qemu/osdep.h"
-#include "qemu/qemu-print.h"
 #include "monitor/monitor.h"
-#include "monitor/hmp-target.h"
 #include "monitor/hmp.h"
-#include "qobject/qdict.h"
 #include "cpu.h"
 #include "internals.h"
 
-void hmp_info_iprs(Monitor *mon, const QDict *qdict)
+#ifdef CONFIG_HMP
+
+void hmp_info_iprs(MonitorHMP *hmp, const QDict *qdict)
 {
     bool all_cpus = qdict_get_try_bool(qdict, "cpustate_all", false);
     int vcpu = qdict_get_try_int(qdict, "vcpu", -1);
@@ -20,45 +19,45 @@ void hmp_info_iprs(Monitor *mon, const QDict *qdict)
 
     if (all_cpus) {
         CPU_FOREACH(cs) {
-            monitor_printf(mon, "\nCPU#%d\n", cs->cpu_index);
+            monitor_hmp_printf(hmp, "\nCPU#%d\n", cs->cpu_index);
             alpha_cpu_dump_iprs(cs);
         }
     } else {
-        cs = vcpu >= 0 ? qemu_get_cpu(vcpu) : mon_get_cpu(mon);
+        cs = vcpu >= 0 ? qemu_get_cpu(vcpu) : monitor_hmp_get_cpu(hmp);
 
         if (!cs) {
             if (vcpu >= 0) {
-                monitor_printf(mon, "CPU#%d not available\n", vcpu);
+                monitor_hmp_printf(hmp, "CPU#%d not available\n", vcpu);
             } else {
-                monitor_printf(mon, "No CPU available\n");
+                monitor_hmp_printf(hmp, "No CPU available\n");
             }
             return;
         }
 
-        monitor_printf(mon, "\nCPU#%d\n", cs->cpu_index);
+        monitor_hmp_printf(hmp, "\nCPU#%d\n", cs->cpu_index);
         alpha_cpu_dump_iprs(cs);
     }
 }
 
-void hmp_info_tlb(Monitor *mon, const QDict *qdict)
+void hmp_info_tlb(MonitorHMP *hmp, const QDict *qdict)
 {
-    CPUState *cs = mon_get_cpu(mon);
+    CPUState *cs = monitor_hmp_get_cpu(hmp);
 
     if (!cs) {
-        monitor_printf(mon, "No CPU available\n");
+        monitor_hmp_printf(hmp, "No CPU available\n");
         return;
     }
     alpha_cpu_dump_mmu(cs);
 }
 
-static target_long monitor_get_reg(Monitor *mon, const struct MonitorDef *md,
-                                   int val)
+static int64_t monitor_get_reg(MonitorHMP *hmp, const struct MonitorDef *md,
+                               int val)
 {
-    CPUArchState *env = mon_get_cpu_env(mon);
+    CPUArchState *env = monitor_hmp_get_cpu_env(hmp);
     return alpha_cpu_get_reg_value(env, val);
 }
 
-static const MonitorDef monitor_defs[] = {
+const MonitorDef alpha_monitor_defs[] = {
     { "r0|v0", 0, monitor_get_reg },
     { "r1|t0", 1, monitor_get_reg },
     { "r2|t1", 2, monitor_get_reg },
@@ -126,8 +125,3 @@ static const MonitorDef monitor_defs[] = {
     { "f31", offsetof(CPUAlphaState, fpregs[31]) },
     { NULL },
 };
-
-const MonitorDef *target_monitor_defs(void)
-{
-    return monitor_defs;
-}

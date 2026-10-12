@@ -6,7 +6,8 @@
 #ifndef _ALPHA_INTERNALS_H
 #define _ALPHA_INTERNALS_H
 
-#include "hw/registerfields.h"
+#include "hw/core/registerfields.h"
+#include "exec/cpu-common.h"
 #include "fpu/softfloat.h"
 #include "cpu.h"
 #include "instmap.h"

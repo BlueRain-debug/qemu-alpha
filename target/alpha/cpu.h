@@ -9,10 +9,11 @@
 #include "qemu/cpu-float.h"
 #include "qemu/timer.h"
 #include "exec/cpu-defs.h"
-#include "exec/memory.h"
+#include "exec/cpu-interrupt.h"
+#include "system/memory.h"
 #include "exec/page-protection.h"
-#include "hw/clock.h"
-#include "hw/registerfields.h"
+#include "hw/core/clock.h"
+#include "hw/core/registerfields.h"
 #include "qom/object.h"
 #include "qapi/qapi-types-common.h"
 #include "cpu-bits.h"
@@ -312,7 +313,7 @@ struct ArchCPU {
 typedef struct AlphaCPUInfo {
     const char *name;
     void (*initfn)(Object *obj);
-    void (*class_init)(ObjectClass *oc, void *data);
+    void (*class_init)(ObjectClass *oc, const void *data);
 } AlphaCPUInfo;
 
 /**
@@ -491,7 +492,7 @@ typedef enum AlphaMMUIdxBit {
 
 #undef MMUIDX_TO_BIT
 
-#include "exec/cpu-all.h"
+
 
 /* Bit definitions for PC */
 FIELD(PC, PAL_MODE, 0, 1)

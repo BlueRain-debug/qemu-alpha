@@ -14,7 +14,7 @@
 #include "hw/isa/superio.h"
 #include "hw/rtc/mc146818rtc.h"
 #include "hw/usb/hcd-uhci.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
 
 #define TYPE_M1543_PCI_DEVICE   "m1543-pci"
 #define TYPE_M1543_SUPERIO      "m1543-superio"

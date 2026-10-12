@@ -184,7 +184,7 @@ static void m1543_ide_reset(DeviceState *dev)
     int i;
 
     for (i = 0; i < ARRAY_SIZE(d->bus); i++) {
-        ide_bus_reset(&d->bus[i]);
+        ide_bus_reset(&d->bus[i], IDE_RESET_HARDWARE);
     }
 
     pci_config_set_prog_interface(pci_conf, 0x8a); /* legacy mode */
@@ -262,7 +262,7 @@ static void m1543_ide_exitfn(PCIDevice *pd)
     }
 }
 
-static void m1543_ide_class_init(ObjectClass *klass, void *data)
+static void m1543_ide_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);

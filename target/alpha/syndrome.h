@@ -8,7 +8,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/bitops.h"
-#include "hw/registerfields.h"
+#include "hw/core/registerfields.h"
 
 /*
  * Alpha exception internal fields.

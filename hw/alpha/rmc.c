@@ -12,10 +12,12 @@
 #include "qapi/error.h"
 #include "chardev/char.h"
 #include "chardev/char-fe.h"
-#include "hw/sysbus.h"
+#include "system/cpus.h"
+#include "hw/core/cpu.h"
+#include "hw/core/sysbus.h"
 #include "hw/alpha/tigbus.h"
 #include "hw/alpha/rmc.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "system/rtc.h"
 #include "cpu.h"
@@ -33,7 +35,7 @@ struct ES40RMCState {
     uint32_t base_address;
     uint64_t freq_hz;
 
-    CharBackend display;
+    CharFrontend display;
     bool display_inited;
 };
 
@@ -544,7 +546,7 @@ static void es40_rmc_init(Object *obj)
                           "es40-rmc.dpram", sizeof(s->mem));
 }
 
-static void es40_rmc_class_init(ObjectClass *klass, void *data)
+static void es40_rmc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 

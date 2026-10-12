@@ -8,17 +8,21 @@
 #include "qemu/main-loop.h"
 #include "qemu/qemu-print.h"
 #include "exec/cputlb.h"
-#include "exec/cpu_ldst.h"
-#include "exec/exec-all.h"
+#include "accel/tcg/cpu-mmu-index.h"
+#include "exec/memopidx.h"
+#include "exec/memop.h"
+#include "accel/tcg/cpu-ldst.h"
+#include "accel/tcg/cpu-loop.h"
 #include "exec/log.h"
 #include "exec/tb-flush.h"
 #include "exec/translation-block.h"
+#include "exec/target_page.h"
 #include "exec/helper-proto.h"
 #include "accel/tcg/cpu-ops.h"
 #include "system/hw_accel.h"
 #include "system/runstate.h"
 #include "system/tcg.h"
-#include "hw/clock.h"
+#include "hw/core/clock.h"
 #include "fpu/softfloat.h"
 #include "cpu.h"
 #include "ipregs.h"
@@ -188,7 +192,7 @@ void alpha_cpu_init_ipreg_list(AlphaCPU *cpu)
      * Note that we require ipreg_tuples[] to be sorted by key ID.
      */
     keys = g_hash_table_get_keys(cpu->ipregs);
-    keys = g_list_sort(keys, ipreg_key_compare);
+    keys = g_list_sort_with_data(keys, (GCompareDataFunc)ipreg_key_compare, NULL);
     cpu->ipreg_array_len = 0;
 
     g_list_foreach(keys, count_ipreg, cpu);
@@ -566,7 +570,8 @@ static void alpha_update_exception_state_ev4(CPUAlphaState *env,
     }
 
     if (flags.load_insn) {
-        uint32_t insn = cpu_ldl_code(env, env->pc + diff);
+        MemOpIdx oi = make_memop_idx(MO_LEUL, cpu_mmu_index(env_cpu(env), true));
+        uint32_t insn = cpu_ldl_code_mmu(env, env->pc + diff, oi, 0);
 
         SET_FIELD(mm_stat, EV4_MMCSR, RA, get_ra(insn));
         SET_FIELD(mm_stat, EV4_MMCSR, OPCODE, get_opc(insn));
@@ -617,7 +622,8 @@ static void alpha_update_exception_state_ev5(CPUAlphaState *env,
     }
 
     if (flags.load_insn) {
-        uint32_t insn = cpu_ldl_code(env, env->pc + diff);
+        MemOpIdx oi = make_memop_idx(MO_LEUL, cpu_mmu_index(env_cpu(env), true));
+        uint32_t insn = cpu_ldl_code_mmu(env, env->pc + diff, oi, 0);
         int opc = get_opc(insn);
 
         switch (opc) {
@@ -690,7 +696,8 @@ static void alpha_update_exception_state_ev6(CPUAlphaState *env,
     }
 
     if (flags.load_insn) {
-        uint32_t insn = cpu_ldl_code(env, env->pc + diff);
+        MemOpIdx oi = make_memop_idx(MO_LEUL, cpu_mmu_index(env_cpu(env), true));
+        uint32_t insn = cpu_ldl_code_mmu(env, env->pc + diff, oi, 0);
         int opc = get_opc(insn);
 
         switch (opc) {
@@ -2919,7 +2926,7 @@ void alpha_cpu_dump_iprs(CPUState *cs)
 
     cpu_synchronize_state(cs);
     keys = g_hash_table_get_keys(cpu->ipregs);
-    keys = g_list_sort(keys, ipreg_key_compare);
+    keys = g_list_sort_with_data(keys, (GCompareDataFunc)ipreg_key_compare, NULL);
     g_list_foreach(keys, alpha_cpu_dump_ipreg_value, cpu);
     g_list_free(keys);
 }

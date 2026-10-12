@@ -12,12 +12,14 @@
 #include "hw/i2c/bitbang_i2c.h"
 #include "hw/intc/intc.h"
 #include "hw/intc/i8259.h"
+#include "system/cpus.h"
+#include "hw/core/cpu.h"
 #include "hw/core/irq.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/pci/pci_host.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/pci_bus.h"
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
@@ -1196,7 +1198,7 @@ static void tsunami_chipset_instance_init(Object *obj)
     }
 }
 
-static void tsunami_chipset_class_init(ObjectClass *oc, void *data)
+static void tsunami_chipset_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
     InterruptStatsProviderClass *ispc = INTERRUPT_STATS_PROVIDER_CLASS(oc);
@@ -1471,7 +1473,7 @@ static AddressSpace *tsunami_pci_dma_iommu_as(PCIBus *bus, void *opaque,
 }
 
 static void tsunami_iommu_memory_region_class_init(ObjectClass *klass,
-                                                   void *data)
+                                                   const void *data)
 {
     IOMMUMemoryRegionClass *imrc = IOMMU_MEMORY_REGION_CLASS(klass);
 
@@ -2039,7 +2041,7 @@ static const VMStateDescription vmstate_tsunami_pcihost = {
     }
 };
 
-static void tsunami_pcihost_class_init(ObjectClass *klass, void *data)
+static void tsunami_pcihost_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIHostBridgeClass *hc = PCI_HOST_BRIDGE_CLASS(klass);

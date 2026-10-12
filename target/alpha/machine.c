@@ -5,6 +5,7 @@
 
 #include "qemu/osdep.h"
 #include "migration/cpu.h"
+#include "migration/qemu-file.h"
 #include "cpu.h"
 #include "internals.h"
 
@@ -149,9 +150,9 @@ static int cpu_pre_save(void *opaque)
     return 0;
 }
 
-static int cpu_post_save(void *opaque)
+static void cpu_post_save(void *opaque)
 {
-    return 0;
+    g_assert_not_reached();
 }
 
 static int cpu_pre_load(void *opaque)
@@ -209,7 +210,7 @@ const VMStateDescription vmstate_alpha_cpu = {
     .pre_load = cpu_pre_load,
     .post_load = cpu_post_load,
     .fields = (const VMStateField[]) {
-        VMSTATE_CPU(),
+        VMSTATE_STRUCT(parent_obj, AlphaCPU, 0, vmstate_cpu_common, CPUState),
         VMSTATE_UINT64_ARRAY(env.gpregs, AlphaCPU, 32),
         VMSTATE_UINT64(env.pc, AlphaCPU),
         VMSTATE_BOOL(env.pal_mode, AlphaCPU),

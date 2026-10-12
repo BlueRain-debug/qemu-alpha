@@ -14,7 +14,7 @@
 #include "hw/i2c/bitbang_i2c.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/pci_host.h"
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 
 typedef struct TsunamiIOTLBEntry TsunamiIOTLBEntry;
 typedef struct TsunamiCPUState TsunamiCPUState;

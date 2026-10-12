@@ -10,6 +10,7 @@
 #include "qemu/log.h"
 #include "qemu/units.h"
 #include "qapi/error.h"
+#include "exec/target_page.h"
 #include "net/net.h"
 #include "hw/alpha/tsunami.h"
 #include "hw/alpha/tigcontrol.h"
@@ -18,16 +19,16 @@
 #include "hw/block/fdc.h"
 #include "hw/char/parallel-isa.h"
 #include "hw/southbridge/m1543.h"
-#include "hw/boards.h"
-#include "hw/clock.h"
-#include "hw/sysbus.h"
-#include "hw/loader.h"
+#include "hw/core/boards.h"
+#include "hw/core/clock.h"
+#include "hw/core/sysbus.h"
+#include "hw/core/loader.h"
 #include "hw/block/flash.h"
 #include "hw/i2c/smbus_eeprom.h"
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci-bridge/dec_pci.h"
-#include "hw/qdev-clock.h"
+#include "hw/core/qdev-clock.h"
 #include "system/reset.h"
 #include "system/system.h"
 #include "system/qtest.h"
@@ -289,7 +290,7 @@ static void es40_machine_init(MachineState *machine)
 
     if ((filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, firmware)) != NULL) {
         if ((size = es40_decompress_srm(ms, filename, NULL)) < 0) {
-            size = load_image_targphys(filename, 0, PALCODE_ROM_SIZE);
+            size = load_image_targphys(filename, 0, PALCODE_ROM_SIZE, NULL);
         }
     } else {
         size = -1;
@@ -301,7 +302,7 @@ static void es40_machine_init(MachineState *machine)
     }
 }
 
-static void es40_class_init(ObjectClass *oc, void *data)
+static void es40_class_init(ObjectClass *oc, const void *data)
 {
     static const char * const valid_cpu_types[] = {
         ALPHA_CPU_TYPE_NAME("ev6"),

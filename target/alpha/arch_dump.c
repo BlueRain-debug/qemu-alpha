@@ -5,6 +5,7 @@
 
 #include "qemu/osdep.h"
 #include "system/dump.h"
+#include "exec/target_page.h"
 #include "cpu.h"
 #include "elf.h"
 

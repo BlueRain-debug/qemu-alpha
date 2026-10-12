@@ -2,7 +2,7 @@
 #define _ALPHA_IPREGS_H
 
 #include "qemu/osdep.h"
-#include "hw/registerfields.h"
+#include "hw/core/registerfields.h"
 #include "cpu.h"
 
 /*

@@ -26,7 +26,7 @@
 #include "hw/pci/pci_bridge.h"
 #include "hw/pci/pci_bus.h"
 #include "hw/pci-bridge/dec_pci.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 
 static void dec_pci_bridge_realize(PCIDevice *dev, Error **errp)
@@ -52,7 +52,7 @@ static const VMStateDescription vmstate_dec_pci_bridge = {
     }
 };
 
-static void dec_pci_bridge_class_init(ObjectClass *klass, void *data)
+static void dec_pci_bridge_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);

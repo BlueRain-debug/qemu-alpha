@@ -4,7 +4,7 @@
  */
 
 #include "qemu/osdep.h"
-#include "exec/exec-all.h"
+#include "accel/tcg/cpu-loop.h"
 #include "exec/helper-proto.h"
 #include "qemu/host-utils.h"
 #include "cpu.h"

@@ -11,8 +11,9 @@
 #include "syndrome.h"
 #include "exec/cputlb.h"
 #include "exec/helper-proto.h"
-#include "exec/exec-all.h"
-#include "exec/cpu_ldst.h"
+#include "accel/tcg/cpu-loop.h"
+#include "accel/tcg/cpu-ldst.h"
+#include "exec/target_page.h"
 #include "exec/log.h"
 
 QEMU_BUILD_BUG_ON(PAGE_READ != BIT(MMU_DATA_LOAD));
