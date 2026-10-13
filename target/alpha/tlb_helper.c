@@ -818,6 +818,19 @@ void alpha_cpu_do_transaction_failed(CPUState *cs, hwaddr physaddr, vaddr addr,
                                      int mmu_idx, MemTxAttrs attrs,
                                      MemTxResult response, uintptr_t retaddr)
 {
+    CPUAlphaState *env = cpu_env(cs);
+
+    if (env->implver == IMPLVER_2106x && response == MEMTX_ERROR) {
+        /* An explicit EV4 CACK_HERR is a synchronous machine check.
+         * Preserve the existing behavior for undecoded probe addresses.
+         * Sable CPU specification 7.1, table 68 and BIU_STAT/BIU_ADDR.
+         */
+        env->ipr.biu_stat = R_EV4_BIU_STAT_BIU_HERR_MASK |
+            (uint64_t)(access_type == MMU_DATA_STORE ? 5 : 4)
+            << R_EV4_BIU_STAT_BIU_CMD_SHIFT;
+        env->ipr.biu_addr = physaddr;
+        do_raise_exception_ra(env, EXCP_MCHK, 0, retaddr);
+    }
     /*
      * 4.7.9 Nonexistent Memory Processing
      *

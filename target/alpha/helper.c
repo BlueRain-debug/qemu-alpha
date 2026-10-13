@@ -1469,6 +1469,19 @@ static uint64_t ev4_lock_flag_read(CPUAlphaState *env,
     return env->llsc_addr != LLSC_ADDR_NONE;
 }
 
+static uint64_t ev4_biu_addr_read(CPUAlphaState *env, const AlphaIPRegInfo *ri)
+{
+    uint64_t value = env->ipr.biu_addr;
+
+    /* CPU specification 3.9.8: reading BIU_ADDR unlocks BIU_STAT[7:0].
+     * Retire these error bits at unlock: this cacheless implementation has
+     * no subsequent successful BIU cycle to refresh the unlocked status.
+     * Keep independent fill-error bits and the last address available.
+     */
+    env->ipr.biu_stat &= ~0xffULL;
+    return value;
+}
+
 static const AlphaIPRegInfo ev4_abox_ip_reginfo[] = {
     { .name = "TB_CTL", .ipr = EV4_IPR_TB_CTL,
       .access = IPR_W,
@@ -1504,7 +1517,8 @@ static const AlphaIPRegInfo ev4_abox_ip_reginfo[] = {
     { .name = "BIU_ADDR", .ipr = EV4_IPR_BIU_ADDR,
       .access = IPR_R,
       .resetvalue = 0,
-      .fieldoffset = offsetof(CPUAlphaState, ipr.biu_addr) },
+      .fieldoffset = offsetof(CPUAlphaState, ipr.biu_addr),
+      .readfn = ev4_biu_addr_read, .raw_readfn = raw_read },
     { .name = "BIU_STAT", .ipr = EV4_IPR_BIU_STAT,
       .access = IPR_R,
       .resetvalue = 0,

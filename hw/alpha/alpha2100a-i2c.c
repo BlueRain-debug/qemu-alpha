@@ -35,7 +35,7 @@ struct LynxPCF8584 {
     QEMUTimer *timer;
     uint8_t control, status, own, clock, vector, data;
     uint8_t completion_status;
-    bool master, receive, addressed;
+    bool master, receive, addressed, receive_byte;
 };
 
 static void pcf_irq(LynxPCF8584 *s)
@@ -49,6 +49,10 @@ static void pcf_complete(void *opaque)
     LynxPCF8584 *s = opaque;
 
     s->status = s->completion_status;
+    if (s->receive_byte && !(s->control & ACK)) {
+        s->status |= LRB;
+        i2c_nack(s->bus);
+    }
     pcf_irq(s);
 }
 
@@ -67,7 +71,7 @@ static void pcf_stop(LynxPCF8584 *s)
 {
     timer_del(s->timer);
     i2c_end_transfer(s->bus);
-    s->master = s->addressed = s->receive = false;
+    s->master = s->addressed = s->receive = s->receive_byte = false;
     s->status = PIN | BB;
     pcf_irq(s);
 }
@@ -92,9 +96,8 @@ static uint64_t pcf_read(void *opaque, hwaddr addr, unsigned size)
         if (s->master && s->receive && s->addressed) {
             /* The first read discards the address and fetches byte zero. */
             s->data = i2c_recv(s->bus);
-            if (!(s->control & ACK)) {
-                i2c_nack(s->bus);
-            }
+            s->receive_byte = true;
+            /* ACK may change while the pipelined byte is in flight. */
             pcf_schedule(s, false);
         }
     }
@@ -132,6 +135,7 @@ static void pcf_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
         pcf_stop(s);
     } else if (value & STA) {
         s->master = true;
+        s->receive_byte = false;
         s->receive = s->data & 1;
         s->addressed = !i2c_start_transfer(s->bus, s->data >> 1, s->receive);
         pcf_schedule(s, !s->addressed);

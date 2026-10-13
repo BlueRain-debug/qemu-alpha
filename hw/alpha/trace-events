@@ -65,3 +65,5 @@ alpha2100a_io(bool write, uint64_t port, unsigned len, uint64_t value) "write=%d
 alpha2100a_csr(bool write, uint64_t addr, uint64_t value) "write=%d addr=0x%" PRIx64 " value=0x%" PRIx64
 
 alpha2100a_i2c(bool write, unsigned reg, unsigned value, unsigned status) "write=%d reg=%u value=0x%02x status=0x%02x"
+
+alpha2100a_csr_access(bool write, uint64_t addr, uint64_t value, uint64_t pc, unsigned cpu) "write=%d addr=0x%" PRIx64 " value=0x%" PRIx64 " pc=0x%" PRIx64 " cpu=%u"

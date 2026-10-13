@@ -36,6 +36,7 @@ config JENSEN
     select SERIAL_MM
     select PCKBD
     select VGA_ISA
+    select JENSEN_S3
     select PFLASH_CFI01
     select I8257
     select FDC_ISA
@@ -53,3 +54,10 @@ config ALPHASERVER_2100A
     select PCKBD
     select I2C
     select AT24C
+    select PCI
+    select VGA_CIRRUS
+    select JENSEN_S3
+
+config JENSEN_S3
+    bool
+    select VGA_ISA
