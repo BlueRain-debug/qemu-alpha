@@ -232,6 +232,10 @@ typedef struct CPUArchState {
     /* TLB context, only relevant for full system emulation. */
     CPUAlphaTLBContext tlb[2];
 
+    /* EV4 diagnostic ITB readback: eight small and four large page slots. */
+    uint64_t ev4_itb_readback[12];
+    uint8_t ev4_itb_next[2];
+
     /* Fields up to this point are cleared by a CPU reset. */
     struct {} end_reset_fields;
 

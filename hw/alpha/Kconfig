@@ -40,3 +40,16 @@ config JENSEN
     select I8257
     select FDC_ISA
     select SCSI
+
+config ALPHASERVER_2100A
+    bool
+    default y
+    depends on ALPHA
+    select ISA_BUS
+    select I8259
+    select I8254
+    select MC146818RTC
+    select SERIAL_ISA
+    select PCKBD
+    select I2C
+    select AT24C

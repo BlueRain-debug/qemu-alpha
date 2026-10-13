@@ -155,7 +155,7 @@ static void alpha_ev45_initfn(Object *obj)
     AlphaCPU *cpu = ALPHA_CPU(obj);
 
     cpu->bfd_mach = bfd_mach_alpha_ev4;
-    cpu->chip_id = 0b000111;            /* 2106x, production version */
+    cpu->chip_id = 0b000011;            /* 21064A, production version (C_STAT) */
     cpu->proc_id = PROCID_EV45;
     cpu->isa_implver = IMPLVER_2106x;
     cpu->isa_amask = 0;

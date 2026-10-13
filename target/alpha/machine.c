@@ -108,6 +108,34 @@ static const VMStateDescription vmstate_tlb = {
     }
 };
 
+static bool ev4_itb_readback_needed(void *opaque)
+{
+    AlphaCPU *cpu = opaque;
+
+    return cpu->env.implver == IMPLVER_2106x;
+}
+
+static int ev4_itb_readback_post_load(void *opaque, int version_id)
+{
+    AlphaCPU *cpu = opaque;
+
+    return cpu->env.ev4_itb_next[0] < 8 && cpu->env.ev4_itb_next[1] < 4
+           ? 0 : -EINVAL;
+}
+
+static const VMStateDescription vmstate_ev4_itb_readback = {
+    .name = "cpu/ev4-itb-readback",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = ev4_itb_readback_needed,
+    .post_load = ev4_itb_readback_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64_ARRAY(env.ev4_itb_readback, AlphaCPU, 12),
+        VMSTATE_UINT8_ARRAY(env.ev4_itb_next, AlphaCPU, 2),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static int get_power(QEMUFile *f, void *opaque, size_t size,
                     const VMStateField *field)
 {
@@ -247,6 +275,7 @@ const VMStateDescription vmstate_alpha_cpu = {
     .subsections = (const VMStateDescription * const []) {
         &vmstate_fpu,
         &vmstate_tlb,
+        &vmstate_ev4_itb_readback,
         NULL,
     }
 };

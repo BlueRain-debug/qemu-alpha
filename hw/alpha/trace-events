@@ -59,3 +59,9 @@ jensen_s3_memory(unsigned addr, unsigned value, bool write) "addr=0x%06x value=0
 
 jensen_mpu_read(uint64_t addr, unsigned value, uint64_t ra) "addr=0x%" PRIx64 " value=0x%02x ra=0x%" PRIx64
 jensen_mpu_write(uint64_t addr, unsigned value, uint64_t ra) "addr=0x%" PRIx64 " value=0x%02x ra=0x%" PRIx64
+
+# alpha2100a.c
+alpha2100a_io(bool write, uint64_t port, unsigned len, uint64_t value) "write=%d port=0x%" PRIx64 " len=%u value=0x%" PRIx64
+alpha2100a_csr(bool write, uint64_t addr, uint64_t value) "write=%d addr=0x%" PRIx64 " value=0x%" PRIx64
+
+alpha2100a_i2c(bool write, unsigned reg, unsigned value, unsigned status) "write=%d reg=%u value=0x%02x status=0x%02x"

@@ -1087,17 +1087,39 @@ static void ev4_itb_pte_write(CPUAlphaState *env, const AlphaIPRegInfo *ri,
                     R_EV4_ITB_PTE_KRE_MASK | R_EV4_ITB_PTE_ERE_MASK |
                     R_EV4_ITB_PTE_SRE_MASK | R_EV4_ITB_PTE_URE_MASK |
                     R_EV4_ITB_PTE_PFN_MASK;
+    unsigned bank = FIELD_EX64(env->ipr.tb_ctl, PTE, GH) == 3;
+    unsigned count = bank ? 4 : 8;
+    unsigned base = bank ? 8 : 0;
+    unsigned slot = env->ev4_itb_next[bank];
 
     value &= mask;
     value |= env->ipr.tb_ctl;
     alpha_tlb_fill(env, type, env->ipr.tb_tag, value, asn);
     env->ipr.itb_pte = value;
     env->ipr.itb_pte_temp = ev4_xtb_pte_temp_init(value, true);
+    /* Writes and reads advance the pointer for the selected page array. */
+    env->ev4_itb_readback[base + slot] = env->ipr.itb_pte_temp;
+    env->ev4_itb_next[bank] = (slot + 1) % count;
 }
 
 static uint64_t ev4_itb_pte_read(CPUAlphaState *env, const AlphaIPRegInfo *ri)
 {
-    return env->ipr.itb_pte_temp;
+    /*
+     * 21064/21064A HRM 5.2.2/5.2.4: MFPR ITB_PTE transfers the
+     * selected entry to ITB_PTE_TEMP, then advances the array pointer.
+     * The GPR destination is not the result; use MFPR ITB_PTE_TEMP.
+     * Keep readback data across invalidation, which only clears validity.
+     * Allocation here is cyclic, as in the existing software TLB, rather
+     * than reproducing the hardware's not-last-used replacement algorithm.
+     */
+    unsigned bank = FIELD_EX64(env->ipr.tb_ctl, PTE, GH) == 3;
+    unsigned count = bank ? 4 : 8;
+    unsigned base = bank ? 8 : 0;
+    unsigned slot = env->ev4_itb_next[bank];
+
+    env->ipr.itb_pte_temp = env->ev4_itb_readback[base + slot];
+    env->ev4_itb_next[bank] = (slot + 1) % count;
+    return 0;
 }
 
 static void ev4_iccsr_write(CPUAlphaState *env, const AlphaIPRegInfo *ri,
@@ -1490,9 +1512,6 @@ static const AlphaIPRegInfo ev4_abox_ip_reginfo[] = {
     { .name = "DC_ADDR", .ipr = EV4_IPR_DC_ADDR,
       .type = ALPHA_IP_CONST, .access = IPR_R,
       .resetvalue = 0 },
-    { .name = "DC_STAT", .ipr = EV4_IPR_DC_STAT,
-      .type = ALPHA_IP_CONST, .access = IPR_R,
-      .resetvalue = 0b111 },
     { .name = "FILL_ADDR", .ipr = EV4_IPR_FILL_ADDR,
       .type = ALPHA_IP_CONST, .access = IPR_R,
       .resetvalue = 0 },
@@ -1591,7 +1610,14 @@ static void ev4_redirect_write(CPUAlphaState *env, const AlphaIPRegInfo *ri,
 static void register_ev4_ipregs(AlphaCPU *cpu)
 {
     int i;
+    AlphaIPRegInfo dc_stat = {
+        .name = "DC_STAT", .ipr = EV4_IPR_DC_STAT,
+        .type = ALPHA_IP_CONST, .access = IPR_R,
+        /* 21064A calls this C_STAT; its production CHIP_ID is 011. */
+        .resetvalue = cpu->chip_id,
+    };
 
+    define_one_alpha_ipreg(cpu, &dc_stat);
     define_alpha_ipregs(cpu, ev4_ibox_ip_reginfo);
     define_alpha_ipregs(cpu, ev4_abox_ip_reginfo);
 
