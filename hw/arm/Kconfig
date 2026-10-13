@@ -37,6 +37,8 @@ config ARM_VIRT
     select ACPI_CXL
     select ACPI_HMAT
     select WDT_SBSA
+    select USB_EHCI_SYSBUS
+    select SDHCI
 
 config CUBIEBOARD
     bool

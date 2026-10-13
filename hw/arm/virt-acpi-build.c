@@ -146,6 +146,42 @@ static void build_acpi0017(Aml *table)
     aml_append(table, scope);
 }
 
+static void acpi_dsdt_add_winrt(Aml *scope, VirtMachineState *vms)
+{
+    static const struct {
+        const char *name;
+        const char *hid;
+        int id;
+    } devices[] = {
+        { "USB0", "PNP0D20", VIRT_EHCI },
+        { "SDC1", "PNP0D40", VIRT_SDHCI },
+    };
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(devices); i++) {
+        int id = devices[i].id;
+        uint32_t irq = vms->irqmap[id] + ARM_SPI_BASE;
+        Aml *dev = aml_device("%s", devices[i].name);
+        Aml *crs = aml_resource_template();
+
+        aml_append(dev, aml_name_decl("_HID", aml_string("%s", devices[i].hid)));
+        aml_append(dev, aml_name_decl("_UID", aml_int(0)));
+        aml_append(crs, aml_memory32_fixed(vms->memmap[id].base,
+                                         vms->memmap[id].size, AML_READ_WRITE));
+        aml_append(crs, aml_interrupt(AML_CONSUMER, AML_LEVEL, AML_ACTIVE_HIGH,
+                                      AML_EXCLUSIVE, &irq, 1));
+        aml_append(dev, aml_name_decl("_CRS", crs));
+        if (id == VIRT_SDHCI) {
+            Aml *card = aml_device("SDMM");
+
+            aml_append(card, aml_name_decl("_ADR", aml_int(0)));
+            aml_append(card, aml_name_decl("_RMV", aml_int(0)));
+            aml_append(dev, card);
+        }
+        aml_append(scope, dev);
+    }
+}
+
 static void acpi_dsdt_add_pci(Aml *scope, const MemMapEntry *memmap,
                               uint32_t irq, VirtMachineState *vms)
 {
@@ -1232,7 +1268,11 @@ build_dsdt(GArray *table_data, BIOSLinker *linker, VirtMachineState *vms)
     virtio_acpi_dsdt_add(scope, memmap[VIRT_MMIO].base, memmap[VIRT_MMIO].size,
                          (irqmap[VIRT_MMIO] + ARM_SPI_BASE),
                          0, vms->virtio_transports);
-    acpi_dsdt_add_pci(scope, memmap, irqmap[VIRT_PCIE] + ARM_SPI_BASE, vms);
+    if (vms->winrt) {
+        acpi_dsdt_add_winrt(scope, vms);
+    } else {
+        acpi_dsdt_add_pci(scope, memmap, irqmap[VIRT_PCIE] + ARM_SPI_BASE, vms);
+    }
     if (vms->acpi_dev) {
         build_ged_aml(scope, "\\_SB."GED_DEVICE,
                       HOTPLUG_HANDLER(vms->acpi_dev),
@@ -1266,34 +1306,36 @@ build_dsdt(GArray *table_data, BIOSLinker *linker, VirtMachineState *vms)
 
     aml_append(dsdt, scope);
 
-    pci0_scope = aml_scope("\\_SB.PCI0");
+    if (!vms->winrt) {
+        pci0_scope = aml_scope("\\_SB.PCI0");
 
-    aml_append(pci0_scope, build_pci_bridge_edsm());
-    build_append_pci_bus_devices(pci0_scope, vms->bus);
-    bsel = object_property_get_uint(OBJECT(vms->bus), ACPI_PCIHP_PROP_BSEL,
-                                    &error_abort);
-    if (bsel != UINT32_MAX) {
-        build_append_pcihp_slots(pci0_scope, vms->bus);
-    }
-
-    if (vms->acpi_dev) {
-        bool acpi_pcihp;
-
-        acpi_pcihp = object_property_get_bool(OBJECT(vms->acpi_dev),
-                                              ACPI_PM_PROP_ACPI_PCIHP_BRIDGE,
-                                              NULL);
-
-        if (acpi_pcihp) {
-            build_acpi_pci_hotplug(dsdt, AML_SYSTEM_MEMORY,
-                                   memmap[VIRT_ACPI_PCIHP].base);
-            build_append_pcihp_resources(pci0_scope,
-                                         memmap[VIRT_ACPI_PCIHP].base,
-                                         memmap[VIRT_ACPI_PCIHP].size);
-
-            build_append_notification_callback(pci0_scope, vms->bus);
+        aml_append(pci0_scope, build_pci_bridge_edsm());
+        build_append_pci_bus_devices(pci0_scope, vms->bus);
+        bsel = object_property_get_uint(OBJECT(vms->bus), ACPI_PCIHP_PROP_BSEL,
+                                        &error_abort);
+        if (bsel != UINT32_MAX) {
+            build_append_pcihp_slots(pci0_scope, vms->bus);
         }
+
+        if (vms->acpi_dev) {
+            bool acpi_pcihp;
+
+            acpi_pcihp = object_property_get_bool(OBJECT(vms->acpi_dev),
+                                                  ACPI_PM_PROP_ACPI_PCIHP_BRIDGE,
+                                                  NULL);
+
+            if (acpi_pcihp) {
+                build_acpi_pci_hotplug(dsdt, AML_SYSTEM_MEMORY,
+                                       memmap[VIRT_ACPI_PCIHP].base);
+                build_append_pcihp_resources(pci0_scope,
+                                             memmap[VIRT_ACPI_PCIHP].base,
+                                             memmap[VIRT_ACPI_PCIHP].size);
+
+                build_append_notification_callback(pci0_scope, vms->bus);
+            }
+        }
+        aml_append(dsdt, pci0_scope);
     }
-    aml_append(dsdt, pci0_scope);
 
     /* copy AML table into ACPI tables blob */
     g_array_append_vals(table_data, dsdt->buf->data, dsdt->buf->len);

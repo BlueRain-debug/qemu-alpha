@@ -95,6 +95,8 @@
 #include "hw/cxl/cxl_host.h"
 #include "qemu/guest-random.h"
 #include "hw/watchdog/sbsa_gwdt.h"
+#include "hw/sd/sdhci.h"
+#include "hw/usb/hcd-ehci.h"
 
 static GlobalProperty arm_virt_compat_defaults[] = {
     { TYPE_VIRTIO_IOMMU_PCI, "aw-bits", "48" },
@@ -210,6 +212,8 @@ static const MemMapEntry base_memmap[] = {
     [VIRT_PVTIME] =             { 0x090a0000, 0x00010000 },
     [VIRT_SECURE_GPIO] =        { 0x090b0000, 0x00001000 },
     [VIRT_ACPI_PCIHP] =         { 0x090c0000, ACPI_PCIHP_SIZE },
+    [VIRT_EHCI] =               { 0x090e0000, 0x00010000 },
+    [VIRT_SDHCI] =              { 0x090f0000, 0x00010000 },
     [VIRT_MMIO] =               { 0x0a000000, 0x00000200 },
     /* ...repeating for a total of NUM_VIRTIO_TRANSPORTS, each of that size */
     [VIRT_PLATFORM_BUS] =       { 0x0c000000, 0x02000000 },
@@ -267,6 +271,8 @@ static const int a15irqmap[] = {
     [VIRT_UART1] = 8,
     [VIRT_ACPI_GED] = 9,
     [VIRT_GWDT_WS0] = 10,
+    [VIRT_EHCI] = 11,
+    [VIRT_SDHCI] = 12,
     [VIRT_MMIO] = 16, /* ...to 16 + NUM_VIRTIO_TRANSPORTS - 1 */
     [VIRT_GIC_V2M] = 48, /* ...to 48 + NUM_GICV2M_SPIS - 1 */
     [VIRT_SMMU] = 74,    /* ...to 74 + NUM_SMMU_IRQS - 1 */
@@ -2871,6 +2877,33 @@ static void virt_post_cpus_gic_realized(VirtMachineState *vms,
     }
 }
 
+/* Platform devices used by the Windows RT drivers, based on GH Cao's port. */
+static void create_winrt_devices(const VirtMachineState *vms)
+{
+    DeviceState *dev, *card;
+    SysBusDevice *sbd;
+    DriveInfo *di = drive_get(IF_SD, 0, 0);
+
+    sysbus_create_simple(TYPE_PLATFORM_EHCI, vms->memmap[VIRT_EHCI].base,
+                         qdev_get_gpio_in(vms->gic, vms->irqmap[VIRT_EHCI]));
+
+    dev = qdev_new(TYPE_SYSBUS_SDHCI);
+    /* The reference v3 port uses the v2 SDHCI capabilities, including DMA. */
+    qdev_prop_set_uint64(dev, "capareg",
+                         vms->winrt_sdhci_dma ? 0x057834b4 : 0x053034b4);
+    sbd = SYS_BUS_DEVICE(dev);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, vms->memmap[VIRT_SDHCI].base);
+    sysbus_connect_irq(sbd, 0,
+                      qdev_get_gpio_in(vms->gic, vms->irqmap[VIRT_SDHCI]));
+
+    card = qdev_new(TYPE_SD_CARD);
+    qdev_prop_set_drive_err(card, "drive", di ? blk_by_legacy_dinfo(di) : NULL,
+                            &error_fatal);
+    qdev_realize_and_unref(card, qdev_get_child_bus(dev, "sd-bus"),
+                          &error_fatal);
+}
+
 static void machvirt_init(MachineState *machine)
 {
     VirtMachineState *vms = VIRT_MACHINE(machine);
@@ -2888,6 +2921,13 @@ static void machvirt_init(MachineState *machine)
     unsigned int max_cpus = machine->smp.max_cpus;
 
     possible_cpus = mc->possible_cpu_arch_ids(machine);
+
+    if (vms->winrt && (!tcg_enabled() || vms->secure || vms->virt ||
+                      machine->smp.cpus != 1 || machine->smp.max_cpus != 1)) {
+        error_report("winrt requires TCG, one CPU, secure=off and "
+                     "virtualization=off");
+        exit(1);
+    }
 
     /*
      * In accelerated mode, the memory map is computed earlier in kvm_type()
@@ -3044,7 +3084,15 @@ static void machvirt_init(MachineState *machine)
 
         aarch64 &= object_property_get_bool(cpuobj, "aarch64", NULL);
 
-        if (!vms->secure) {
+        if (vms->winrt) {
+            if (object_property_get_bool(cpuobj, "aarch64", NULL) ||
+                vms->gic_version != VIRT_GIC_VERSION_2) {
+                error_report("winrt requires an AArch32 CPU and GICv2");
+                exit(1);
+            }
+            /* Windows RT probes the AArch32 Security Extensions. */
+            object_property_set_bool(cpuobj, "has_el3", true, &error_fatal);
+        } else if (!vms->secure) {
             object_property_set_bool(cpuobj, "has_el3", false, NULL);
         }
 
@@ -3228,6 +3276,10 @@ static void machvirt_init(MachineState *machine)
      */
     create_virtio_devices(vms);
 
+    if (vms->winrt) {
+        create_winrt_devices(vms);
+    }
+
     vms->fw_cfg = create_fw_cfg(vms, &address_space_memory);
     rom_set_fw(vms->fw_cfg);
 
@@ -3256,6 +3308,26 @@ static void machvirt_init(MachineState *machine)
 
     vms->machine_done.notify = virt_machine_done;
     qemu_add_machine_init_done_notifier(&vms->machine_done);
+}
+
+static bool virt_get_winrt_sdhci_dma(Object *obj, Error **errp)
+{
+    return VIRT_MACHINE(obj)->winrt_sdhci_dma;
+}
+
+static void virt_set_winrt_sdhci_dma(Object *obj, bool value, Error **errp)
+{
+    VIRT_MACHINE(obj)->winrt_sdhci_dma = value;
+}
+
+static bool virt_get_winrt(Object *obj, Error **errp)
+{
+    return VIRT_MACHINE(obj)->winrt;
+}
+
+static void virt_set_winrt(Object *obj, bool value, Error **errp)
+{
+    VIRT_MACHINE(obj)->winrt = value;
 }
 
 static bool virt_get_secure(Object *obj, Error **errp)
@@ -4210,6 +4282,15 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
         NULL, NULL);
     object_class_property_set_description(oc, "acpi",
         "Enable ACPI");
+    object_class_property_add_bool(oc, "winrt-sdhci-dma",
+                                   virt_get_winrt_sdhci_dma,
+                                   virt_set_winrt_sdhci_dma);
+    object_class_property_set_description(oc, "winrt-sdhci-dma",
+        "Enable SDHCI DMA in the Windows RT platform (default on)");
+    object_class_property_add_bool(oc, "winrt", virt_get_winrt,
+                                   virt_set_winrt);
+    object_class_property_set_description(oc, "winrt",
+        "Enable the experimental AArch32 Windows RT platform");
     object_class_property_add_bool(oc, "secure", virt_get_secure,
                                    virt_set_secure);
     object_class_property_set_description(oc, "secure",
@@ -4357,6 +4438,7 @@ static void virt_instance_init(Object *obj)
      * boot UEFI blobs which assume no TrustZone support.
      */
     vms->secure = false;
+    vms->winrt_sdhci_dma = true;
 
     /* EL2 is also disabled by default, for similar reasons */
     vms->virt = false;

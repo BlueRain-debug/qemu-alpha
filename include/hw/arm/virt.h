@@ -100,6 +100,8 @@ enum {
     VIRT_GWDT_WS0,
     VIRT_GWDT_REFRESH,
     VIRT_GWDT_CONTROL,
+    VIRT_EHCI,
+    VIRT_SDHCI,
     VIRT_LOWMEMMAP_LAST,
 };
 
@@ -166,6 +168,8 @@ struct VirtMachineState {
     FWCfgState *fw_cfg;
     PFlashCFI01 *flash[2];
     bool secure;
+    bool winrt;
+    bool winrt_sdhci_dma;
     bool highmem;
     bool highmem_compact;
     bool highmem_cxl;
