@@ -214,6 +214,7 @@ static const MemMapEntry base_memmap[] = {
     [VIRT_ACPI_PCIHP] =         { 0x090c0000, ACPI_PCIHP_SIZE },
     [VIRT_EHCI] =               { 0x090e0000, 0x00010000 },
     [VIRT_SDHCI] =              { 0x090f0000, 0x00010000 },
+    [VIRT_WINRT_TIMER] =        { 0x09100000, 0x00001000 },
     [VIRT_MMIO] =               { 0x0a000000, 0x00000200 },
     /* ...repeating for a total of NUM_VIRTIO_TRANSPORTS, each of that size */
     [VIRT_PLATFORM_BUS] =       { 0x0c000000, 0x02000000 },
@@ -273,6 +274,7 @@ static const int a15irqmap[] = {
     [VIRT_GWDT_WS0] = 10,
     [VIRT_EHCI] = 11,
     [VIRT_SDHCI] = 12,
+    [VIRT_WINRT_TIMER] = 13,
     [VIRT_MMIO] = 16, /* ...to 16 + NUM_VIRTIO_TRANSPORTS - 1 */
     [VIRT_GIC_V2M] = 48, /* ...to 48 + NUM_GICV2M_SPIS - 1 */
     [VIRT_SMMU] = 74,    /* ...to 74 + NUM_SMMU_IRQS - 1 */
@@ -2897,6 +2899,18 @@ static void create_winrt_devices(const VirtMachineState *vms)
     sysbus_connect_irq(sbd, 0,
                       qdev_get_gpio_in(vms->gic, vms->irqmap[VIRT_SDHCI]));
 
+    if (vms->winrt_sp804) {
+        DeviceState *timer = qdev_new("sp804");
+
+        qdev_prop_set_bit(timer, "legacy-mode-select", true);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(timer), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(timer), 0,
+                        vms->memmap[VIRT_WINRT_TIMER].base);
+        sysbus_connect_irq(SYS_BUS_DEVICE(timer), 0,
+                           qdev_get_gpio_in(vms->gic,
+                                            vms->irqmap[VIRT_WINRT_TIMER]));
+    }
+
     card = qdev_new(TYPE_SD_CARD);
     qdev_prop_set_drive_err(card, "drive", di ? blk_by_legacy_dinfo(di) : NULL,
                             &error_fatal);
@@ -2922,10 +2936,16 @@ static void machvirt_init(MachineState *machine)
 
     possible_cpus = mc->possible_cpu_arch_ids(machine);
 
+    if (vms->winrt_sp804 && !vms->winrt) {
+        error_report("winrt-sp804 requires winrt=on");
+        exit(1);
+    }
+
     if (vms->winrt && (!tcg_enabled() || vms->secure || vms->virt ||
-                      machine->smp.cpus != 1 || machine->smp.max_cpus != 1)) {
-        error_report("winrt requires TCG, one CPU, secure=off and "
-                     "virtualization=off");
+                      machine->smp.cpus > 4 ||
+                      machine->smp.max_cpus != machine->smp.cpus)) {
+        error_report("winrt requires TCG, one to four CPUs, secure=off, "
+                     "virtualization=off and no CPU hotplug");
         exit(1);
     }
 
@@ -2987,7 +3007,8 @@ static void machvirt_init(MachineState *machine)
      * and otherwise we will use HVC (for backwards compatibility and
      * because if we're using KVM then we must use HVC).
      */
-    if (vms->secure && firmware_loaded) {
+    if (vms->winrt || (vms->secure && firmware_loaded)) {
+        /* WinRT firmware parks secondary CPUs instead of using PSCI. */
         vms->psci_conduit = QEMU_PSCI_CONDUIT_DISABLED;
     } else if (vms->virt) {
         vms->psci_conduit = QEMU_PSCI_CONDUIT_SMC;
@@ -3318,6 +3339,16 @@ static bool virt_get_winrt_sdhci_dma(Object *obj, Error **errp)
 static void virt_set_winrt_sdhci_dma(Object *obj, bool value, Error **errp)
 {
     VIRT_MACHINE(obj)->winrt_sdhci_dma = value;
+}
+
+static bool virt_get_winrt_sp804(Object *obj, Error **errp)
+{
+    return VIRT_MACHINE(obj)->winrt_sp804;
+}
+
+static void virt_set_winrt_sp804(Object *obj, bool value, Error **errp)
+{
+    VIRT_MACHINE(obj)->winrt_sp804 = value;
 }
 
 static bool virt_get_winrt(Object *obj, Error **errp)
@@ -4287,6 +4318,10 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
                                    virt_set_winrt_sdhci_dma);
     object_class_property_set_description(oc, "winrt-sdhci-dma",
         "Enable SDHCI DMA in the Windows RT platform (default on)");
+    object_class_property_add_bool(oc, "winrt-sp804", virt_get_winrt_sp804,
+                                   virt_set_winrt_sp804);
+    object_class_property_set_description(oc, "winrt-sp804",
+        "Use an SP804 timer and CSRT for the Windows RT platform");
     object_class_property_add_bool(oc, "winrt", virt_get_winrt,
                                    virt_set_winrt);
     object_class_property_set_description(oc, "winrt",

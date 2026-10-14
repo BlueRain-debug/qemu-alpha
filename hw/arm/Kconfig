@@ -39,6 +39,7 @@ config ARM_VIRT
     select WDT_SBSA
     select USB_EHCI_SYSBUS
     select SDHCI
+    select ARM_TIMER
 
 config CUBIEBOARD
     bool

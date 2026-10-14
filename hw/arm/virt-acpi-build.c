@@ -155,14 +155,21 @@ static void acpi_dsdt_add_winrt(Aml *scope, VirtMachineState *vms)
     } devices[] = {
         { "USB0", "PNP0D20", VIRT_EHCI },
         { "SDC1", "PNP0D40", VIRT_SDHCI },
+        { "TMR0", "ARMH0804", VIRT_WINRT_TIMER },
     };
     int i;
 
     for (i = 0; i < ARRAY_SIZE(devices); i++) {
         int id = devices[i].id;
         uint32_t irq = vms->irqmap[id] + ARM_SPI_BASE;
-        Aml *dev = aml_device("%s", devices[i].name);
-        Aml *crs = aml_resource_template();
+        Aml *dev;
+        Aml *crs;
+
+        if (id == VIRT_WINRT_TIMER && !vms->winrt_sp804) {
+            continue;
+        }
+        dev = aml_device("%s", devices[i].name);
+        crs = aml_resource_template();
 
         aml_append(dev, aml_name_decl("_HID", aml_string("%s", devices[i].hid)));
         aml_append(dev, aml_name_decl("_CID", aml_string("%s", devices[i].hid)));
@@ -892,6 +899,37 @@ build_srat(GArray *table_data, BIOSLinker *linker, VirtMachineState *vms)
     acpi_table_end(linker, &table);
 }
 
+/* The inbox halextsp804 driver consumes an ARMH/0804 CSRT resource group. */
+static void build_winrt_csrt(GArray *table_data, BIOSLinker *linker,
+                             VirtMachineState *vms)
+{
+    AcpiTable table = { .sig = "CSRT", .rev = 0, .oem_id = vms->oem_id,
+                        .oem_table_id = vms->oem_table_id };
+    int timer;
+
+    acpi_table_begin(&table, table_data);
+    build_append_int_noprefix(table_data, 68, 4); /* Group length */
+    build_append_int_noprefix(table_data, 0x484d5241, 4); /* Vendor ARMH */
+    build_append_int_noprefix(table_data, 0, 4); /* Subvendor */
+    build_append_int_noprefix(table_data, 0x0804, 2); /* Device */
+    build_append_int_noprefix(table_data, 0, 2); /* Subdevice */
+    build_append_int_noprefix(table_data, 0, 2); /* Revision */
+    build_append_int_noprefix(table_data, 0, 2); /* Reserved */
+    build_append_int_noprefix(table_data, 12, 4); /* Shared information length */
+    build_append_int_noprefix(table_data,
+                             vms->memmap[VIRT_WINRT_TIMER].base, 8);
+    build_append_int_noprefix(table_data, 1000000, 4); /* Clock in Hz */
+    for (timer = 0; timer < 2; timer++) {
+        build_append_int_noprefix(table_data, 16, 4); /* Descriptor length */
+        build_append_int_noprefix(table_data, 2, 2); /* Timer resource */
+        build_append_int_noprefix(table_data, 0, 2); /* Timer subtype */
+        build_append_int_noprefix(table_data, timer, 4); /* UID */
+        build_append_int_noprefix(table_data,
+                                 vms->irqmap[VIRT_WINRT_TIMER] + ARM_SPI_BASE, 4);
+    }
+    acpi_table_end(linker, &table);
+}
+
 /*
  * ACPI spec, Revision 6.5
  * 5.2.25 Generic Timer Description Table (GTDT)
@@ -1428,7 +1466,11 @@ void virt_acpi_build(VirtMachineState *vms, AcpiBuildTables *tables)
     }
 
     acpi_add_table(table_offsets, tables_blob);
-    build_gtdt(tables_blob, tables->linker, vms, wdt && !has_wdat);
+    if (vms->winrt_sp804) {
+        build_winrt_csrt(tables_blob, tables->linker, vms);
+    } else {
+        build_gtdt(tables_blob, tables->linker, vms, wdt && !has_wdat);
+    }
 
     acpi_add_table(table_offsets, tables_blob);
     {

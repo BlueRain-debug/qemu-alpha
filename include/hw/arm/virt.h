@@ -102,6 +102,7 @@ enum {
     VIRT_GWDT_CONTROL,
     VIRT_EHCI,
     VIRT_SDHCI,
+    VIRT_WINRT_TIMER,
     VIRT_LOWMEMMAP_LAST,
 };
 
@@ -170,6 +171,7 @@ struct VirtMachineState {
     bool secure;
     bool winrt;
     bool winrt_sdhci_dma;
+    bool winrt_sp804;
     bool highmem;
     bool highmem_compact;
     bool highmem_cxl;

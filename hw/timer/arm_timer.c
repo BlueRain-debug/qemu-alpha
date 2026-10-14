@@ -200,6 +200,7 @@ struct SP804State {
     MemoryRegion iomem;
     arm_timer_state *timer[2];
     uint32_t freq0, freq1;
+    bool legacy_mode_select;
     int level[2];
     qemu_irq irq;
 };
@@ -256,6 +257,23 @@ static void sp804_write(void *opaque, hwaddr offset,
                         uint64_t value, unsigned size)
 {
     SP804State *s = (SP804State *)opaque;
+
+    /*
+     * Early Windows RT HAL extensions OR in the requested mode without
+     * clearing the previous mode. On this opt-in compatibility path, the
+     * newly set mode wins. Normal SP804 one-shot precedence is unchanged.
+     */
+    if (s->legacy_mode_select && (offset == 0x08 || offset == 0x28) &&
+        (value & (TIMER_CTRL_ONESHOT | TIMER_CTRL_PERIODIC)) ==
+        (TIMER_CTRL_ONESHOT | TIMER_CTRL_PERIODIC)) {
+        uint32_t old = s->timer[offset >> 5]->control;
+
+        if (old & TIMER_CTRL_ONESHOT) {
+            value &= ~TIMER_CTRL_ONESHOT;
+        } else {
+            value &= ~TIMER_CTRL_PERIODIC;
+        }
+    }
 
     if (offset < 0x20) {
         arm_timer_write(s->timer[0], offset, value);
@@ -390,6 +408,7 @@ static const TypeInfo icp_pit_info = {
 static const Property sp804_properties[] = {
     DEFINE_PROP_UINT32("freq0", SP804State, freq0, 1000000),
     DEFINE_PROP_UINT32("freq1", SP804State, freq1, 1000000),
+    DEFINE_PROP_BOOL("legacy-mode-select", SP804State, legacy_mode_select, false),
 };
 
 static void sp804_class_init(ObjectClass *klass, const void *data)
