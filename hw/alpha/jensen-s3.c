@@ -80,7 +80,8 @@ static unsigned s3_pitch(JensenS3State *s)
     unsigned extension = s->vga.cr[0x51] & 0x30;
     unsigned offset = s->vga.cr[0x13] |
         (extension ? extension << 4 : (s->vga.cr[0x43] & 4) << 6);
-    return offset * 8;
+    /* A zero offset wraps to 256, as in 86Box. */
+    return (offset ? offset : 0x100) * 8;
 }
 
 static bool s3_cursor_external(JensenS3State *s)
