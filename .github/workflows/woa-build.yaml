@@ -10,9 +10,175 @@ permissions:
   contents: read
 
 jobs:
+  linux:
+    name: ${{ matrix.job_name }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - job_name: Linux x86-64 (GCC)
+            runner: ubuntu-24.04
+            arch: x86_64
+            build_dir: build-linux
+            dist_stem: qemu-winrt-linux-x86_64
+            archive: qemu-winrt-linux-x86_64.tar.gz
+            artifact_name: QEMU-WinRT-Linux-AMD64
+          - job_name: Linux AArch64 (GCC, native)
+            runner: ubuntu-24.04-arm
+            arch: aarch64
+            build_dir: build-linux-aarch64
+            dist_stem: qemu-winrt-linux-aarch64
+            archive: qemu-winrt-linux-aarch64.tar.gz
+            artifact_name: QEMU-WinRT-Linux-AA64
+
+    steps:
+      - name: Check out the source tree
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bison \
+            build-essential \
+            file \
+            flex \
+            git \
+            libfdt-dev \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libpixman-1-dev \
+            libsdl2-dev \
+            libslirp-dev \
+            ninja-build \
+            pkg-config \
+            python3 \
+            python3-pip \
+            python3-setuptools \
+            python3-venv \
+            python3-wheel \
+            zlib1g-dev
+
+      - name: Configure and build the Linux emulator
+        run: |
+          set -euo pipefail
+
+          build_dir="${{ matrix.build_dir }}"
+          version="$(tr -d '\r\n' < VERSION)"
+          install_dir="$PWD/dist/${{ matrix.dist_stem }}-$version"
+          mkdir -p "$build_dir"
+          (
+            cd "$build_dir"
+            CC=gcc CXX=g++ ../configure \
+              --prefix="$install_dir" \
+              --bindir=. \
+              --python=/usr/bin/python3 \
+              --target-list=arm-softmmu \
+              --enable-system \
+              --enable-tcg \
+              --enable-pixman \
+              --enable-fdt=system \
+              --enable-gtk \
+              --enable-sdl \
+              --enable-slirp \
+              --enable-vnc \
+              --disable-docs \
+              --disable-guest-agent \
+              --disable-rust \
+              --disable-werror
+          )
+
+          ninja -C "$build_dir" -j"$(nproc)" qemu-system-arm qemu-img
+
+      - name: Stage and archive the Linux distribution
+        run: |
+          set -euo pipefail
+
+          build_dir="${{ matrix.build_dir }}"
+          version="$(tr -d '\r\n' < VERSION)"
+          dist_root="$PWD/dist"
+          dist="$dist_root/${{ matrix.dist_stem }}-$version"
+          mkdir -p "$dist/share/qemu"
+
+          install -m 0755 "$build_dir/qemu-system-arm" "$build_dir/qemu-img" "$dist/"
+          install -m 0644 COPYING COPYING.LIB LICENSE README.rst "$dist/"
+          cp -aL pc-bios/. "$dist/share/qemu/"
+
+          # Record the shared-library requirements as in the Alpha workflow.
+          : > "$dist/linux-library-dependencies.txt"
+          for executable in "$dist/qemu-system-arm" "$dist/qemu-img"; do
+            file "$executable" | tee -a "$dist/linux-library-dependencies.txt"
+            ldd "$executable" | tee -a "$dist/linux-library-dependencies.txt"
+          done
+
+          tar -czf "${{ matrix.archive }}" -C "$dist_root" "$(basename "$dist")"
+
+      - name: Upload the Linux artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+          archive: false
+
   windows-arm-system:
-    name: Windows x86-64 (MSYS2 UCRT64)
-    runs-on: windows-2022
+    name: ${{ matrix.job_name }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - job_name: Windows x86-64 (MSYS2 UCRT64 GCC)
+            runner: windows-2022
+            arch: x86_64
+            msystem: UCRT64
+            runtime_prefix: /ucrt64
+            package_prefix: mingw-w64-ucrt-x86_64
+            compiler_packages: mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-binutils
+            cc: gcc
+            cxx: g++
+            ar: ar
+            nm: nm
+            ranlib: ranlib
+            windres: windres
+            dlltool: dlltool
+            build_dir: build-winrt
+            dist_stem: qemu-winrt-windows-x86_64
+            archive: qemu-winrt-windows-x86_64.zip
+            artifact_name: QEMU-WinRT-Windows-AMD64
+          - job_name: Windows ARM64 (MSYS2 CLANGARM64, native)
+            runner: windows-11-arm
+            arch: aarch64
+            msystem: CLANGARM64
+            runtime_prefix: /clangarm64
+            package_prefix: mingw-w64-clang-aarch64
+            compiler_packages: mingw-w64-clang-aarch64-clang mingw-w64-clang-aarch64-llvm-tools mingw-w64-clang-aarch64-libc++
+            cc: clang
+            cxx: clang++
+            ar: llvm-ar
+            nm: llvm-nm
+            ranlib: llvm-ranlib
+            windres: llvm-windres
+            dlltool: llvm-dlltool
+            build_dir: build-winrt-arm64
+            dist_stem: qemu-winrt-windows-aarch64
+            archive: qemu-winrt-windows-aarch64.zip
+            artifact_name: QEMU-WinRT-Windows-AA64
+
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+      AR: ${{ matrix.ar }}
+      NM: ${{ matrix.nm }}
+      RANLIB: ${{ matrix.ranlib }}
+      WINDRES: ${{ matrix.windres }}
+      DLLTOOL: ${{ matrix.dlltool }}
+      QEMU_MSYS_PREFIX: ${{ matrix.runtime_prefix }}
 
     defaults:
       run:
@@ -25,56 +191,69 @@ jobs:
 
       - name: Check out the source tree
         uses: actions/checkout@v6
-        with:
-          ref: qemu-winrt
 
       - name: Set up MSYS2
         uses: msys2/setup-msys2@v2
         with:
-          msystem: UCRT64
+          msystem: ${{ matrix.msystem }}
           update: true
           install: >-
             bison
+            binutils
             diffutils
             findutils
             flex
             git
             grep
             make
-            mingw-w64-ucrt-x86_64-binutils
-            mingw-w64-ucrt-x86_64-dtc
-            mingw-w64-ucrt-x86_64-gcc
-            mingw-w64-ucrt-x86_64-glib2
-            mingw-w64-ucrt-x86_64-libslirp
-            mingw-w64-ucrt-x86_64-ninja
-            mingw-w64-ucrt-x86_64-pixman
-            mingw-w64-ucrt-x86_64-pkgconf
-            mingw-w64-ucrt-x86_64-python
-            mingw-w64-ucrt-x86_64-python-pip
-            mingw-w64-ucrt-x86_64-python-setuptools
-            mingw-w64-ucrt-x86_64-python-wheel
-            mingw-w64-ucrt-x86_64-SDL2
-            mingw-w64-ucrt-x86_64-zlib
+            sed
+            ${{ matrix.package_prefix }}-adwaita-icon-theme
+            ${{ matrix.package_prefix }}-adwaita-icon-theme-legacy
+            ${{ matrix.package_prefix }}-dtc
+            ${{ matrix.package_prefix }}-fontconfig
+            ${{ matrix.compiler_packages }}
+            ${{ matrix.package_prefix }}-gdk-pixbuf2
+            ${{ matrix.package_prefix }}-glib2
+            ${{ matrix.package_prefix }}-gtk3
+            ${{ matrix.package_prefix }}-gtk-update-icon-cache
+            ${{ matrix.package_prefix }}-hicolor-icon-theme
+            ${{ matrix.package_prefix }}-librsvg
+            ${{ matrix.package_prefix }}-libslirp
+            ${{ matrix.package_prefix }}-ninja
+            ${{ matrix.package_prefix }}-pixman
+            ${{ matrix.package_prefix }}-pkgconf
+            ${{ matrix.package_prefix }}-python
+            ${{ matrix.package_prefix }}-python-pip
+            ${{ matrix.package_prefix }}-python-setuptools
+            ${{ matrix.package_prefix }}-python-wheel
+            ${{ matrix.package_prefix }}-SDL2
+            ${{ matrix.package_prefix }}-shared-mime-info
+            ${{ matrix.package_prefix }}-zlib
 
-      - name: Configure and build the ARM system emulator
+      - name: Configure and build the Windows emulator
         run: |
           set -euo pipefail
 
-          build_dir=build-winrt
-          rm -rf "$build_dir"
+          build_dir="${{ matrix.build_dir }}"
+          version="$(tr -d '\r\n' < VERSION)"
+          install_dir="$(cygpath -m "$PWD/dist/${{ matrix.dist_stem }}-$version")"
           mkdir -p "$build_dir"
           (
             cd "$build_dir"
-            CC=gcc CXX=g++ ../configure \
-              --python=/ucrt64/bin/python \
+            ../configure \
+              --cpu="${{ matrix.arch }}" \
+              --prefix="$install_dir" \
+              --bindir=. \
+              --python="$QEMU_MSYS_PREFIX/bin/python" \
               --target-list=arm-softmmu \
               --enable-system \
               --enable-tcg \
               --enable-pixman \
               --enable-fdt=system \
+              --enable-gtk \
               --enable-sdl \
+              --enable-slirp \
               --enable-vnc \
-              --disable-gtk \
               --disable-docs \
               --disable-guest-agent \
               --disable-rust \
@@ -86,25 +265,229 @@ jobs:
             qemu-system-armw.exe \
             qemu-img.exe
 
-          "$build_dir/qemu-system-arm.exe" --version
-          "$build_dir/qemu-img.exe" --version
-          "$build_dir/qemu-system-arm.exe" -machine help
+      - name: Stage the Windows distribution
+        run: |
+          set -euo pipefail
 
-      - name: Stage build artifacts
+          build_dir="${{ matrix.build_dir }}"
+          version="$(tr -d '\r\n' < VERSION)"
+          dist_root="$PWD/dist"
+          dist="$dist_root/${{ matrix.dist_stem }}-$version"
+
+          imported_dlls() {
+            if [[ "${{ matrix.arch }}" == aarch64 ]]; then
+              llvm-readobj --coff-imports "$1" \
+                | sed -n 's/^[[:space:]]*Name: //p' \
+                | tr -d '\r'
+            else
+              objdump -p "$1" \
+                | sed -n 's/^[[:space:]]*DLL Name: //p' \
+                | tr -d '\r'
+            fi
+          }
+
+          is_windows_system_dll() {
+            local dll="$1"
+            local lower="${dll,,}"
+
+            [[ "$lower" == api-ms-win-*.dll ||
+               "$lower" == ext-ms-win-*.dll ||
+               -f "/c/Windows/System32/$dll" ]]
+          }
+
+          # Keep the archive layout consistent with --bindir=.
+          # Match the PE machine type to the host architecture being built.
+          "$QEMU_MSYS_PREFIX/bin/python" - "$build_dir" "${{ matrix.arch }}" <<'PY'
+          import struct
+          import sys
+          from pathlib import Path
+
+          expected = {"x86_64": 0x8664, "aarch64": 0xAA64}[sys.argv[2]]
+          for name in ("qemu-system-arm.exe", "qemu-system-armw.exe", "qemu-img.exe"):
+              path = Path(sys.argv[1]) / name
+              data = path.read_bytes()
+              pe = struct.unpack_from("<I", data, 0x3C)[0]
+              if data[:2] != b"MZ" or data[pe:pe + 4] != b"PE\0\0":
+                  raise SystemExit(f"Invalid PE executable: {path}")
+              machine = struct.unpack_from("<H", data, pe + 4)[0]
+              if machine != expected:
+                  raise SystemExit(f"Unexpected PE machine {machine:#x}: {path}")
+          PY
+
+          mkdir -p \
+            "$dist/etc" \
+            "$dist/lib" \
+            "$dist/share/icons"
+
+          install -m 0755 \
+            "$build_dir/qemu-system-arm.exe" \
+            "$build_dir/qemu-system-armw.exe" \
+            "$build_dir/qemu-img.exe" \
+            "$dist/"
+
+          # GLib locates these helpers by name at runtime; they do not appear
+          # in the executable's PE import table.
+          install -m 0755 \
+            "$QEMU_MSYS_PREFIX/bin/gspawn-win64-helper.exe" \
+            "$QEMU_MSYS_PREFIX/bin/gspawn-win64-helper-console.exe" \
+            "$dist/"
+
+          install -m 0644 \
+            COPYING \
+            COPYING.LIB \
+            LICENSE \
+            README.rst \
+            "$dist/"
+
+          mkdir -p "$dist/share/qemu"
+          cp -aL pc-bios/. "$dist/share/qemu/"
+
+          # GTK loads these resources and modules at runtime rather than
+          # expressing them as executable DLL imports.
+          cp -aL "$QEMU_MSYS_PREFIX/etc/fonts" "$dist/etc/"
+          cp -aL "$QEMU_MSYS_PREFIX/etc/gtk-3.0" "$dist/etc/"
+          cp -aL "$QEMU_MSYS_PREFIX/lib/gdk-pixbuf-2.0" "$dist/lib/"
+          cp -aL "$QEMU_MSYS_PREFIX/lib/gtk-3.0" "$dist/lib/"
+          cp -aL "$QEMU_MSYS_PREFIX/share/fontconfig" "$dist/share/"
+          cp -aL "$QEMU_MSYS_PREFIX/share/glib-2.0" "$dist/share/"
+          cp -aL "$QEMU_MSYS_PREFIX/share/gtk-3.0" "$dist/share/"
+          cp -aL "$QEMU_MSYS_PREFIX/share/icons/Adwaita" "$dist/share/icons/"
+          cp -aL "$QEMU_MSYS_PREFIX/share/icons/AdwaitaLegacy" "$dist/share/icons/"
+          cp -aL "$QEMU_MSYS_PREFIX/share/icons/hicolor" "$dist/share/icons/"
+          cp -aL "$QEMU_MSYS_PREFIX/share/mime" "$dist/share/"
+          cp -aL "$QEMU_MSYS_PREFIX/share/themes" "$dist/share/"
+
+          # Generate relocatable module caches explicitly.  The Windows GTK3
+          # package currently has no external input-method DLLs, so its pacman
+          # hook does not create immodules.cache on a fresh installation.
+          "$QEMU_MSYS_PREFIX/bin/gdk-pixbuf-query-loaders.exe" \
+            | tr -d '\r' \
+            > "$dist/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+          "$QEMU_MSYS_PREFIX/bin/gtk-query-immodules-3.0.exe" \
+            | tr -d '\r' \
+            > "$dist/lib/gtk-3.0/3.0.0/immodules.cache"
+
+          # Rebuild every other package-hook-generated cache in the staged
+          # tree instead of relying on the state of the MSYS2 installation.
+          "$QEMU_MSYS_PREFIX/bin/glib-compile-schemas.exe" \
+            "$dist/share/glib-2.0/schemas"
+          for icon_theme in Adwaita AdwaitaLegacy hicolor; do
+            "$QEMU_MSYS_PREFIX/bin/gtk-update-icon-cache.exe" -f -q \
+              "$dist/share/icons/$icon_theme"
+          done
+          "$QEMU_MSYS_PREFIX/bin/update-mime-database.exe" "$dist/share/mime"
+
+          # Copy MinGW runtime DLLs and their transitive dependencies.
+          declare -A seen=()
+          queue=(
+            "$dist/qemu-system-arm.exe"
+            "$dist/qemu-system-armw.exe"
+            "$dist/qemu-img.exe"
+            "$dist/gspawn-win64-helper.exe"
+            "$dist/gspawn-win64-helper-console.exe"
+          )
+          while IFS= read -r module; do
+            queue+=("$module")
+          done < <(find "$dist/lib" -type f -iname '*.dll' -print)
+
+          while (( ${#queue[@]} > 0 )); do
+            pe_file="${queue[0]}"
+            queue=("${queue[@]:1}")
+
+            if ! imports="$(imported_dlls "$pe_file")"; then
+              echo "Unable to inspect PE imports: $pe_file" >&2
+              exit 1
+            fi
+            while IFS= read -r dll; do
+              [[ -n "$dll" ]] || continue
+
+              key="${dll,,}"
+              if [[ -n "${seen[$key]+x}" ]]; then
+                continue
+              fi
+              seen["$key"]=1
+
+              source_dll="$QEMU_MSYS_PREFIX/bin/$dll"
+              if [[ -f "$source_dll" ]]; then
+                install -m 0755 "$source_dll" "$dist/$dll"
+                queue+=("$source_dll")
+              elif ! is_windows_system_dll "$dll"; then
+                echo "Missing runtime DLL: $dll (required by $pe_file)" >&2
+                exit 1
+              fi
+            done <<<"$imports"
+          done
+
+          runtime_dll_count="$(find "$dist" -maxdepth 1 \
+            -type f -iname '*.dll' | wc -l)"
+          if (( runtime_dll_count == 0 )); then
+            echo "No MinGW runtime DLLs were staged" >&2
+            exit 1
+          fi
+
+          loader_dll_count="$(find \
+            "$dist/lib/gdk-pixbuf-2.0/2.10.0/loaders" \
+            -type f -iname '*.dll' | wc -l)"
+          if (( loader_dll_count == 0 )); then
+            echo "No GDK Pixbuf loader DLLs were staged" >&2
+            exit 1
+          fi
+
+          required_runtime_files=(
+            "$dist/libgtk-3-0.dll"
+            "$dist/gspawn-win64-helper.exe"
+            "$dist/gspawn-win64-helper-console.exe"
+            "$dist/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+            "$dist/lib/gtk-3.0/3.0.0/immodules.cache"
+            "$dist/share/glib-2.0/schemas/gschemas.compiled"
+            "$dist/share/icons/Adwaita/index.theme"
+            "$dist/share/icons/AdwaitaLegacy/index.theme"
+            "$dist/share/icons/Adwaita/icon-theme.cache"
+            "$dist/share/icons/AdwaitaLegacy/icon-theme.cache"
+            "$dist/share/icons/hicolor/icon-theme.cache"
+            "$dist/share/mime/mime.cache"
+          )
+          for required_file in "${required_runtime_files[@]}"; do
+            if [[ ! -f "$required_file" ]]; then
+              echo "Missing staged GTK runtime file: $required_file" >&2
+              exit 1
+            fi
+          done
+
+          # Module caches must remain valid after extracting the artifact to
+          # a location other than the MSYS2 installation prefix.
+          if ! grep -Eiq '^"[^"]*libpixbufloader-[^"]+\.dll"$' \
+            "$dist/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"; then
+            echo "GDK Pixbuf loader cache contains no loader entries" >&2
+            exit 1
+          fi
+          if grep -Eiq '(^|")([a-z]:[\\/]|/(ucrt64|clangarm64)/)' \
+            "$dist/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache" \
+            "$dist/lib/gtk-3.0/3.0.0/immodules.cache"; then
+            echo "GTK module cache contains an absolute MSYS2 path" >&2
+            exit 1
+          fi
+
+      - name: Create the Windows archive
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $stage = Join-Path $PWD "dist\qemu-winrt-windows-x86_64"
-          $firmware = Join-Path $stage "share\qemu"
-          New-Item -ItemType Directory -Force -Path $firmware | Out-Null
-          Copy-Item build-winrt\qemu-system-arm.exe, build-winrt\qemu-system-armw.exe, build-winrt\qemu-img.exe $stage
-          Copy-Item pc-bios\* $firmware -Recurse
-          Copy-Item COPYING, COPYING.LIB, LICENSE, README.rst $stage
+
+          $version = (Get-Content -Raw VERSION).Trim()
+          $source = Join-Path $PWD "dist\${{ matrix.dist_stem }}-$version"
+          $archive = Join-Path $PWD "${{ matrix.archive }}"
+
+          Remove-Item -Force $archive -ErrorAction SilentlyContinue
+          Compress-Archive -LiteralPath $source -DestinationPath $archive -CompressionLevel Optimal
+
+          if (-not (Test-Path $archive) -or (Get-Item $archive).Length -eq 0) {
+            throw "The Windows archive was not created correctly."
+          }
 
       - name: Upload the Windows artifact
         uses: actions/upload-artifact@v7
         with:
-          name: QEMU-WinRT-Windows-AMD64
-          path: dist/qemu-winrt-windows-x86_64
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.archive }}
           if-no-files-found: error
-          archive: true
+          archive: false
