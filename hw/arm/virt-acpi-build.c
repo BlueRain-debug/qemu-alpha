@@ -165,6 +165,7 @@ static void acpi_dsdt_add_winrt(Aml *scope, VirtMachineState *vms)
         Aml *crs = aml_resource_template();
 
         aml_append(dev, aml_name_decl("_HID", aml_string("%s", devices[i].hid)));
+        aml_append(dev, aml_name_decl("_CID", aml_string("%s", devices[i].hid)));
         aml_append(dev, aml_name_decl("_UID", aml_int(0)));
         aml_append(crs, aml_memory32_fixed(vms->memmap[id].base,
                                          vms->memmap[id].size, AML_READ_WRITE));
