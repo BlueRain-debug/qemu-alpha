@@ -159,6 +159,15 @@ static void acpi_dsdt_add_winrt(Aml *scope, VirtMachineState *vms)
     };
     int i;
 
+    if (vms->winrt_tegra_timer) {
+        Aml *dev = aml_device("TGT0");
+
+        /* The HAL owns these resources through CSRT. Match the native
+         * Tegra namespace device without duplicating its resources in _CRS. */
+        aml_append(dev, aml_name_decl("_HID", aml_string("NVDA000A")));
+        aml_append(scope, dev);
+    }
+
     for (i = 0; i < ARRAY_SIZE(devices); i++) {
         int id = devices[i].id;
         uint32_t irq = vms->irqmap[id] + ARM_SPI_BASE;
@@ -930,6 +939,33 @@ static void build_winrt_csrt(GArray *table_data, BIOSLinker *linker,
     acpi_table_end(linker, &table);
 }
 
+/* Match the fixed resource UIDs registered by the Tegra HAL. */
+static void build_winrt_tegra_csrt(GArray *table_data, BIOSLinker *linker,
+                                  VirtMachineState *vms)
+{
+    AcpiTable table = { .sig = "CSRT", .rev = 0, .oem_id = vms->oem_id,
+                        .oem_table_id = vms->oem_table_id };
+
+    static const uint32_t uids[] = { 0, 1, 2, 3, 4, 0x1000, 0x1001 };
+
+    acpi_table_begin(&table, table_data);
+    build_append_int_noprefix(table_data, 24 + ARRAY_SIZE(uids) * 12, 4);
+    build_append_int_noprefix(table_data, 0x4144564e, 4); /* NVDA */
+    build_append_int_noprefix(table_data, 0, 4);
+    build_append_int_noprefix(table_data, 0x000a, 2);
+    build_append_int_noprefix(table_data, 0, 2);
+    build_append_int_noprefix(table_data, 0, 2);
+    build_append_int_noprefix(table_data, 0, 2);
+    build_append_int_noprefix(table_data, 0, 4); /* No shared information */
+    for (unsigned i = 0; i < ARRAY_SIZE(uids); i++) {
+        build_append_int_noprefix(table_data, 12, 4);
+        build_append_int_noprefix(table_data, 2, 2); /* Timer */
+        build_append_int_noprefix(table_data, 0, 2);
+        build_append_int_noprefix(table_data, uids[i], 4);
+    }
+    acpi_table_end(linker, &table);
+}
+
 /*
  * ACPI spec, Revision 6.5
  * 5.2.25 Generic Timer Description Table (GTDT)
@@ -1468,6 +1504,10 @@ void virt_acpi_build(VirtMachineState *vms, AcpiBuildTables *tables)
     acpi_add_table(table_offsets, tables_blob);
     if (vms->winrt_sp804) {
         build_winrt_csrt(tables_blob, tables->linker, vms);
+    } else if (vms->winrt_tegra_timer) {
+        /* The Tegra HAL has its own counter and always-on RTC. Do not
+         * also register the architecture counter through GTDT/EGIT. */
+        build_winrt_tegra_csrt(tables_blob, tables->linker, vms);
     } else {
         build_gtdt(tables_blob, tables->linker, vms, wdt && !has_wdat);
     }

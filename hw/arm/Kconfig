@@ -40,6 +40,7 @@ config ARM_VIRT
     select USB_EHCI_SYSBUS
     select SDHCI
     select ARM_TIMER
+    select TEGRA20_TIMER
 
 config CUBIEBOARD
     bool

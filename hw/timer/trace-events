@@ -133,3 +133,7 @@ imx_epit_cmp(uint32_t sr) "sr was %d"
 qtimer_interrupt(void) "qtimer interrupt line updated"
 qtimer_read(uint64_t offset) "offset 0x%" PRIx64
 qtimer_write(uint64_t offset, uint64_t value) "offset 0x%" PRIx64 " value 0x%" PRIx64
+
+# tegra20-timer.c
+tegra20_timer_program(unsigned channel, uint32_t control, int64_t deadline) "channel %u control 0x%x deadline %" PRId64
+tegra20_timer_expire(unsigned channel, uint32_t control) "channel %u control 0x%x"

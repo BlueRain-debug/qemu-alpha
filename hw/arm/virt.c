@@ -2911,6 +2911,33 @@ static void create_winrt_devices(const VirtMachineState *vms)
                                             vms->irqmap[VIRT_WINRT_TIMER]));
     }
 
+    if (vms->winrt_tegra_timer) {
+        static const int irqs[] = { 0, 1, 41, 42, 2 };
+        DeviceState *timer = qdev_new("tegra20-timer");
+        SysBusDevice *busdev = SYS_BUS_DEVICE(timer);
+        MachineState *ms = MACHINE(vms);
+
+        sysbus_realize_and_unref(busdev, &error_fatal);
+        /* Fixed addresses in the Tegra HAL. The matching firmware excludes
+         * both pages from its RAM resource map before any DXE allocations. */
+        sysbus_mmio_map_overlap(busdev, 0, 0x60005000, 1);
+        sysbus_mmio_map_overlap(busdev, 1, 0x7000e000, 1);
+        for (unsigned i = 0; i < ARRAY_SIZE(irqs); i++) {
+            sysbus_connect_irq(busdev, i, qdev_get_gpio_in(vms->gic, irqs[i]));
+        }
+        qemu_fdt_setprop(ms->fdt, "/", "qemu,winrt-tegra-timer", NULL, 0);
+        qemu_fdt_add_subnode(ms->fdt, "/reserved-memory");
+        qemu_fdt_setprop_cell(ms->fdt, "/reserved-memory", "#address-cells", 2);
+        qemu_fdt_setprop_cell(ms->fdt, "/reserved-memory", "#size-cells", 2);
+        qemu_fdt_setprop(ms->fdt, "/reserved-memory", "ranges", NULL, 0);
+        qemu_fdt_add_subnode(ms->fdt, "/reserved-memory/tegra-timer@60005000");
+        qemu_fdt_setprop_cells(ms->fdt, "/reserved-memory/tegra-timer@60005000",
+                               "reg", 0, 0x60005000, 0, 0x1000);
+        qemu_fdt_add_subnode(ms->fdt, "/reserved-memory/tegra-rtc@7000e000");
+        qemu_fdt_setprop_cells(ms->fdt, "/reserved-memory/tegra-rtc@7000e000",
+                               "reg", 0, 0x7000e000, 0, 0x1000);
+    }
+
     card = qdev_new(TYPE_SD_CARD);
     qdev_prop_set_drive_err(card, "drive", di ? blk_by_legacy_dinfo(di) : NULL,
                             &error_fatal);
@@ -2935,6 +2962,26 @@ static void machvirt_init(MachineState *machine)
     unsigned int max_cpus = machine->smp.max_cpus;
 
     possible_cpus = mc->possible_cpu_arch_ids(machine);
+
+    if (vms->winrt_tegra_timer) {
+        if (!vms->winrt || vms->winrt_sp804) {
+            error_report("winrt-tegra-timer requires winrt=on and "
+                         "winrt-sp804=off");
+            exit(1);
+        }
+        /* Reserve the fixed Tegra GSIVs 32/33/34/73/74. */
+        memcpy(vms->winrt_tegra_irqmap, a15irqmap, sizeof(a15irqmap));
+        vms->winrt_tegra_irqmap[VIRT_UART0] = 14;
+        vms->winrt_tegra_irqmap[VIRT_RTC] = 15;
+        vms->winrt_tegra_irqmap[VIRT_MMIO] = 80;
+        vms->irqmap = vms->winrt_tegra_irqmap;
+        if (vms->msi_controller == VIRT_MSI_CTRL_AUTO) {
+            vms->msi_controller = VIRT_MSI_CTRL_NONE;
+        } else if (vms->msi_controller != VIRT_MSI_CTRL_NONE) {
+            error_report("winrt-tegra-timer requires msi=none");
+            exit(1);
+        }
+    }
 
     if (vms->winrt_sp804 && !vms->winrt) {
         error_report("winrt-sp804 requires winrt=on");
@@ -3349,6 +3396,16 @@ static bool virt_get_winrt_sp804(Object *obj, Error **errp)
 static void virt_set_winrt_sp804(Object *obj, bool value, Error **errp)
 {
     VIRT_MACHINE(obj)->winrt_sp804 = value;
+}
+
+static bool virt_get_winrt_tegra_timer(Object *obj, Error **errp)
+{
+    return VIRT_MACHINE(obj)->winrt_tegra_timer;
+}
+
+static void virt_set_winrt_tegra_timer(Object *obj, bool value, Error **errp)
+{
+    VIRT_MACHINE(obj)->winrt_tegra_timer = value;
 }
 
 static bool virt_get_winrt(Object *obj, Error **errp)
@@ -4322,6 +4379,12 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
                                    virt_set_winrt_sp804);
     object_class_property_set_description(oc, "winrt-sp804",
         "Use an SP804 timer and CSRT for the Windows RT platform");
+    object_class_property_add_bool(oc, "winrt-tegra-timer",
+                                   virt_get_winrt_tegra_timer,
+                                   virt_set_winrt_tegra_timer);
+    object_class_property_set_description(oc, "winrt-tegra-timer",
+        "Expose fixed-address Tegra timer/RTC interfaces (requires matching "
+        "WinRT firmware RAM reservations)");
     object_class_property_add_bool(oc, "winrt", virt_get_winrt,
                                    virt_set_winrt);
     object_class_property_set_description(oc, "winrt",
