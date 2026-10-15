@@ -31,6 +31,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/module.h"
+#include "qapi/error.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/usb/usb.h"
 #include "migration/vmstate.h"
@@ -648,6 +649,12 @@ struct USBAudioState {
     } out;
 
     /* properties */
+    uint32_t usb_version;
+    USBDesc usb2_desc;
+    USBDescDevice usb2_full, usb2_high;
+    USBDescConfig usb2_high_config;
+    USBDescIface usb2_high_ifaces[ARRAY_SIZE(desc_iface_multi)];
+    USBDescEndpoint usb2_high_eps[ARRAY_SIZE(desc_iface_multi)];
     uint32_t debug;
     uint32_t buffer_user, buffer;
     bool multi;
@@ -936,16 +943,57 @@ static void usb_audio_unrealize(USBDevice *dev)
     streambuf_fini(&s->out.buf);
 }
 
+static void usb_audio_init_usb2(USBAudioState *s)
+{
+    const USBDescDevice *full = s->dev.usb_desc->full;
+    unsigned int i;
+
+    s->usb2_desc = *s->dev.usb_desc;
+    s->usb2_desc.id.bcdDevice = 0x0100;
+    s->usb2_full = *full;
+    s->usb2_full.bcdUSB = 0x0200;
+    s->usb2_high = s->usb2_full;
+    s->usb2_high_config = full->confs[0];
+    for (i = 0; i < s->usb2_high_config.nif; i++) {
+        s->usb2_high_ifaces[i] = s->usb2_high_config.ifs[i];
+        if (s->usb2_high_ifaces[i].bNumEndpoints) {
+            s->usb2_high_eps[i] = s->usb2_high_ifaces[i].eps[0];
+            /* Eight 125 us microframes preserve the 1 ms audio packet. */
+            s->usb2_high_eps[i].bInterval = 4;
+            s->usb2_high_ifaces[i].eps = &s->usb2_high_eps[i];
+        }
+    }
+    s->usb2_high_config.ifs = s->usb2_high_ifaces;
+    s->usb2_high.confs = &s->usb2_high_config;
+    s->usb2_desc.full = &s->usb2_full;
+    s->usb2_desc.high = &s->usb2_high;
+    s->dev.usb_desc = &s->usb2_desc;
+}
+
+static void usb_audio_handle_attach(USBDevice *dev)
+{
+    if (USB_AUDIO(dev)->usb_version == 2) {
+        usb_desc_attach(dev);
+    }
+}
+
 static void usb_audio_realize(USBDevice *dev, Error **errp)
 {
     USBAudioState *s = USB_AUDIO(dev);
     int i;
 
+    if (s->usb_version != 1 && s->usb_version != 2) {
+        error_setg(errp, "usb-audio: usb_version must be 1 or 2");
+        return;
+    }
     if (!audio_be_check(&s->audio_be, errp)) {
         return;
     }
 
     dev->usb_desc = s->multi ? &desc_audio_multi : &desc_audio;
+    if (s->usb_version == 2) {
+        usb_audio_init_usb2(s);
+    }
 
     usb_desc_create_serial(dev);
     usb_desc_init(dev);
@@ -991,6 +1039,7 @@ static const VMStateDescription vmstate_usb_audio = {
 
 static const Property usb_audio_properties[] = {
     DEFINE_AUDIO_PROPERTIES(USBAudioState, audio_be),
+    DEFINE_PROP_UINT32("usb_version", USBAudioState, usb_version, 1),
     DEFINE_PROP_UINT32("debug", USBAudioState, debug, 0),
     DEFINE_PROP_UINT32("buffer", USBAudioState, buffer_user, 0),
     DEFINE_PROP_BOOL("multi", USBAudioState, multi, false),
@@ -1006,6 +1055,7 @@ static void usb_audio_class_init(ObjectClass *klass, const void *data)
     set_bit(DEVICE_CATEGORY_SOUND, dc->categories);
     k->product_desc   = "QEMU USB Audio Interface";
     k->realize        = usb_audio_realize;
+    k->handle_attach  = usb_audio_handle_attach;
     k->handle_reset   = usb_audio_handle_reset;
     k->handle_control = usb_audio_handle_control;
     k->handle_data    = usb_audio_handle_data;
