@@ -76,6 +76,8 @@ jobs:
             CC=gcc CXX=g++ ../configure \
               --prefix="$install_dir" \
               --bindir=. \
+              --datadir=share \
+              -Dqemu_suffix=qemu \
               --python=/usr/bin/python3 \
               --target-list=arm-softmmu \
               --enable-system \
@@ -107,6 +109,14 @@ jobs:
           install -m 0755 "$build_dir/qemu-system-arm" "$build_dir/qemu-img" "$dist/"
           install -m 0644 COPYING COPYING.LIB LICENSE README.rst "$dist/"
           cp -aL pc-bios/. "$dist/share/qemu/"
+
+          # Keep the default VGA and virtio NIC option ROMs in every artifact.
+          for rom in efi-virtio.rom vgabios-stdvga.bin; do
+            if [[ ! -s "$dist/share/qemu/$rom" ]]; then
+              echo "Missing or empty staged firmware: $rom" >&2
+              exit 1
+            fi
+          done
 
           # Record the shared-library requirements as in the Alpha workflow.
           : > "$dist/linux-library-dependencies.txt"
@@ -244,6 +254,8 @@ jobs:
               --cpu="${{ matrix.arch }}" \
               --prefix="$install_dir" \
               --bindir=. \
+              --datadir=share \
+              -Dqemu_suffix=qemu \
               --python="$QEMU_MSYS_PREFIX/bin/python" \
               --target-list=arm-softmmu \
               --enable-system \
@@ -341,6 +353,14 @@ jobs:
 
           mkdir -p "$dist/share/qemu"
           cp -aL pc-bios/. "$dist/share/qemu/"
+
+          # Keep the default VGA and virtio NIC option ROMs in every artifact.
+          for rom in efi-virtio.rom vgabios-stdvga.bin; do
+            if [[ ! -s "$dist/share/qemu/$rom" ]]; then
+              echo "Missing or empty staged firmware: $rom" >&2
+              exit 1
+            fi
+          done
 
           # GTK loads these resources and modules at runtime rather than
           # expressing them as executable DLL imports.
