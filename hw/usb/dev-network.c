@@ -1146,12 +1146,13 @@ static void usb_net_handle_statusin(USBNetState *s, USBPacket *p)
     }
 
     if (is_rndis(s)) {
+        if (QTAILQ_EMPTY(&s->rndis_resp)) {
+            p->status = USB_RET_NAK;
+            return;
+        }
         rbuf[0] = cpu_to_le32(1);
         rbuf[1] = cpu_to_le32(0);
         usb_packet_copy(p, rbuf, 8);
-        if (!s->rndis_resp.tqh_first) {
-            p->status = USB_RET_NAK;
-        }
     } else {
         ebuf[0] =
             cpu_to_be16(ClassInterfaceRequest | USB_CDC_NETWORK_CONNECTION);
