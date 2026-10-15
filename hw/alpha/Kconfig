@@ -57,6 +57,9 @@ config ALPHASERVER_2100A
     select PCI
     select VGA_CIRRUS
     select JENSEN_S3
+    select LSI_SCSI_PCI
+    select I8257
+    select FDC_ISA
 
 config JENSEN_S3
     bool

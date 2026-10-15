@@ -14,6 +14,7 @@
 #include "qemu/error-report.h"
 #include "qemu/units.h"
 #include "qemu/timer.h"
+#include "qemu/main-loop.h"
 #include "qapi/error.h"
 #include "hw/core/boards.h"
 #include "hw/core/clock.h"
@@ -25,6 +26,8 @@
 #include "hw/intc/i8259.h"
 #include "hw/rtc/mc146818rtc.h"
 #include "hw/input/i8042.h"
+#include "hw/block/fdc.h"
+#include "hw/dma/i8257.h"
 #include "hw/timer/i8254.h"
 #include "hw/char/serial-isa.h"
 #include "hw/i2c/i2c.h"
@@ -41,6 +44,8 @@
 #include "internals.h"
 #include "trace.h"
 
+#define TYPE_LYNX_IOMMU "alpha2100a-iommu"
+#define TYPE_LYNX_DMA "alpha2100a-isa-dma"
 #define TYPE_ALPHA2100A_MACHINE MACHINE_TYPE_NAME("alpha2100a")
 OBJECT_DECLARE_SIMPLE_TYPE(Alpha2100AMachine, ALPHA2100A_MACHINE)
 #define LYNX_IO 0x3a0000000ULL
@@ -59,22 +64,44 @@ typedef struct LynxInterval {
     bool pending;
 } LynxInterval;
 
+/* Diagnostic bookkeeping for the documented direct-mapped B-cache.
+ * Architectural RAM and LL/SC are still handled by QEMU's normal fast path.
+ * This is not a full cache-coherent SMP or instruction-cache implementation.
+ */
+typedef struct LynxCacheLine {
+    hwaddr tag;
+    bool valid, dirty, corrected;
+    uint8_t data[32], original[32];
+} LynxCacheLine;
+
 struct Alpha2100AMachine {
     MachineState parent_obj;
     AlphaCPU *cpus[4];
     MemoryRegion isa_io, isa_mem, sparse_io, sparse_mem, dense_mem;
     MemoryRegion csr, pci_conf, vga_rom, mem_diag, mem_test_store;
-    uint16_t *mem_edc;
+    uint16_t *mem_edc, *ram_edc;
+    LynxCacheLine *bcache[4];
+    /* Conservative observer hint, not hardware state: once a CPU has held
+     * corrected data, EDC-disable must not bypass its cached copy. Keeping
+     * the hint until reset avoids tracking a count across every eviction.
+     */
+    bool cache_correction[4];
     uint64_t mem_size_strap;
     bool mem_uncorrectable;
     PCIBus *pci_bus;
     bool s3_928;
     char *s3_romfile;
-    AddressSpace io_as, mem_as;
+    AddressSpace io_as, mem_as, dma_as;
+    IOMMUMemoryRegion dma_iommu;
     uint64_t csr_regs[16][128];
-    uint8_t nvram[8192], nvram_page;
+    uint8_t nvram[8192], nvram_page, rtc_index;
+    char *nvram_filename;
+    FILE *nvram_file;
+    MC146818RtcState *rtc;
     uint8_t *firmware;
     gsize firmware_size;
+    hwaddr firmware_base;
+    bool firmware_is_arc;
     LynxInterval intervals[4];
     int64_t interval_epoch;
     uint64_t ic_regs[2][16];
@@ -138,6 +165,66 @@ static void lynx_interval_tick(void *opaque)
               (t->ticks * 4 + t->id) * NANOSECONDS_PER_SECOND / 4096);
 }
 
+/* One profile contains the 8 KiB configuration EEPROM followed by CMOS
+ * bytes 0x0e..0x7f. Clock/calendar registers are regenerated from -rtc;
+ * QEMU's century byte (0x32) is excluded from profile restoration.
+ */
+#define LYNX_PROFILE_SIZE (8192 + 114)
+
+static void lynx_profile_write(Alpha2100AMachine *s, unsigned offset,
+                                const uint8_t *data, unsigned size)
+{
+    if (s->nvram_file &&
+        (fseek(s->nvram_file, offset, SEEK_SET) ||
+         fwrite(data, 1, size, s->nvram_file) != size || fflush(s->nvram_file))) {
+        error_report("Alpha2100A: cannot persist NVRAM profile '%s'",
+                     s->nvram_filename);
+        exit(EXIT_FAILURE);
+    }
+}
+
+static void lynx_profile_init(Alpha2100AMachine *s)
+{
+    uint8_t image[LYNX_PROFILE_SIZE];
+    bool create = false;
+
+    if (!s->nvram_filename) {
+        return;
+    }
+    s->nvram_file = g_fopen(s->nvram_filename, "r+b");
+    if (!s->nvram_file && errno == ENOENT) {
+        s->nvram_file = g_fopen(s->nvram_filename, "w+b");
+        create = true;
+    }
+    if (!s->nvram_file) {
+        error_report("Alpha2100A: cannot open NVRAM profile '%s': %s",
+                     s->nvram_filename, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    if (create) {
+        memcpy(image, s->nvram, sizeof(s->nvram));
+        for (unsigned reg = 14; reg < 128; reg++) {
+            image[8192 + reg - 14] = mc146818rtc_get_cmos_data(s->rtc, reg);
+        }
+        lynx_profile_write(s, 0, image, sizeof(image));
+    } else {
+        if (fseek(s->nvram_file, 0, SEEK_END) ||
+            ftell(s->nvram_file) != sizeof(image) ||
+            fseek(s->nvram_file, 0, SEEK_SET) ||
+            fread(image, 1, sizeof(image), s->nvram_file) != sizeof(image)) {
+            error_report("Alpha2100A: NVRAM profile must contain %u bytes",
+                         (unsigned)sizeof(image));
+            exit(EXIT_FAILURE);
+        }
+        memcpy(s->nvram, image, sizeof(s->nvram));
+        for (unsigned reg = 14; reg < 128; reg++) {
+            if (reg != 0x32) {
+                mc146818rtc_set_cmos_data(s->rtc, reg, image[8192 + reg - 14]);
+            }
+        }
+    }
+}
+
 static uint64_t lynx_io_read(void *opaque, hwaddr addr, unsigned size)
 {
     Alpha2100AMachine *s = opaque;
@@ -153,6 +240,14 @@ static uint64_t lynx_io_read(void *opaque, hwaddr addr, unsigned size)
     }
     if (port == 0xc00) {
         value = s->nvram_page;
+    } else if (port >= 0xc80 && port + len <= 0xc84) {
+        /* Sable/Lynx system-board EISA ID: DEC2A01. */
+        static const uint8_t id[4] = { 0x10, 0xa3, 0x2a, 0x01 };
+
+        value = 0;
+        for (unsigned i = 0; i < len; i++) {
+            value |= (uint32_t)id[port - 0xc80 + i] << (i * 8);
+        }
     } else if (port >= 0x800 && port + len <= 0x900) {
         value = 0;
         for (unsigned i = 0; i < len; i++) {
@@ -170,13 +265,25 @@ static void lynx_io_write(void *opaque, hwaddr addr, uint64_t value, unsigned si
     unsigned port = addr >> 5, len = ((addr >> 3) & 3) + 1;
     value >>= len == 4 ? 0 : (port & 3) * 8;
     trace_alpha2100a_io(true, port, len, value);
+    if (port == 0x70) {
+        s->rtc_index = value & 127;
+    } else if (port == 0x71 && s->rtc_index >= 14 && s->rtc_index != 0x32) {
+        uint8_t byte = value;
+
+        lynx_profile_write(s, 8192 + s->rtc_index - 14, &byte, 1);
+    }
     if (port == 0xc00) {
         s->nvram_page = value & 31;
         return;
+    } else if (port >= 0xc80 && port + len <= 0xc84) {
+        return;
     } else if (port >= 0x800 && port + len <= 0x900) {
+        unsigned offset = s->nvram_page * 256 + port - 0x800;
+
         for (unsigned i = 0; i < len; i++) {
             s->nvram[s->nvram_page * 256 + port - 0x800 + i] = value >> (i * 8);
         }
+        lynx_profile_write(s, offset, s->nvram + offset, len);
         return;
     }
     if (len == 1) {
@@ -220,45 +327,79 @@ static void lynx_mem_write(void *opaque, hwaddr addr, uint64_t value,
  */
 static uint16_t lynx_mem_code(const uint8_t *line, unsigned slice)
 {
-    bool ones = true;
-    uint16_t code = 0xc14;
+    /* Only these generator columns have been established. An arbitrary
+     * stack/heap line must not be assigned a fabricated zero-data code.
+     * Recognize the known linear basis around all-zero and all-one data.
+     */
+    uint32_t fill = ldl_le_p(line + (4 + slice) * 4);
+    uint16_t code;
 
+    if (fill != 0 && fill != UINT32_MAX) {
+        return UINT16_MAX;
+    }
+    code = fill ? 0x3eb : 0xc14;
     for (unsigned i = 0; i < 4; i++) {
-        ones &= ldl_le_p(line + (i * 2 + slice) * 4) == UINT32_MAX;
+        uint32_t delta = ldl_le_p(line + (i * 2 + slice) * 4) ^ fill;
+        uint32_t known = i == 0 ? 3 : i == 1 ? 1 : 0;
+
+        if (delta & ~known) {
+            return UINT16_MAX;
+        }
+        if (i == 0) {
+            code ^= (delta & 1) ? 0x37 : 0;
+            code ^= (delta & 2) ? 0x19 : 0;
+        } else if (i == 1) {
+            code ^= (delta & 1) ? 0x8b0 : 0;
+        }
     }
-    if (ones) {
-        return 0x3eb;
-    }
-    uint32_t lo = ldl_le_p(line + slice * 4);
-    uint32_t hi = ldl_le_p(line + (2 + slice) * 4);
-    code ^= (lo & 1) ? 0x37 : 0;
-    code ^= (lo & 2) ? 0x19 : 0;
-    code ^= (hi & 1) ? 0x8b0 : 0;
     return code;
 }
 
-static void lynx_mem_capture(Alpha2100AMachine *s, hwaddr line_addr,
-                              uint8_t *line, bool read)
+static void lynx_mem_capture(Alpha2100AMachine *s, hwaddr physical,
+                              uint8_t *line, bool read, uint16_t *codes)
 {
     uint64_t control = s->csr_regs[8][6];
-    uint64_t latch = 0;
+    uint64_t latch = 0, latch_mask = 0;
     uint64_t flags = 0, syndrome_latch = 0;
-    uint16_t *codes = s->mem_edc + (line_addr / 32) * 2;
+    uint16_t generated_codes[2] = { lynx_mem_code(line, 0),
+                                    lynx_mem_code(line, 1) };
 
+    if (generated_codes[0] == UINT16_MAX ||
+        generated_codes[1] == UINT16_MAX) {
+        /* The full 128-bit generator matrix remains unimplemented. Keep
+         * unknown data outside this limited diagnostic injection model.
+         */
+        if (!read) {
+            codes[0] = codes[1] = UINT16_MAX;
+        }
+        return;
+    }
     for (unsigned slice = 0; slice < 2; slice++) {
         uint32_t ctl = control >> (slice * 32);
-        uint16_t generated = lynx_mem_code(line, slice);
+        uint16_t generated = generated_codes[slice];
         uint16_t code;
         uint16_t syndrome;
         uint32_t status = 0, correction = 0;
         unsigned word = slice;
 
         if (!read) {
-            codes[slice] = (ctl & BIT(13)) ? (ctl >> 16) & 0xfff : generated;
+            codes[slice] = (ctl & BIT(13)) ?
+                           ((ctl >> 16) & 0xfff) | 0x8000 : generated;
+        } else if (codes[slice] == 0xffff) {
+            codes[slice] = generated;
         }
-        code = codes[slice];
+        code = codes[slice] & 0xfff;
         latch |= (uint64_t)(code * 0x10001) << (slice * 32);
-        syndrome = ((ctl & BIT(12)) ? ctl & 0xfff : code) ^ generated;
+        /* MEDCC capture inhibit is independent from error reporting.
+         * Native diagnostics set bit 29 after the controlled writeback.
+         * Normal stack/victim traffic must not replace that EDC snapshot.
+         */
+        if (!(ctl & (BIT(29) | BIT(31)))) {
+            latch_mask |= (uint64_t)UINT32_MAX << (slice * 32);
+        }
+        syndrome = (ctl & BIT(31)) ? 0 :
+                   (ctl & BIT(12)) ? (ctl & 0xfff) ^ generated :
+                   (codes[slice] & 0x8000) ? code ^ generated : 0;
         if (read && syndrome) {
             switch (syndrome) {
             case 0x37: correction = 1; status = 0x17; break;
@@ -271,6 +412,10 @@ static void lynx_mem_capture(Alpha2100AMachine *s, hwaddr line_addr,
                 stl_le_p(line + word * 4, ldl_le_p(line + word * 4) ^ correction);
             }
             if (!(ctl & BIT(31))) {
+                /* A fault takes a new snapshot even when normal capture
+                 * is inhibited; MERR below holds it until acknowledgement.
+                 */
+                latch_mask |= (uint64_t)UINT32_MAX << (slice * 32);
                 s->mem_uncorrectable |= !correction;
                 flags |= (uint64_t)(correction ? 0x40001 : 0x10001)
                          << (slice * 32);
@@ -278,14 +423,21 @@ static void lynx_mem_capture(Alpha2100AMachine *s, hwaddr line_addr,
             }
         }
     }
-    if (!(control & BIT_ULL(31)) || !(control & BIT_ULL(63))) {
-        s->csr_regs[8][4] = latch;
+    if (flags) {
+        /* Both CSIC slices latch the same bus transaction on an error. */
+        latch_mask = UINT64_MAX;
+    }
+    if ((!read || flags) && latch_mask &&
+        !(s->csr_regs[8][0] & 0x100000001ULL)) {
+        trace_alpha2100a_capture(read, physical, latch, control,
+            current_cpu ? ALPHA_CPU(current_cpu)->env.pc : 0);
+        s->csr_regs[8][4] = (s->csr_regs[8][4] & ~latch_mask) |
+                             (latch & latch_mask);
     }
     if (flags && !(s->csr_regs[8][0] & 0x100000001ULL)) {
         s->csr_regs[8][0] |= flags;
         s->csr_regs[8][5] = syndrome_latch;
         unsigned commander = current_cpu ? (current_cpu->cpu_index + 1) & 3 : 1;
-        uint64_t physical = 0x20000000 + line_addr;
         uint32_t command = 0xe2000000 | (physical >> 26);
         uint32_t row = commander << 21;
         s->csr_regs[8][1] =
@@ -303,19 +455,167 @@ static void lynx_mem_capture(Alpha2100AMachine *s, hwaddr line_addr,
     }
 }
 
+static uint8_t *lynx_ram_line(Alpha2100AMachine *s, hwaddr addr,
+                              uint16_t **codes)
+{
+    if (addr < MACHINE(s)->ram_size) {
+        *codes = s->ram_edc + (addr / 32) * 2;
+        return memory_region_get_ram_ptr(MACHINE(s)->ram) + addr;
+    }
+    addr -= 0x20000000;
+    assert(addr < MACHINE(s)->ram_size);
+    *codes = s->mem_edc + (addr / 32) * 2;
+    return memory_region_get_ram_ptr(&s->mem_test_store) + addr;
+}
+
+static MemTxResult lynx_cache_data(Alpha2100AMachine *s, hwaddr addr,
+                                   unsigned size, bool write, uint64_t *value)
+{
+    unsigned cpu = current_cpu ? current_cpu->cpu_index : 0;
+    uint64_t biu = s->cpus[cpu]->env.ipr.biu_ctl;
+    unsigned capacity = extract64(biu, 28, 3) == 5 ? 4 * MiB : MiB;
+    bool cached = current_cpu && (biu & 1) &&
+                  !(biu & BIT_ULL(32 + (addr >> 32)));
+    bool diagnostic = s->csr_regs[8][3] & BIT_ULL(31);
+    hwaddr base = addr & ~31ULL;
+    uint16_t *codes;
+    uint8_t *ram = lynx_ram_line(s, base, &codes);
+    LynxCacheLine *line = &s->bcache[cpu][(addr & (capacity - 1)) / 32];
+    uint8_t data[32];
+    bool adjusted = false;
+
+    /* QEMU RAM remains authoritative for DMA, atomic and other-CPU writes.
+     * Never let a retained diagnostic correction hide a later RAM update.
+     * Such a write also replaces the old injected EDC for this abstraction.
+     */
+    if (cached && line->valid && line->tag == base && line->corrected &&
+        memcmp(line->original, ram, sizeof(line->original))) {
+        line->valid = false;
+        codes[0] = codes[1] = 0xffff;
+    }
+    if (s->csr_regs[8][6] &
+        (BIT_ULL(12) | BIT_ULL(44) | BIT_ULL(13) | BIT_ULL(45))) {
+        trace_alpha2100a_cache(write, addr, cached,
+            line->valid && line->tag == base, s->csr_regs[8][6],
+            current_cpu ? ALPHA_CPU(current_cpu)->env.pc : 0);
+    }
+    s->mem_uncorrectable = false;
+    if (!cached) {
+        memcpy(data, ram, sizeof(data));
+        if (diagnostic) {
+            lynx_mem_capture(s, base, data, !write, codes);
+            adjusted = !write && memcmp(data, ram, sizeof(data)) != 0;
+        }
+    } else {
+        if (!line->valid || (line->tag != base && !(biu & 8))) {
+            if (line->valid && line->dirty && diagnostic) {
+                uint16_t *victim_codes;
+                lynx_ram_line(s, line->tag, &victim_codes);
+                lynx_mem_capture(s, line->tag, line->data, false, victim_codes);
+            }
+            line->tag = base;
+            line->valid = true;
+            line->dirty = line->corrected = false;
+            memcpy(line->data, ram, sizeof(line->data));
+            memcpy(line->original, ram, sizeof(line->original));
+            if (diagnostic && !write) {
+                lynx_mem_capture(s, base, line->data, true, codes);
+                line->corrected = memcmp(line->data, ram, sizeof(line->data)) != 0;
+                if (line->corrected) {
+                    s->cache_correction[cpu] = true;
+                    s->cpus[cpu]->env.memory_data_active = true;
+                }
+            }
+        }
+        if (write) {
+            memcpy(line->data, ram, sizeof(line->data));
+            line->dirty = true;
+            line->corrected = false;
+            if (lynx_mem_code(ram, 0) == UINT16_MAX ||
+                lynx_mem_code(ram, 1) == UINT16_MAX) {
+                /* Discard unmodelled cache bookkeeping after the write.
+                 * Keep RAM authoritative instead of retaining a dirty line
+                 * which has no meaningful code in this limited model.
+                 */
+                codes[0] = codes[1] = UINT16_MAX;
+                line->valid = line->dirty = false;
+            }
+        }
+        adjusted = line->corrected;
+        memcpy(data, adjusted ? line->data : ram, sizeof(data));
+    }
+    if (!write && adjusted) {
+        switch (size) {
+        case 1: *value = data[addr & 31]; break;
+        case 2: *value = lduw_le_p(data + (addr & 31)); break;
+        case 4: *value = ldl_le_p(data + (addr & 31)); break;
+        case 8: *value = ldq_le_p(data + (addr & 31)); break;
+        }
+        trace_alpha2100a_correction(addr, size, *value, cpu,
+            current_cpu ? ALPHA_CPU(current_cpu)->env.pc : 0);
+    }
+    if (cached && s->mem_uncorrectable) {
+        line->valid = false; /* CACK_HERR did not complete a valid fill. */
+    }
+    return s->mem_uncorrectable ? MEMTX_ERROR : MEMTX_OK;
+}
+
+static MemTxResult lynx_ram_data(void *opaque, hwaddr addr, unsigned size,
+                                 bool write, uint64_t *value)
+{
+    Alpha2100AMachine *s = opaque;
+    unsigned cpu = current_cpu ? current_cpu->cpu_index : 0;
+    unsigned capacity;
+    LynxCacheLine *line;
+    uint16_t *codes;
+    uint8_t *ram;
+    bool tracked_victim;
+
+    if (addr >= MACHINE(s)->ram_size ||
+        size > MACHINE(s)->ram_size - addr) {
+        return MEMTX_OK; /* I/O and the test aperture have their own callbacks. */
+    }
+    capacity = extract64(s->cpus[cpu]->env.ipr.biu_ctl, 28, 3) == 5 ?
+               4 * MiB : MiB;
+    line = &s->bcache[cpu][(addr & (capacity - 1)) / 32];
+    codes = s->ram_edc + (addr / 32) * 2;
+    ram = memory_region_get_ram_ptr(MACHINE(s)->ram) + (addr & ~31ULL);
+    /* A healthy B-cache read hit has no controller transaction. This is
+     * per-CPU bookkeeping: secondary PAL spin loops need no global lock.
+     * Corrected copies still need the external-RAM consistency check below.
+     */
+    if (!write && line->valid && line->tag == (addr & ~31ULL) &&
+        !line->corrected && (s->cpus[cpu]->env.ipr.biu_ctl & 1) &&
+        !(s->cpus[cpu]->env.ipr.biu_ctl & BIT_ULL(32 + (addr >> 32)))) {
+        return MEMTX_OK;
+    }
+    tracked_victim = line->valid &&
+        (line->dirty || line->corrected ||
+         (lynx_mem_code(line->data, 0) != UINT16_MAX &&
+          lynx_mem_code(line->data, 1) != UINT16_MAX));
+    /* Unmodelled data with no injected code/correction has no diagnostic
+     * side effects. In particular, normal PAL interrupt stacks must not
+     * serialize all CPUs through the BQL on every word access.
+     */
+    if ((codes[0] == UINT16_MAX || !(codes[0] & 0x8000)) &&
+        (codes[1] == UINT16_MAX || !(codes[1] & 0x8000)) &&
+        !tracked_victim &&
+        (lynx_mem_code(ram, 0) == UINT16_MAX ||
+         lynx_mem_code(ram, 1) == UINT16_MAX)) {
+        return MEMTX_OK;
+    }
+    BQL_LOCK_GUARD();
+    return lynx_cache_data(s, addr, size, write, value);
+}
+
 static MemTxResult lynx_diag_read(void *opaque, hwaddr addr, uint64_t *value,
                                   unsigned size, MemTxAttrs attrs)
 {
     Alpha2100AMachine *s = opaque;
     uint8_t *ram = memory_region_get_ram_ptr(&s->mem_test_store);
-    uint8_t line[32];
 
-    memcpy(line, ram + (addr & ~31ULL), sizeof(line));
-    s->mem_uncorrectable = false;
-    lynx_mem_capture(s, addr & ~31ULL, line, true);
-    *value = size == 4 ? ldl_le_p(line + (addr & 31)) :
-                        ldq_le_p(line + (addr & 31));
-    return s->mem_uncorrectable ? MEMTX_ERROR : MEMTX_OK;
+    *value = size == 4 ? ldl_le_p(ram + addr) : ldq_le_p(ram + addr);
+    return lynx_cache_data(s, 0x20000000 + addr, size, false, value);
 }
 
 static void lynx_diag_write(void *opaque, hwaddr addr, uint64_t value,
@@ -323,12 +623,13 @@ static void lynx_diag_write(void *opaque, hwaddr addr, uint64_t value,
 {
     Alpha2100AMachine *s = opaque;
     uint8_t *ram = memory_region_get_ram_ptr(&s->mem_test_store);
+
     if (size == 4) {
         stl_le_p(ram + addr, value);
     } else {
         stq_le_p(ram + addr, value);
     }
-    lynx_mem_capture(s, addr & ~31ULL, ram + (addr & ~31ULL), false);
+    lynx_cache_data(s, 0x20000000 + addr, size, true, &value);
     memory_region_set_dirty(&s->mem_test_store, addr, size);
 }
 
@@ -336,6 +637,7 @@ static const MemoryRegionOps lynx_diag_ops = {
     .read_with_attrs = lynx_diag_read, .write = lynx_diag_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid.min_access_size = 4, .valid.max_access_size = 8,
+    .impl.min_access_size = 4, .impl.max_access_size = 8,
 };
 
 static uint64_t lynx_csr_read(void *opaque, hwaddr addr, unsigned size)
@@ -462,6 +764,20 @@ static void lynx_csr_write(void *opaque, hwaddr addr, uint64_t value, unsigned s
         } else {
             *storage = value;
         }
+        if (block == 8 && reg == 6) {
+            bool active = !(*storage & BIT_ULL(31)) ||
+                          !(*storage & BIT_ULL(63));
+
+            /* Pre-injection ordinary reads also flush clean cache lines.
+             * Observe them while either CSIC slice checks data, even before
+             * forcing is enabled. Unknown, side-effect-free data bypasses
+             * the BQL in lynx_ram_data.
+             */
+            for (unsigned i = 0; i < MACHINE(s)->smp.cpus; i++) {
+                s->cpus[i]->env.memory_data_active = active ||
+                                                     s->cache_correction[i];
+            }
+        }
         if (block == 14 && reg == 0x260 / 32) {
             /* HAE0_4 supplies PCI AD[31:30] for the 1 GiB dense aperture. */
             memory_region_set_alias_offset(&s->dense_mem, (*storage & 3) << 30);
@@ -526,6 +842,172 @@ static void lynx_conf_write(void *opaque, hwaddr addr, uint64_t value,
     }
 }
 
+/* T2/T3 PCI target windows, I/O specification 5.2.1.1. A PTE maps one
+ * 8 KiB page, with valid in bit 0 and the PFN in bits 19:1. There is no
+ * emulated IOTLB: every software DMA transaction sees the current registers
+ * and page table. Error-status/interrupt details remain unimplemented.
+ */
+static IOMMUTLBEntry lynx_dma_translate(IOMMUMemoryRegion *mr, hwaddr addr,
+                                       IOMMUAccessFlags flags, int index)
+{
+    Alpha2100AMachine *s = container_of(mr, Alpha2100AMachine, dma_iommu);
+    IOMMUTLBEntry entry = {
+        .target_as = &address_space_memory,
+        .iova = addr & ~0x1fffULL,
+        .addr_mask = 0x1fff,
+        .perm = IOMMU_NONE,
+    };
+
+    if (addr > UINT32_MAX) {
+        return entry;
+    }
+    for (unsigned i = 0; i < 2; i++) {
+        uint64_t base = s->csr_regs[14][10 + i * 3];
+        uint64_t mask = (s->csr_regs[14][11 + i * 3] & 0x7ff00000) | 0xfffff;
+        uint64_t translated = s->csr_regs[14][12 + i * 3];
+        uint64_t start = base & 0xfff00000;
+        uint64_t end = ((base & 0xfff) << 20) | 0xfffff;
+        bool sg = base & BIT(18);
+
+        if (!(base & BIT(19)) || addr < start || addr > end) {
+            continue;
+        }
+        if (sg) {
+            MemTxResult result;
+            hwaddr pte_addr = (((translated & 0x3ffffe00) << 1) & ~(mask >> 10)) |
+                              (((addr & mask) >> 10) & ~7ULL);
+            uint64_t pte = address_space_ldq_le(&address_space_memory, pte_addr,
+                                               MEMTXATTRS_UNSPECIFIED, &result);
+
+            if (result != MEMTX_OK || !(pte & 1) || (pte >> 20)) {
+                trace_alpha2100a_dma(addr, 0, i + 1, sg, false);
+                return entry;
+            }
+            entry.translated_addr = (pte & 0xffffe) << 12;
+        } else {
+            entry.translated_addr = ((translated & 0x7ff00000) & ~mask) |
+                                    (addr & mask & ~0x1fffULL);
+        }
+        entry.perm = IOMMU_RW;
+        trace_alpha2100a_dma(addr, entry.translated_addr, i + 1, sg, true);
+        return entry;
+    }
+    trace_alpha2100a_dma(addr, 0, 0, false, false);
+    return entry;
+}
+
+static AddressSpace *lynx_dma_address_space(PCIBus *bus, void *opaque, int devfn)
+{
+    Alpha2100AMachine *s = opaque;
+
+    return &s->dma_as;
+}
+
+static const PCIIOMMUOps lynx_dma_ops = {
+    .get_address_space = lynx_dma_address_space,
+};
+
+static void lynx_iommu_class_init(ObjectClass *oc, const void *data)
+{
+    IOMMU_MEMORY_REGION_CLASS(oc)->translate = lynx_dma_translate;
+}
+
+static const TypeInfo lynx_iommu_type = {
+    .name = TYPE_LYNX_IOMMU,
+    .parent = TYPE_IOMMU_MEMORY_REGION,
+    .class_init = lynx_iommu_class_init,
+};
+
+/* The 82374's legacy channels issue PCI DMA through T3, not directly to
+ * CPU physical RAM. Reuse the i8257 registers, requests and scheduling; only
+ * the board-local memory interface differs. Enhanced ESC descriptors and
+ * EISA chaining are not modeled yet.
+ */
+typedef struct LynxDMA {
+    I8257State parent_obj;
+    Alpha2100AMachine *machine;
+} LynxDMA;
+
+static int lynx_isa_dma_memory(IsaDma *obj, int channel, void *buf, int pos,
+                               int len, bool write)
+{
+    LynxDMA *d = (LynxDMA *)obj;
+    I8257State *dma = &d->parent_obj;
+    I8257Regs *r = &dma->regs[channel & 3];
+    hwaddr addr = (uint64_t)(r->pageh & 0x7f) << 24 |
+                  (uint32_t)r->page << 16 | r->now[0];
+
+    if (!(r->mode & 0x0c)) {
+        if (!write) {
+            memset(buf, 0, len);
+        }
+        return len;
+    }
+    if (r->mode & 0x20) {
+        /* Address decrement preserves byte order within a 16-bit transfer. */
+        unsigned unit = 1 << dma->dshift;
+
+        for (int done = 0; done < len; done += unit) {
+            unsigned count = MIN(unit, len - done);
+
+            if (address_space_rw(&d->machine->dma_as, addr - pos - done,
+                                 MEMTXATTRS_UNSPECIFIED, (uint8_t *)buf + done,
+                                 count, write) != MEMTX_OK) {
+                return done;
+            }
+        }
+    } else if (address_space_rw(&d->machine->dma_as, addr + pos,
+                                MEMTXATTRS_UNSPECIFIED, buf, len, write) !=
+               MEMTX_OK) {
+        return 0;
+    }
+    return len;
+}
+
+static int lynx_isa_dma_read(IsaDma *obj, int channel, void *buf, int pos, int len)
+{
+    return lynx_isa_dma_memory(obj, channel, buf, pos, len, false);
+}
+
+static int lynx_isa_dma_write(IsaDma *obj, int channel, void *buf, int pos, int len)
+{
+    return lynx_isa_dma_memory(obj, channel, buf, pos, len, true);
+}
+
+static void lynx_dma_class_init(ObjectClass *oc, const void *data)
+{
+    IsaDmaClass *dc = ISADMA_CLASS(oc);
+
+    dc->read_memory = lynx_isa_dma_read;
+    dc->write_memory = lynx_isa_dma_write;
+}
+
+static const TypeInfo lynx_dma_type = {
+    .name = TYPE_LYNX_DMA,
+    .parent = TYPE_I8257,
+    .instance_size = sizeof(LynxDMA),
+    .class_init = lynx_dma_class_init,
+};
+
+static void lynx_isa_dma_init(Alpha2100AMachine *s, ISABus *isa)
+{
+    ISADevice *channels[2];
+
+    for (unsigned i = 0; i < 2; i++) {
+        ISADevice *dev = isa_new(TYPE_LYNX_DMA);
+
+        ((LynxDMA *)dev)->machine = s;
+        object_property_add_child(OBJECT(s), "dma[*]", OBJECT(dev));
+        qdev_prop_set_int32(DEVICE(dev), "base", i ? 0xc0 : 0);
+        qdev_prop_set_int32(DEVICE(dev), "page-base", i ? 0x88 : 0x80);
+        qdev_prop_set_int32(DEVICE(dev), "pageh-base", i ? 0x488 : 0x480);
+        qdev_prop_set_int32(DEVICE(dev), "dshift", i);
+        isa_realize_and_unref(dev, isa, &error_fatal);
+        channels[i] = dev;
+    }
+    isa_bus_dma(isa, ISADMA(channels[0]), ISADMA(channels[1]));
+}
+
 static int lynx_pci_map_irq(PCIDevice *dev, int pin)
 {
     unsigned slot = PCI_SLOT(dev->devfn);
@@ -567,13 +1049,38 @@ static void lynx_reset(MachineState *machine, ResetType type)
     uint8_t scratch[SRM_BASE] = { 0 };
 
     qemu_devices_reset(type);
+    if (s->firmware_is_arc) {
+        unsigned mode = mc146818rtc_get_cmos_data(s->rtc, 0x0b);
+
+        /* ARC interprets the TOY in binary, 24-hour mode with epoch 1980.
+         * Convert the initial RTC fields before changing DM; subsequent
+         * hardware resets already retain binary format.
+         */
+        if (!(mode & 4)) {
+            static const uint8_t fields[] = { 0, 2, 4, 6, 7, 8, 9, 0x32 };
+
+            for (unsigned i = 0; i < ARRAY_SIZE(fields); i++) {
+                unsigned reg = fields[i];
+                unsigned value = mc146818rtc_get_cmos_data(s->rtc, reg);
+
+                mc146818rtc_set_cmos_data(s->rtc, reg,
+                                         (value >> 4) * 10 + (value & 15));
+            }
+        }
+        mc146818rtc_set_cmos_data(s->rtc, 0x0b, mode | 6);
+    }
     /* Replace the skipped SROM's initial low-RAM state on every reset. */
     physical_memory_write(0, scratch, sizeof(scratch));
-    physical_memory_write(SRM_BASE, s->firmware, s->firmware_size);
+    physical_memory_write(s->firmware_base, s->firmware, s->firmware_size);
     memset(s->csr_regs, 0, sizeof(s->csr_regs));
     memory_region_set_enabled(&s->mem_diag, false);
     memory_region_set_alias_offset(&s->dense_mem, 0);
-    memset(s->mem_edc, 0, machine->ram_size / 32 * 2 * sizeof(uint16_t));
+    memset(s->mem_edc, 0xff, machine->ram_size / 32 * 2 * sizeof(uint16_t));
+    memset(s->ram_edc, 0xff, machine->ram_size / 32 * 2 * sizeof(uint16_t));
+    for (unsigned i = 0; i < machine->smp.cpus; i++) {
+        memset(s->bcache[i], 0, 4 * MiB / 32 * sizeof(LynxCacheLine));
+        s->cache_correction[i] = false;
+    }
     memset(s->ic_regs, 0, sizeof(s->ic_regs));
     s->ic_regs[0][0x40 / 8] = s->ic_regs[1][0x40 / 8] = UINT64_MAX;
     s->irq_levels = s->irq_in_service = 0;
@@ -585,8 +1092,16 @@ static void lynx_reset(MachineState *machine, ResetType type)
         /* The skipped SROM enables each installed processor's backup cache. */
         s->csr_regs[i][0] = 0x100000001ULL;
         cpu_reset(CPU(s->cpus[i]));
-        s->cpus[i]->env.ipr.pal_base = SRM_BASE;
-        cpu_set_pc(CPU(s->cpus[i]), SRM_BASE | R_PC_PAL_MODE_MASK);
+        s->cpus[i]->env.memory_data_active = true;
+        s->cpus[i]->env.ipr.pal_base = s->firmware_base;
+        if (s->firmware_is_arc) {
+            /* SROM passes total RAM bytes in A1. ARC's PAL bootstrap also
+             * uses A1!=0 to distinguish a cold start from warm re-entry;
+             * zero incorrectly skips heap initialization on the first boot.
+             */
+            alpha_cpu_set_reg_value(&s->cpus[i]->env, 17, machine->ram_size);
+        }
+        cpu_set_pc(CPU(s->cpus[i]), s->firmware_base | R_PC_PAL_MODE_MASK);
         t->pending = false;
         t->ticks = 1;
         timer_mod(t->timer, s->interval_epoch +
@@ -599,7 +1114,8 @@ static void lynx_init(MachineState *machine)
     Alpha2100AMachine *s = ALPHA2100A_MACHINE(machine);
     ISABus *isa;
     qemu_irq *irqs;
-    ISADevice *rtc, *pcf;
+    ISADevice *rtc, *pcf, *fdc;
+    DriveInfo *floppies[MAX_FD];
     DeviceState *host;
     static const uint8_t io_eeprom[256] = { [0xfe] = 0x40, [0xff] = 0x40 };
     static const uint8_t mem_eeprom[256] = { 0 };
@@ -612,6 +1128,31 @@ static void lynx_init(MachineState *machine)
         error_report("AlphaServer 2100A experiment requires 32 MiB to 512 MiB RAM");
         exit(1);
     }
+    firmware = machine->firmware ?
+        qemu_find_file(QEMU_FILE_TYPE_BIOS, machine->firmware) : NULL;
+    if (!firmware || !g_file_get_contents(firmware, (char **)&s->firmware,
+                                         &s->firmware_size, &gerr)) {
+        error_report("AlphaServer 2100A: supply extracted EV4 firmware with -bios%s%s",
+                     gerr ? ": " : "", gerr ? gerr->message : "");
+        exit(1);
+    }
+    if (s->firmware_size >= 8 && s->firmware_size <= 4 * MiB &&
+        ldl_le_p(s->firmware) == 0x207f0000) {
+        s->firmware_base = SRM_BASE;
+    } else if (s->firmware_size >= 32 && s->firmware_size <= 4 * MiB &&
+               ldl_le_p(s->firmware + 24) == 0x4000 &&
+               ldl_le_p(s->firmware + 28) == 0xfeceface) {
+        /* The original ARC bootstrap enters its linked firmware body at
+         * KSEG0+0x704100. Load the whole PAL/firmware image at 0x700000,
+         * as the SROM handoff does; the header's 0x4000 is not a load base.
+         * On-board flash and an SRM->ARC handoff remain unimplemented.
+         */
+        s->firmware_base = 0x700000;
+        s->firmware_is_arc = true;
+    } else {
+        error_report("AlphaServer 2100A requires an extracted EV4 SRM or ARC image");
+        exit(1);
+    }
     memset(s->nvram, 0xff, sizeof(s->nvram));
     refclk = clock_new(OBJECT(machine), "cpu-refclk");
     clock_set_hz(refclk, 275000000);
@@ -619,6 +1160,9 @@ static void lynx_init(MachineState *machine)
         LynxInterval *t = &s->intervals[i];
 
         s->cpus[i] = ALPHA_CPU(object_new(machine->cpu_type));
+        s->bcache[i] = g_new0(LynxCacheLine, 4 * MiB / 32);
+        s->cpus[i]->memory_data = lynx_ram_data;
+        s->cpus[i]->memory_data_opaque = s;
         qdev_connect_clock_in(DEVICE(s->cpus[i]), "cpu-refclk", refclk);
         qdev_realize_and_unref(DEVICE(s->cpus[i]), NULL, &error_fatal);
         t->machine = s;
@@ -641,7 +1185,8 @@ static void lynx_init(MachineState *machine)
         exit(1);
     }
     s->mem_size_strap = (uint64_t)strap << 32 | strap;
-    s->mem_edc = g_new0(uint16_t, machine->ram_size / 32 * 2);
+    s->mem_edc = g_new(uint16_t, machine->ram_size / 32 * 2);
+    s->ram_edc = g_new(uint16_t, machine->ram_size / 32 * 2);
     /* SRM runs in dirty backup-cache lines while testing its first DRAM bank.
      * The cacheless SROM shortcut needs separate backing for that temporary
      * diagnostic aperture, otherwise the test overwrites the running console.
@@ -675,21 +1220,39 @@ static void lynx_init(MachineState *machine)
                           "lynx.pci-config", 0x10000000);
     memory_region_add_subregion(sysmem, LYNX_CONF, &s->pci_conf);
     host = qdev_new("alpha2100a-pci-host");
-    sysbus_realize_and_unref(SYS_BUS_DEVICE(host), &error_fatal);
     s->pci_bus = pci_register_root_bus(host, "pci", lynx_pci_set_irq,
                                       lynx_pci_map_irq, s, &s->isa_mem,
                                       &s->isa_io, PCI_DEVFN(6, 0), 64,
                                       TYPE_PCI_BUS);
     PCI_HOST_BRIDGE(host)->bus = s->pci_bus;
+    memory_region_init_iommu(&s->dma_iommu, sizeof(s->dma_iommu),
+                             TYPE_LYNX_IOMMU, OBJECT(machine), "lynx.dma", 4 * GiB);
+    address_space_init(&s->dma_as, MEMORY_REGION(&s->dma_iommu), "lynx.pci-dma");
+    pci_setup_iommu(s->pci_bus, &lynx_dma_ops, s);
+    /* Realize the host with its child bus already present. PCI's bus-realize
+     * callback installs the machine-done hook which creates DMA aliases.
+     */
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(host), &error_fatal);
     isa = isa_bus_new(NULL, &s->isa_mem, &s->isa_io, &error_fatal);
     s->pic_irqs = i8259_init(isa, NULL);
     irqs = qemu_allocate_irqs(lynx_isa_irq, s, 16);
     isa_bus_register_input_irqs(isa, irqs);
     isa_create_simple(isa, "i8042");
     isa_create_simple(isa, "isa-pit");
+    lynx_isa_dma_init(s, isa);
+    fdc = isa_new(TYPE_ISA_FDC);
+    qdev_prop_set_bit(DEVICE(fdc), "strict-pio", true);
+    isa_realize_and_unref(fdc, isa, &error_fatal);
+    for (unsigned i = 0; i < MAX_FD; i++) {
+        floppies[i] = drive_get(IF_FLOPPY, 0, i);
+    }
+    isa_fdc_init_drives(fdc, floppies);
     rtc = isa_new(TYPE_MC146818_RTC);
-    qdev_prop_set_int32(DEVICE(rtc), "base_year", 1900);
+    qdev_prop_set_int32(DEVICE(rtc), "base_year",
+                        s->firmware_is_arc ? 1980 : 1900);
     isa_realize_and_unref(rtc, isa, &error_fatal);
+    s->rtc = MC146818_RTC(rtc);
+    lynx_profile_init(s);
     serial_hds_isa_init(isa, 0, 2);
     pcf = isa_create_simple(isa, "alpha2100a-pcf8584");
     qdev_connect_gpio_out(DEVICE(pcf), 0, qemu_allocate_irq(lynx_irq_set, s, 23));
@@ -743,32 +1306,31 @@ static void lynx_init(MachineState *machine)
                                  cpu_eeprom, sizeof(cpu_eeprom));
         }
     }
-    firmware = machine->firmware ?
-        qemu_find_file(QEMU_FILE_TYPE_BIOS, machine->firmware) : NULL;
-    if (!firmware || !g_file_get_contents(firmware, (char **)&s->firmware,
-                                         &s->firmware_size, &gerr)) {
-        error_report("AlphaServer 2100A: supply extracted EV4 SRM with -bios%s%s",
-                     gerr ? ": " : "", gerr ? gerr->message : "");
-        exit(1);
-    }
-    if (!s->firmware_size || s->firmware_size > 4 * MiB ||
-        s->firmware_size < 8 || ldl_le_p(s->firmware) != 0x207f0000) {
-        error_report("AlphaServer 2100A requires an extracted EV4 SRM image");
-        exit(1);
-    }
+
 }
 
 static void lynx_finalize(Object *obj)
 {
     Alpha2100AMachine *s = ALPHA2100A_MACHINE(obj);
     g_free(s->mem_edc);
+    g_free(s->ram_edc);
+    for (unsigned i = 0; i < 4; i++) {
+        g_free(s->bcache[i]);
+    }
     g_free(s->firmware);
     g_free(s->s3_romfile);
+    if (s->nvram_file) {
+        fclose(s->nvram_file);
+    }
+    g_free(s->nvram_filename);
     for (unsigned i = 0; i < 4; i++) {
         timer_free(s->intervals[i].timer);
     }
     if (s->mem_as.root) {
         address_space_destroy(&s->mem_as);
+    }
+    if (s->dma_as.root) {
+        address_space_destroy(&s->dma_as);
     }
     if (s->io_as.root) {
         address_space_destroy(&s->io_as);
@@ -797,6 +1359,23 @@ static void lynx_set_rom(Object *obj, const char *value, Error **errp)
     s->s3_romfile = *value ? g_strdup(value) : NULL;
 }
 
+static char *lynx_get_nvram(Object *obj, Error **errp)
+{
+    return g_strdup(ALPHA2100A_MACHINE(obj)->nvram_filename ?: "");
+}
+
+static void lynx_set_nvram(Object *obj, const char *value, Error **errp)
+{
+    Alpha2100AMachine *s = ALPHA2100A_MACHINE(obj);
+
+    if (s->rtc) {
+        error_setg(errp, "nvram-file must be set before machine initialization");
+        return;
+    }
+    g_free(s->nvram_filename);
+    s->nvram_filename = *value ? g_strdup(value) : NULL;
+}
+
 static void lynx_class_init(ObjectClass *oc, const void *data)
 {
     static const char *const cpu_types[] = { ALPHA_CPU_TYPE_NAME("ev4"),
@@ -813,7 +1392,10 @@ static void lynx_class_init(ObjectClass *oc, const void *data)
     mc->default_display = "cirrus";
     object_class_property_add_bool(oc, "s3-928", lynx_get_s3, lynx_set_s3);
     object_class_property_add_str(oc, "s3-romfile", lynx_get_rom, lynx_set_rom);
-    mc->no_floppy = true;
+    object_class_property_add_str(oc, "nvram-file", lynx_get_nvram, lynx_set_nvram);
+    object_class_property_set_description(oc, "nvram-file",
+        "8306-byte configuration EEPROM/CMOS profile; clock follows -rtc");
+    mc->no_floppy = false;
     mc->no_parallel = true;
 }
 static const TypeInfo lynx_type = {
@@ -846,6 +1428,8 @@ static const TypeInfo lynx_host_type = {
 
 static void lynx_register(void)
 {
+    type_register_static(&lynx_iommu_type);
+    type_register_static(&lynx_dma_type);
     type_register_static(&lynx_cirrus_type);
     type_register_static(&lynx_host_type);
     type_register_static(&lynx_type);

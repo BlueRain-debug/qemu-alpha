@@ -67,3 +67,11 @@ alpha2100a_csr(bool write, uint64_t addr, uint64_t value) "write=%d addr=0x%" PR
 alpha2100a_i2c(bool write, unsigned reg, unsigned value, unsigned status) "write=%d reg=%u value=0x%02x status=0x%02x"
 
 alpha2100a_csr_access(bool write, uint64_t addr, uint64_t value, uint64_t pc, unsigned cpu) "write=%d addr=0x%" PRIx64 " value=0x%" PRIx64 " pc=0x%" PRIx64 " cpu=%u"
+
+alpha2100a_cache(bool write, uint64_t addr, bool cached, bool hit, uint64_t control, uint64_t pc) "write=%d addr=0x%" PRIx64 " cached=%d hit=%d control=0x%" PRIx64 " pc=0x%" PRIx64
+
+alpha2100a_capture(bool read, uint64_t addr, uint64_t latch, uint64_t control, uint64_t pc) "read=%d addr=0x%" PRIx64 " latch=0x%" PRIx64 " control=0x%" PRIx64 " pc=0x%" PRIx64
+
+alpha2100a_correction(uint64_t addr, unsigned size, uint64_t value, unsigned cpu, uint64_t pc) "addr=0x%" PRIx64 " size=%u value=0x%" PRIx64 " cpu=%u pc=0x%" PRIx64
+
+alpha2100a_dma(uint64_t addr, uint64_t translated, unsigned window, bool sg, bool valid) "addr=0x%" PRIx64 " translated=0x%" PRIx64 " window=%u sg=%d valid=%d"

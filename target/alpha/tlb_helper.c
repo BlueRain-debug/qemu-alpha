@@ -1083,3 +1083,63 @@ void alpha_cpu_dump_mmu(CPUState *cs)
     alpha_tlb_dump(env, AlphaTLBType_Instruction);
     alpha_tlb_dump(env, AlphaTLBType_Data);
 }
+
+/* The access has already passed the TCG MMU checks. Observe the same address
+ * translation, without using a debugger's instruction-TLB fallback.
+ */
+uint64_t HELPER(memory_data)(CPUAlphaState *env, uint64_t address,
+                             uint64_t value, uint32_t mmu_idx,
+                             uint32_t memop, uint32_t write)
+{
+    AlphaCPU *cpu = env_archcpu(env);
+    AlphaMMUFaultInfo fi = {};
+    GetPhysAddrResult res = {};
+    GetPhysAddrFlags gpaf = {};
+    MMUAccessType access = write ? MMU_DATA_STORE : MMU_DATA_LOAD;
+    unsigned size = memop_size(memop);
+    MemTxResult response;
+
+    if (!cpu->memory_data) {
+        return value;
+    }
+    AlphaMMUIdx map_idx = mmu_idx;
+    switch (mmu_idx) {
+    case AlphaMMUIdx_Privileged:
+        map_idx = alpha_mmu_index(env, false);
+        break;
+    case AlphaMMUIdx_PrivilegedVPTE:
+        map_idx = AlphaMMUIdx_Kernel;
+        gpaf.vpte_fetch = true;
+        break;
+    case AlphaMMUIdx_PrivilegedWChk:
+        map_idx = alpha_mmu_index(env, false);
+        gpaf.write_check = true;
+        break;
+    case AlphaMMUIdx_AltMode:
+        map_idx = alpha_mmu_index_altmode(env);
+        break;
+    case AlphaMMUIdx_AltModeWChk:
+        map_idx = alpha_mmu_index_altmode(env);
+        gpaf.write_check = true;
+        break;
+    }
+    if (!get_phys_addr(env, address, access, map_idx, gpaf, &res, &fi)) {
+        return value;
+    }
+    response = cpu->memory_data(cpu->memory_data_opaque, res.f.phys_addr,
+                               size, write, &value);
+    if (response != MEMTX_OK) {
+        alpha_cpu_do_transaction_failed(CPU(cpu), res.f.phys_addr, address,
+            size, access, mmu_idx, res.f.attrs, response, GETPC());
+    }
+    if (!write && (memop & MO_SIGN)) {
+        if (size == 4) {
+            value = (int64_t)(int32_t)value;
+        } else if (size == 2) {
+            value = (int64_t)(int16_t)value;
+        } else if (size == 1) {
+            value = (int64_t)(int8_t)value;
+        }
+    }
+    return value;
+}

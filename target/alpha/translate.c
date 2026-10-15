@@ -372,10 +372,59 @@ static inline uint64_t memop_mask(MemOp op)
     return ~((uint64_t)memop_size(op) - 1);
 }
 
+/* A board may observe integer data transactions for cache/ECC diagnostics.
+ * FP/atomic writes retain the existing fast path; this is not a complete cache
+ * hierarchy. Boards without an observer generate the original instructions.
+ */
+static void gen_data_load(DisasContext *s, TCGv_i64 dest, TCGv_i64 addr,
+                          int mmu_idx, MemOp memop, bool pal_access)
+{
+    if (ALPHA_CPU(s->cs)->memory_data) {
+        TCGv_i64 value = tcg_temp_new_i64();
+        TCGLabel *done = gen_new_label();
+
+        tcg_gen_qemu_ld_i64(value, addr, mmu_idx, memop);
+        if (!pal_access) {
+            TCGv_i32 active = tcg_temp_new_i32();
+            tcg_gen_ld8u_i32(active, tcg_env,
+                            offsetof(CPUAlphaState, memory_data_active));
+            tcg_gen_brcondi_i32(TCG_COND_EQ, active, 0, done);
+        }
+        gen_helper_memory_data(value, tcg_env, addr, value,
+                               tcg_constant_i32(mmu_idx),
+                               tcg_constant_i32(memop), tcg_constant_i32(0));
+        gen_set_label(done);
+        tcg_gen_mov_i64(dest, value);
+    } else {
+        tcg_gen_qemu_ld_i64(dest, addr, mmu_idx, memop);
+    }
+}
+
+static void gen_data_store(DisasContext *s, TCGv_i64 value, TCGv_i64 addr,
+                           int mmu_idx, MemOp memop, bool pal_access)
+{
+    tcg_gen_qemu_st_i64(value, addr, mmu_idx, memop);
+    if (ALPHA_CPU(s->cs)->memory_data) {
+        TCGv_i64 ignored = tcg_temp_new_i64();
+        TCGLabel *done = gen_new_label();
+
+        if (!pal_access) {
+            TCGv_i32 active = tcg_temp_new_i32();
+            tcg_gen_ld8u_i32(active, tcg_env,
+                            offsetof(CPUAlphaState, memory_data_active));
+            tcg_gen_brcondi_i32(TCG_COND_EQ, active, 0, done);
+        }
+        gen_helper_memory_data(ignored, tcg_env, addr, value,
+                               tcg_constant_i32(mmu_idx),
+                               tcg_constant_i32(memop), tcg_constant_i32(1));
+        gen_set_label(done);
+    }
+}
+
 static void gen_load_locked(DisasContext *s, TCGv_i64 addr, TCGv_i64 dest,
                             int mmu_idx, MemOp memop)
 {
-    tcg_gen_qemu_ld_i64(dest, addr, mmu_idx, memop);
+    gen_data_load(s, dest, addr, mmu_idx, memop, false);
     tcg_gen_mov_i64(cpu_llsc_addr, addr);
     tcg_gen_mov_i64(cpu_llsc_val, dest);
 #if 0
@@ -402,7 +451,7 @@ static void gen_load_int(DisasContext *s, int ra, int rb, int32_t disp16,
     if (locked) {
         gen_load_locked(s, addr, dest, get_mem_index(s), op);
     } else {
-        tcg_gen_qemu_ld_i64(dest, addr, get_mem_index(s), op);
+        gen_data_load(s, dest, addr, get_mem_index(s), op, false);
     }
 }
 
@@ -418,7 +467,7 @@ static void gen_store_int(DisasContext *s, int ra, int rb, int32_t disp16,
     }
 
     src = read_cpu_reg(s, ra);
-    tcg_gen_qemu_st_i64(src, addr, get_mem_index(s), op);
+    gen_data_store(s, src, addr, get_mem_index(s), op, false);
 }
 
 static void gen_store_conditional_common(DisasContext *s, TCGv_i64 val,
@@ -1423,7 +1472,7 @@ static void gen_hw_ld_ev4(DisasContext *s, TCGv_i64 dest, TCGv_i64 addr,
     if (locked) {
         gen_load_locked(s, addr, dest, mmu_idx, memop);
     } else {
-        tcg_gen_qemu_ld_i64(dest, addr, mmu_idx, memop);
+        gen_data_load(s, dest, addr, mmu_idx, memop, true);
     }
 }
 
@@ -1509,7 +1558,7 @@ static void gen_hw_st_ev4(DisasContext *s, TCGv_i64 addr, TCGv_i64 val,
     if (locked) {
         gen_store_conditional_common(s, val, addr, mmu_idx, memop);
     } else {
-        tcg_gen_qemu_st_i64(val, addr, mmu_idx, memop);
+        gen_data_store(s, val, addr, mmu_idx, memop, true);
     }
 }
 

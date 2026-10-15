@@ -158,12 +158,16 @@ typedef struct CPUArchState {
         uint64_t vaddress;      /* VA associated with exception, if any */
     } exception;
 
+    /* Board diagnostic hint, derived from controller state, not architectural. */
+    uint8_t memory_data_active;
+
     /* Internal processor registers. */
     uint64_t pal_shadow[8];
     struct {
         uint64_t aster;
         uint64_t astrr;
         uint64_t abox_ctl;
+        uint64_t biu_ctl;
         uint64_t biu_addr;
         uint64_t biu_stat;
         uint64_t cc;
@@ -277,6 +281,11 @@ extern const AlphaCPUAlias alpha_cpu_aliases[];
 struct ArchCPU {
     CPUState parent_obj;
     CPUAlphaState env;
+
+    /* Optional data-transaction observer, fixed at board realization. */
+    MemTxResult (*memory_data)(void *opaque, hwaddr addr, unsigned size,
+                              bool write, uint64_t *value);
+    void *memory_data_opaque;
 
     /* Implementation versions and feature sets. */
     int bfd_mach;

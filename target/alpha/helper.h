@@ -82,3 +82,5 @@ DEF_HELPER_FLAGS_2(set_rounding_mode, TCG_CALL_NO_RWG, void, env, i32)
 DEF_HELPER_FLAGS_2(set_flush_zero, TCG_CALL_NO_RWG, void, env, i32)
 DEF_HELPER_FLAGS_2(set_fpcr, TCG_CALL_NO_RWG, void, env, i64)
 DEF_HELPER_FLAGS_1(get_fpcr, TCG_CALL_NO_RWG_SE, i64, env)
+
+DEF_HELPER_6(memory_data, i64, env, i64, i64, i32, i32, i32)
