@@ -918,7 +918,8 @@ static int rndis_query_response(USBNetState *s,
 
     bufoffs = le32_to_cpu(buf->InformationBufferOffset) + 8;
     buflen = le32_to_cpu(buf->InformationBufferLength);
-    if (buflen > length || bufoffs >= length || bufoffs + buflen > length) {
+    /* Windows may point an empty OID input buffer at the message end. */
+    if (buflen > length || bufoffs > length || buflen > length - bufoffs) {
         return USB_RET_STALL;
     }
 
