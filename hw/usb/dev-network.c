@@ -627,6 +627,15 @@ struct rndis_response {
 struct USBNetState {
     USBDevice dev;
 
+    bool rndis;
+    USBDesc rndis_desc;
+    USBDescDevice rndis_full, rndis_high;
+    USBDescConfig rndis_config_full, rndis_config_high;
+    USBDescIface rndis_full_ifaces[2], rndis_high_ifaces[2];
+    USBDescIfaceAssoc rndis_full_group, rndis_high_group;
+    USBDescEndpoint rndis_high_intr;
+    USBDescEndpoint rndis_high_bulk[2];
+
     enum rndis_state rndis_state;
     uint32_t medium;
     uint32_t speed;
@@ -1058,6 +1067,13 @@ static int rndis_parse(USBNetState *s, uint8_t *data, int length)
     return USB_RET_STALL;
 }
 
+static void usb_net_handle_attach(USBDevice *dev)
+{
+    if (USB_NET(dev)->rndis) {
+        usb_desc_attach(dev);
+    }
+}
+
 static void usb_net_handle_reset(USBDevice *dev)
 {
 }
@@ -1359,10 +1375,67 @@ static NetClientInfo net_usbnet_info = {
     .cleanup = usbnet_cleanup,
 };
 
+/* Use the in-box Windows RNDIS class driver, including on EHCI-only buses. */
+static void usb_net_init_rndis(USBNetState *s)
+{
+    s->rndis_desc = desc_net;
+    s->rndis_desc.id.bcdDevice = 0x0100;
+    s->rndis_full = desc_device_net;
+    s->rndis_full.bDeviceClass = 0xef;
+    s->rndis_full.bDeviceSubClass = 0x02;
+    s->rndis_full.bDeviceProtocol = 0x01;
+    s->rndis_full.bNumConfigurations = 1;
+    s->rndis_config_full = desc_device_net.confs[0];
+    memcpy(s->rndis_full_ifaces, desc_iface_rndis,
+           sizeof(s->rndis_full_ifaces));
+    s->rndis_full_ifaces[0].bInterfaceClass = 0xef;
+    s->rndis_full_ifaces[0].bInterfaceSubClass = 0x04;
+    s->rndis_full_ifaces[0].bInterfaceProtocol = 0x01;
+    s->rndis_full_group = (USBDescIfaceAssoc) {
+        .bFirstInterface = 0,
+        .bInterfaceCount = 2,
+        .bFunctionClass = 0xef,
+        .bFunctionSubClass = 0x04,
+        .bFunctionProtocol = 0x01,
+        .iFunction = STRING_RNDIS,
+        .nif = ARRAY_SIZE(s->rndis_full_ifaces),
+        .ifs = s->rndis_full_ifaces,
+    };
+    s->rndis_config_full.nif = 0;
+    s->rndis_config_full.ifs = NULL;
+    s->rndis_config_full.nif_groups = 1;
+    s->rndis_config_full.if_groups = &s->rndis_full_group;
+    s->rndis_full.confs = &s->rndis_config_full;
+    s->rndis_desc.full = &s->rndis_full;
+
+    s->rndis_high = s->rndis_full;
+    s->rndis_config_high = s->rndis_config_full;
+    memcpy(s->rndis_high_ifaces, s->rndis_full_ifaces,
+           sizeof(s->rndis_high_ifaces));
+    s->rndis_high_intr = desc_iface_rndis[0].eps[0];
+    /* High-speed intervals are expressed in 125 us microframes: 32 ms. */
+    s->rndis_high_intr.bInterval = 9;
+    s->rndis_high_ifaces[0].eps = &s->rndis_high_intr;
+    memcpy(s->rndis_high_bulk, desc_iface_rndis[1].eps,
+           sizeof(s->rndis_high_bulk));
+    s->rndis_high_bulk[0].wMaxPacketSize = 512;
+    s->rndis_high_bulk[1].wMaxPacketSize = 512;
+    s->rndis_high_ifaces[1].eps = s->rndis_high_bulk;
+    s->rndis_high_group = s->rndis_full_group;
+    s->rndis_high_group.ifs = s->rndis_high_ifaces;
+    s->rndis_config_high.if_groups = &s->rndis_high_group;
+    s->rndis_high.confs = &s->rndis_config_high;
+    s->rndis_desc.high = &s->rndis_high;
+    s->dev.usb_desc = &s->rndis_desc;
+}
+
 static void usb_net_realize(USBDevice *dev, Error **errp)
 {
     USBNetState *s = USB_NET(dev);
 
+    if (s->rndis) {
+        usb_net_init_rndis(s);
+    }
     usb_desc_create_serial(dev);
     usb_desc_init(dev);
 
@@ -1410,6 +1483,7 @@ static const VMStateDescription vmstate_usb_net = {
 };
 
 static const Property net_properties[] = {
+    DEFINE_PROP_BOOL("rndis", USBNetState, rndis, false),
     DEFINE_NIC_PROPERTIES(USBNetState, conf),
 };
 
@@ -1421,6 +1495,7 @@ static void usb_net_class_initfn(ObjectClass *klass, const void *data)
     uc->realize        = usb_net_realize;
     uc->product_desc   = "QEMU USB Network Interface";
     uc->usb_desc       = &desc_net;
+    uc->handle_attach  = usb_net_handle_attach;
     uc->handle_reset   = usb_net_handle_reset;
     uc->handle_control = usb_net_handle_control;
     uc->handle_data    = usb_net_handle_data;
