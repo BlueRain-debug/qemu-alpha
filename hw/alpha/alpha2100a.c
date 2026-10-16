@@ -235,12 +235,17 @@ static uint64_t lynx_io_read(void *opaque, hwaddr addr, unsigned size)
     unsigned port = addr >> 5, len = ((addr >> 3) & 3) + 1;
     unsigned shift = len == 4 ? 0 : (port & 3) * 8;
     uint64_t value = 0xffffffff;
+    MemTxResult result = MEMTX_DECODE_ERROR;
     if (len == 1) {
-        value = address_space_ldub(&s->io_as, port, MEMTXATTRS_UNSPECIFIED, NULL);
+        value = address_space_ldub(&s->io_as, port, MEMTXATTRS_UNSPECIFIED, &result);
     } else if (len == 2) {
-        value = address_space_lduw_le(&s->io_as, port, MEMTXATTRS_UNSPECIFIED, NULL);
+        value = address_space_lduw_le(&s->io_as, port, MEMTXATTRS_UNSPECIFIED, &result);
     } else if (len == 4) {
-        value = address_space_ldl_le(&s->io_as, port, MEMTXATTRS_UNSPECIFIED, NULL);
+        value = address_space_ldl_le(&s->io_as, port, MEMTXATTRS_UNSPECIFIED, &result);
+    }
+    if (result != MEMTX_OK) {
+        /* Empty EISA slots must not appear as a board with ID 00000000. */
+        value = UINT32_MAX >> ((4 - len) * 8);
     }
     if (port == 0x61 && len == 1) {
         PITChannelInfo timer, refresh;
@@ -683,8 +688,14 @@ static uint64_t lynx_csr_read(void *opaque, hwaddr addr, unsigned size)
                                        ALPHA_CPU_TYPE_NAME("ev45")) ? 0x10 : 0);
         value = (value & ~0x1f0000001fULL) | (uint64_t)rev << 32 | rev;
     } else if (block >= 14 && reg == 0) {
-        /* IOCSR<35:33> is the read-only T3 revision, not writable config. */
-        value = (value & ~T3_IOCSR_REV_MASK) | T3_IOCSR_REV;
+        /* IOCSR<35:33> is the read-only revision. PINT<6> reflects the
+         * interrupt-controller output, even when PAL masks CPU interrupts.
+         * Original ARC polls this pin before acknowledging a floppy IRQ.
+         */
+        value = (value & ~(T3_IOCSR_REV_MASK | BIT_ULL(6))) | T3_IOCSR_REV;
+        if (block == 14 && lynx_irq_pending(s)) {
+            value |= BIT_ULL(6);
+        }
     } else if (block >= 14 && reg == 0x480 / 32) {
         uint64_t pending = block == 14 ? lynx_irq_pending(s) : 0;
 
@@ -816,7 +827,8 @@ static void lynx_csr_write(void *opaque, hwaddr addr, uint64_t value, unsigned s
                          !!(*storage & BIT_ULL(35)));
         }
         if (block >= 14 && reg == 0) {
-            *storage = (*storage & ~T3_IOCSR_REV_MASK) | T3_IOCSR_REV;
+            *storage = (*storage & ~(T3_IOCSR_REV_MASK | BIT_ULL(6))) |
+                       T3_IOCSR_REV;
         }
         if (block >= 14 && reg == 0x4a0 / 32) {
             lynx_irq_update(s);

@@ -57,6 +57,8 @@ struct JensenAha1742 {
     ISADevice parent_obj;
     SCSIBus bus;
     MemoryRegion io;
+    MemoryRegion *dma_mr;
+    AddressSpace dma_as;
     qemu_irq irq;
     uint32_t slot, irq_num;
     uint8_t regs[0x80];
@@ -102,7 +104,7 @@ static void aha_finish(AhaRequest *r, uint8_t host, uint8_t target,
     }
     if (req && target == CHECK_CONDITION && (r->flags & AHA_ARS)) {
         len = MIN(scsi_req_get_sense(req, sense, sizeof(sense)), r->senselen);
-        if (len && dma_memory_write(&address_space_memory, r->senseptr,
+        if (len && dma_memory_write(&s->dma_as, r->senseptr,
                                     sense, len, MEMTXATTRS_UNSPECIFIED)) {
             host = 0x20;
             flags |= 0x1100;
@@ -121,7 +123,7 @@ static void aha_finish(AhaRequest *r, uint8_t host, uint8_t target,
     status[14] = len;
     /* DI/DSB suppress successful completions only (manual 6-5/6-6). */
     if ((host || target || !(r->flags & AHA_DSB)) &&
-        dma_memory_write(&address_space_memory, r->statusptr, status,
+        dma_memory_write(&s->dma_as, r->statusptr, status,
                          sizeof(status), MEMTXATTRS_UNSPECIFIED)) {
         host = 0x20;
     }
@@ -198,6 +200,7 @@ static void aha_free_request(SCSIBus *bus, void *priv)
 static void aha_transfer(SCSIRequest *req, uint32_t len)
 {
     AhaRequest *r = req->hba_private;
+    JensenAha1742 *s = r->s;
     uint8_t *buf = scsi_req_get_buf(req);
     bool from_device = req->cmd.mode == SCSI_XFER_FROM_DEV;
     uint32_t done = 0;
@@ -208,10 +211,10 @@ static void aha_transfer(SCSIRequest *req, uint32_t len)
         MemTxResult result;
 
         if (from_device) {
-            result = dma_memory_write(&address_space_memory, addr, buf + done,
+            result = dma_memory_write(&s->dma_as, addr, buf + done,
                                       n, MEMTXATTRS_UNSPECIFIED);
         } else {
-            result = dma_memory_read(&address_space_memory, addr, buf + done,
+            result = dma_memory_read(&s->dma_as, addr, buf + done,
                                      n, MEMTXATTRS_UNSPECIFIED);
         }
         r->dma_error |= result != MEMTX_OK;
@@ -255,7 +258,7 @@ static void aha_start(JensenAha1742 *s, uint8_t target)
     r->s = s;
     r->ecb = s->mailbox_out;
     r->target = target;
-    if (dma_memory_read(&address_space_memory, r->ecb, ecb, sizeof(ecb),
+    if (dma_memory_read(&s->dma_as, r->ecb, ecb, sizeof(ecb),
                         MEMTXATTRS_UNSPECIFIED)) {
         aha_post(s, r->ecb, 0xc0 | target);
         g_free(r);
@@ -287,7 +290,7 @@ static void aha_start(JensenAha1742 *s, uint8_t target)
         memcpy(inquiry + 24, "QEMU    ", 8);
         memcpy(inquiry + 32, "0001", 4);
         data = MIN(length, sizeof(inquiry));
-        if (dma_memory_write(&address_space_memory, addr, inquiry, data,
+        if (dma_memory_write(&s->dma_as, addr, inquiry, data,
                              MEMTXATTRS_UNSPECIFIED)) {
             error = 0x20;
             goto invalid;
@@ -306,7 +309,7 @@ static void aha_start(JensenAha1742 *s, uint8_t target)
     if (r->flags & AHA_SG) {
         error = 0x1a;
         if (length > sizeof(descriptors) || (length & 7) ||
-            dma_memory_read(&address_space_memory, addr, descriptors, length,
+            dma_memory_read(&s->dma_as, addr, descriptors, length,
                             MEMTXATTRS_UNSPECIFIED)) {
             goto invalid;
         }
@@ -530,6 +533,9 @@ static void aha_realize(DeviceState *dev, Error **errp)
         error_setg(errp, "AHA-1742 requires EISA slot 1..6 and a valid IRQ");
         return;
     }
+    /* Jensen uses CPU physical addresses; Lynx EISA masters traverse T3. */
+    address_space_init(&s->dma_as, s->dma_mr ? s->dma_mr :
+                       get_system_memory(), TYPE_JENSEN_AHA1742 "-dma");
     QTAILQ_INIT(&s->requests);
     scsi_bus_init(&s->bus, sizeof(s->bus), dev, &aha_scsi_info);
     memory_region_init_io(&s->io, OBJECT(s), &aha_io_ops, s,
@@ -538,7 +544,17 @@ static void aha_realize(DeviceState *dev, Error **errp)
     aha_reset(dev);
 }
 
+static void aha_unrealize(DeviceState *dev)
+{
+    JensenAha1742 *s = JENSEN_AHA1742(dev);
+
+    aha_reset_adapter(s);
+    address_space_destroy(&s->dma_as);
+}
+
 static const Property aha_properties[] = {
+    DEFINE_PROP_LINK("dma-memory", JensenAha1742, dma_mr,
+                     TYPE_MEMORY_REGION, MemoryRegion *),
     DEFINE_PROP_UINT32("slot", JensenAha1742, slot, 6),
     DEFINE_PROP_UINT32("irq", JensenAha1742, irq_num, 11),
 };
@@ -553,6 +569,7 @@ static void aha_class_init(ObjectClass *oc, const void *data)
     DeviceClass *dc = DEVICE_CLASS(oc);
 
     dc->realize = aha_realize;
+    dc->unrealize = aha_unrealize;
     dc->vmsd = &aha_vmstate;
     device_class_set_legacy_reset(dc, aha_reset);
     device_class_set_props(dc, aha_properties);
