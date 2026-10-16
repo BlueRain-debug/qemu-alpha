@@ -1200,13 +1200,17 @@ static uint64_t ev4_irr_read(CPUAlphaState *env, const AlphaIPRegInfo *ri)
 {
     uint64_t ret = 0;
     uint32_t eir = alpha_get_eir(env) & alpha_get_eien(env);
-    uint32_t sir = alpha_get_sir(env) & alpha_get_sien(env);
+    uint32_t sir = alpha_get_sir(env);
     int ast = alpha_pending_ast(env);
     bool pc0 = env->irq_line_state & BIT(ALPHA_CPU_INPUT_PC0);
     bool pc1 = env->irq_line_state & BIT(ALPHA_CPU_INPUT_PC1);
 
     SET_FIELD(ret, EV4_HIRR, HWR, (eir != 0));
-    SET_FIELD(ret, EV4_HIRR, SWR, (sir != 0));
+    /* SIR reports raw requests; only SWR is gated by SIER. Native NT PAL
+     * reads SIRR while masked and writes it back to acknowledge one level.
+     * Hiding other pending levels here would silently clear them.
+     */
+    SET_FIELD(ret, EV4_HIRR, SWR, (sir & alpha_get_sien(env)) != 0);
     SET_FIELD(ret, EV4_HIRR, ATR, alpha_cpu_astirq_pending(env));
     SET_FIELD(ret, EV4_HIRR, CRR, alpha_get_crr(env) & alpha_get_cren(env));
     SET_FIELD(ret, EV4_HIRR, IRQ3, extract64(eir, 3, 1));

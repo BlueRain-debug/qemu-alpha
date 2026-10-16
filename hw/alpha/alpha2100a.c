@@ -36,6 +36,8 @@
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/pci_host.h"
+#include "hw/pci/pci_bridge.h"
+#include "hw/pci-bridge/dec_pci.h"
 #include "hw/core/sysbus.h"
 #include "system/system.h"
 #include "system/physmem.h"
@@ -98,6 +100,8 @@ struct Alpha2100AMachine {
     char *nvram_filename;
     FILE *nvram_file;
     MC146818RtcState *rtc;
+    ISADevice *pit;
+    uint8_t system_control;
     uint8_t *firmware;
     gsize firmware_size;
     hwaddr firmware_base;
@@ -238,7 +242,17 @@ static uint64_t lynx_io_read(void *opaque, hwaddr addr, unsigned size)
     } else if (len == 4) {
         value = address_space_ldl_le(&s->io_as, port, MEMTXATTRS_UNSPECIFIED, NULL);
     }
-    if (port == 0xc00) {
+    if (port == 0x61 && len == 1) {
+        PITChannelInfo timer, refresh;
+
+        /* ESC system control: PIT2 OUT is bit 5, refresh PIT1 OUT is bit 4.
+         * Repeated reads at the same virtual time must not toggle either.
+         * No parity/channel-check error sources are modeled on this board.
+         */
+        pit_get_channel_info(PIT_COMMON(s->pit), 2, &timer);
+        pit_get_channel_info(PIT_COMMON(s->pit), 1, &refresh);
+        value = s->system_control | (timer.out << 5) | (refresh.out << 4);
+    } else if (port == 0xc00) {
         value = s->nvram_page;
     } else if (port >= 0xc80 && port + len <= 0xc84) {
         /* Sable/Lynx system-board EISA ID: DEC2A01. */
@@ -265,6 +279,11 @@ static void lynx_io_write(void *opaque, hwaddr addr, uint64_t value, unsigned si
     unsigned port = addr >> 5, len = ((addr >> 3) & 3) + 1;
     value >>= len == 4 ? 0 : (port & 3) * 8;
     trace_alpha2100a_io(true, port, len, value);
+    if (port == 0x61 && len == 1) {
+        s->system_control = value & 0x0f;
+        pit_set_gate(PIT_COMMON(s->pit), 2, value & 1);
+        return;
+    }
     if (port == 0x70) {
         s->rtc_index = value & 127;
     } else if (port == 0x71 && s->rtc_index >= 14 && s->rtc_index != 0x32) {
@@ -1011,8 +1030,23 @@ static void lynx_isa_dma_init(Alpha2100AMachine *s, ISABus *isa)
 static int lynx_pci_map_irq(PCIDevice *dev, int pin)
 {
     unsigned slot = PCI_SLOT(dev->devfn);
-    /* Native Lynx slots 6..9 use IC positions 32..47. */
+    /* Root IDSEL4 is the Lynx VGA source, not the Demi-Lynx NCR slot. */
+    if (slot == 4) {
+        return 24;
+    }
+    /* Native primary expansion slots 6..9 use IC positions 32..47. */
     return slot >= 6 && slot <= 9 ? 32 + (slot - 6) * 4 + pin : 28;
+}
+
+static int lynx_secondary_map_irq(PCIDevice *dev, int pin)
+{
+    unsigned slot = PCI_SLOT(dev->devfn);
+
+    /* Built-in NCR810 is secondary IDSEL1, wired to IC28 on all pins.
+     * Expansion IDSEL6..9 are physical slots 0..3, IC48..63. These are
+     * board wires, not the rotating swizzle used by a plug-in bridge.
+     */
+    return slot >= 6 && slot <= 9 ? 48 + (slot - 6) * 4 + pin : 28;
 }
 
 static void lynx_pci_set_irq(void *opaque, int irq, int level)
@@ -1085,6 +1119,7 @@ static void lynx_reset(MachineState *machine, ResetType type)
     s->ic_regs[0][0x40 / 8] = s->ic_regs[1][0x40 / 8] = UINT64_MAX;
     s->irq_levels = s->irq_in_service = 0;
     s->nvram_page = 0;
+    s->system_control = 0;
     s->interval_epoch = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     for (unsigned i = 0; i < machine->smp.cpus; i++) {
         LynxInterval *t = &s->intervals[i];
@@ -1117,6 +1152,7 @@ static void lynx_init(MachineState *machine)
     ISADevice *rtc, *pcf, *fdc;
     DriveInfo *floppies[MAX_FD];
     DeviceState *host;
+    PCIDevice *bridge;
     static const uint8_t io_eeprom[256] = { [0xfe] = 0x40, [0xff] = 0x40 };
     static const uint8_t mem_eeprom[256] = { 0 };
     static const uint8_t cpu_eeprom[256] = { [0xfe] = 0x20, [0xff] = 0x20 };
@@ -1233,12 +1269,21 @@ static void lynx_init(MachineState *machine)
      * callback installs the machine-done hook which creates DMA aliases.
      */
     sysbus_realize_and_unref(SYS_BUS_DEVICE(host), &error_fatal);
+    /* Real Lynx has a DECchip 21050 at primary IDSEL3. Firmware assigns
+     * the NCR interrupt according to this topology; placing it at root
+     * IDSEL4 incorrectly gets the built-in VGA vector (0x98).
+     */
+    bridge = pci_new(PCI_DEVFN(3, 0), "alpha2100a-dec21050");
+    pci_bridge_map_irq(PCI_BRIDGE(bridge), "pci.1", lynx_secondary_map_irq);
+    pci_realize_and_unref(bridge, s->pci_bus, &error_fatal);
+    pci_bus_irqs(&PCI_BRIDGE(bridge)->sec_bus, lynx_pci_set_irq, s, 64);
     isa = isa_bus_new(NULL, &s->isa_mem, &s->isa_io, &error_fatal);
     s->pic_irqs = i8259_init(isa, NULL);
     irqs = qemu_allocate_irqs(lynx_isa_irq, s, 16);
     isa_bus_register_input_irqs(isa, irqs);
     isa_create_simple(isa, "i8042");
-    isa_create_simple(isa, "isa-pit");
+    /* PIT has no default I/O base; the ISA helper assigns 0x40 and IRQ0. */
+    s->pit = i8254_pit_init(isa, 0x40, 0, NULL);
     lynx_isa_dma_init(s, isa);
     fdc = isa_new(TYPE_ISA_FDC);
     qdev_prop_set_bit(DEVICE(fdc), "strict-pio", true);
@@ -1421,6 +1466,23 @@ static const TypeInfo lynx_cirrus_type = {
     .class_init = lynx_cirrus_class_init,
 };
 
+static void lynx_bridge_class_init(ObjectClass *oc, const void *data)
+{
+    /* 21050-compatible bridge configuration/windows/reset, using QEMU's
+     * existing DEC bridge. Chip-specific arbitration/timing is not modeled.
+     */
+    PCIDeviceClass *pc = PCI_DEVICE_CLASS(oc);
+
+    pc->device_id = 0x0001;
+    DEVICE_CLASS(oc)->desc = "Alpha2100A DECchip 21050-compatible PCI bridge";
+}
+
+static const TypeInfo lynx_bridge_type = {
+    .name = "alpha2100a-dec21050",
+    .parent = TYPE_DEC_PCI_BRIDGE,
+    .class_init = lynx_bridge_class_init,
+};
+
 static const TypeInfo lynx_host_type = {
     .name = "alpha2100a-pci-host",
     .parent = TYPE_PCI_HOST_BRIDGE,
@@ -1432,6 +1494,7 @@ static void lynx_register(void)
     type_register_static(&lynx_dma_type);
     type_register_static(&lynx_cirrus_type);
     type_register_static(&lynx_host_type);
+    type_register_static(&lynx_bridge_type);
     type_register_static(&lynx_type);
 }
 type_init(lynx_register)
