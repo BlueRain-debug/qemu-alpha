@@ -30,6 +30,7 @@
 #include "hw/isa/isa.h"
 #include "hw/intc/i8259.h"
 #include "hw/rtc/mc146818rtc.h"
+#include "hw/rtc/mc146818rtc_regs.h"
 #include "hw/input/i8042.h"
 #include "hw/block/fdc.h"
 #include "hw/dma/i8257.h"
@@ -65,10 +66,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(Alpha2100AMachine, ALPHA2100A_MACHINE)
 #define CBCTL_ID_MASK ((7ULL << 37) | (7ULL << 5))
 
 typedef struct LynxInterval {
-    Alpha2100AMachine *machine;
-    QEMUTimer *timer;
-    uint64_t ticks;
-    unsigned id;
     bool pending;
 } LynxInterval;
 
@@ -120,16 +117,24 @@ struct Alpha2100AMachine {
     hwaddr firmware_base;
     bool firmware_is_arc;
     LynxInterval intervals[4];
+    unsigned interval_phase;
+    QEMUTimer *interval_timer;
+    uint32_t interval_half_ticks;
+    uint64_t interval_edges;
     int64_t interval_epoch;
     uint64_t ic_regs[2][16];
-    uint64_t irq_levels, irq_in_service;
+    uint64_t irq_levels, irq_latched, irq_in_service;
     qemu_irq *pic_irqs;
 };
 
 static uint64_t lynx_irq_pending(Alpha2100AMachine *s)
 {
     /* AIR=0x40 selects the controller mask; one means disabled. */
-    return s->irq_levels & ~s->ic_regs[0][0x40 / 8] & ~s->irq_in_service;
+    uint64_t level_mode = s->ic_regs[0][0x50 / 8];
+    uint64_t requests = (s->irq_levels & level_mode) |
+                        (s->irq_latched & ~level_mode);
+
+    return requests & ~s->ic_regs[0][0x40 / 8] & ~s->irq_in_service;
 }
 
 static void lynx_irq_update(Alpha2100AMachine *s)
@@ -146,6 +151,9 @@ static void lynx_irq_set(void *opaque, int bit, int level)
     Alpha2100AMachine *s = opaque;
 
     if (level) {
+        if (!(s->irq_levels & BIT_ULL(bit))) {
+            s->irq_latched |= BIT_ULL(bit);
+        }
         s->irq_levels |= BIT_ULL(bit);
     } else {
         s->irq_levels &= ~BIT_ULL(bit);
@@ -170,16 +178,42 @@ static void lynx_isa_irq(void *opaque, int irq, int level)
 
 static void lynx_interval_tick(void *opaque)
 {
-    LynxInterval *t = opaque;
-    Alpha2100AMachine *s = t->machine;
+    Alpha2100AMachine *s = opaque;
+    unsigned cpu = s->interval_phase;
 
-    /* CPU specification 4.12: stagger the four 1024 Hz local clocks. */
-    t->pending = true;
-    qemu_set_irq(qdev_get_gpio_in(DEVICE(s->cpus[t->id]),
-                                 ALPHA_CPU_INPUT_IRQ4), 1);
-    t->ticks++;
-    timer_mod(t->timer, s->interval_epoch +
-              (t->ticks * 4 + t->id) * NANOSECONDS_PER_SECOND / 4096);
+    /* CPU module specification 4.12/table 48: consecutive SQW edges go to
+     * slots 0, 1, 2, 3, even when a slot is empty. Each installed CPU sees
+     * half the RTC square-wave frequency. NT programs this via RS/SQWE.
+     */
+    s->interval_phase = (cpu + 1) & 3;
+    if (cpu < MACHINE(s)->smp.cpus) {
+        s->intervals[cpu].pending = true;
+        qemu_set_irq(qdev_get_gpio_in(DEVICE(s->cpus[cpu]),
+                                     ALPHA_CPU_INPUT_IRQ4), 1);
+    }
+    s->interval_edges++;
+    timer_mod(s->interval_timer, s->interval_epoch +
+              periodic_clock_to_ns(s->interval_edges * s->interval_half_ticks));
+}
+
+static void lynx_interval_update(Alpha2100AMachine *s)
+{
+    unsigned a = s->rtc->cmos_data[RTC_REG_A];
+    unsigned b = s->rtc->cmos_data[RTC_REG_B];
+    uint32_t half_ticks = (b & REG_B_SQWE) && (a & 0x70) <= 0x20 ?
+                         periodic_period_to_clock(a & 15) / 2 : 0;
+
+    if (s->interval_half_ticks == half_ticks) {
+        return;
+    }
+    s->interval_half_ticks = half_ticks;
+    timer_del(s->interval_timer);
+    if (half_ticks) {
+        s->interval_epoch = qemu_clock_get_ns(rtc_clock);
+        s->interval_edges = 1;
+        timer_mod(s->interval_timer, s->interval_epoch +
+                  periodic_clock_to_ns(half_ticks));
+    }
 }
 
 /* One profile contains the 8 KiB configuration EEPROM followed by CMOS
@@ -466,6 +500,10 @@ static void lynx_io_write(void *opaque, hwaddr addr, uint64_t value, unsigned si
         address_space_stw_le(&s->io_as, port, value, MEMTXATTRS_UNSPECIFIED, NULL);
     } else if (len == 4) {
         address_space_stl_le(&s->io_as, port, value, MEMTXATTRS_UNSPECIFIED, NULL);
+    }
+    if (port == 0x71 &&
+        (s->rtc_index == RTC_REG_A || s->rtc_index == RTC_REG_B)) {
+        lynx_interval_update(s);
     }
     if (port == 0x42 && pit2->count_load_time != old_load) {
         s->pit2_elapsed_ns = 0;
@@ -865,6 +903,11 @@ static uint64_t lynx_csr_read(void *opaque, hwaddr addr, unsigned size)
 
         value = pending ? ctz64(pending) : 0x80;
         if (pending) {
+            /* IC mode register 0x50: one is level-sensitive, zero is
+             * latched. A claimed ISA edge must not recur merely because
+             * the device leaves its request high until a deferred read.
+             */
+            s->irq_latched &= ~BIT_ULL(value);
             s->irq_in_service |= BIT_ULL(value);
             lynx_irq_update(s);
         }
@@ -1301,10 +1344,12 @@ static void lynx_reset(MachineState *machine, ResetType type)
     }
     memset(s->ic_regs, 0, sizeof(s->ic_regs));
     s->ic_regs[0][0x40 / 8] = s->ic_regs[1][0x40 / 8] = UINT64_MAX;
-    s->irq_levels = s->irq_in_service = 0;
+    s->irq_levels = s->irq_latched = s->irq_in_service = 0;
     s->nvram_page = 0;
     s->system_control = 0;
-    s->interval_epoch = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->interval_phase = 0;
+    timer_del(s->interval_timer);
+    s->interval_half_ticks = 0;
     for (unsigned i = 0; i < machine->smp.cpus; i++) {
         LynxInterval *t = &s->intervals[i];
 
@@ -1322,10 +1367,8 @@ static void lynx_reset(MachineState *machine, ResetType type)
         }
         cpu_set_pc(CPU(s->cpus[i]), s->firmware_base | R_PC_PAL_MODE_MASK);
         t->pending = false;
-        t->ticks = 1;
-        timer_mod(t->timer, s->interval_epoch +
-                  (4 + i) * NANOSECONDS_PER_SECOND / 4096);
     }
+    lynx_interval_update(s);
 }
 
 static void lynx_init(MachineState *machine)
@@ -1377,17 +1420,12 @@ static void lynx_init(MachineState *machine)
     refclk = clock_new(OBJECT(machine), "cpu-refclk");
     clock_set_hz(refclk, 275000000);
     for (unsigned i = 0; i < machine->smp.cpus; i++) {
-        LynxInterval *t = &s->intervals[i];
-
         s->cpus[i] = ALPHA_CPU(object_new(machine->cpu_type));
         s->bcache[i] = g_new0(LynxCacheLine, 4 * MiB / 32);
         s->cpus[i]->memory_data = lynx_ram_data;
         s->cpus[i]->memory_data_opaque = s;
         qdev_connect_clock_in(DEVICE(s->cpus[i]), "cpu-refclk", refclk);
         qdev_realize_and_unref(DEVICE(s->cpus[i]), NULL, &error_fatal);
-        t->machine = s;
-        t->id = i;
-        t->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, lynx_interval_tick, t);
     }
     memory_region_add_subregion(sysmem, 0, machine->ram);
     /* MCONF straps: DRAM density bits 5:4, number-of-banks bits 7:6.
@@ -1481,6 +1519,7 @@ static void lynx_init(MachineState *machine)
                         s->firmware_is_arc ? 1980 : 1900);
     isa_realize_and_unref(rtc, isa, &error_fatal);
     s->rtc = MC146818_RTC(rtc);
+    s->interval_timer = timer_new_ns(rtc_clock, lynx_interval_tick, s);
     lynx_profile_init(s);
     serial_hds_isa_init(isa, 0, 2);
     pcf = isa_create_simple(isa, "alpha2100a-pcf8584");
@@ -1552,9 +1591,7 @@ static void lynx_finalize(Object *obj)
         fclose(s->nvram_file);
     }
     g_free(s->nvram_filename);
-    for (unsigned i = 0; i < 4; i++) {
-        timer_free(s->intervals[i].timer);
-    }
+    timer_free(s->interval_timer);
     if (s->mem_as.root) {
         address_space_destroy(&s->mem_as);
     }
