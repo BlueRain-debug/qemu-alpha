@@ -6,6 +6,11 @@
  * Original interface attribution: Jay A Estabrook (jestabro@amt.tay1.dec.com).
  * Implemented with QEMU ISA, AddressSpace, CPU and clock interfaces;
  * no Linux implementation is copied. No DEC firmware is distributed here.
+ * ESC DMA register compatibility was cross-checked against 86Box src/dma.c:
+ * Copyright 2008-2020 Sarah Walker.
+ * Copyright 2016-2020 Miran Grca.
+ * Copyright 2017-2020 Fred N. van Kempen.
+ * Independently implemented from Intel 82374EB/SB, sections 3.2 and 6.7.
  * This is not yet a complete T2/T3 chipset or an operating-system machine.
  */
 #include "qemu/osdep.h"
@@ -29,6 +34,7 @@
 #include "hw/block/fdc.h"
 #include "hw/dma/i8257.h"
 #include "hw/timer/i8254.h"
+#include "hw/timer/i8254_internal.h"
 #include "hw/char/serial-isa.h"
 #include "hw/i2c/i2c.h"
 #include "hw/nvram/eeprom_at24c.h"
@@ -94,6 +100,13 @@ struct Alpha2100AMachine {
     bool s3_928;
     char *s3_romfile;
     AddressSpace io_as, mem_as, dma_as;
+    I8257State *isa_dma[2];
+    int64_t pit2_elapsed_ns;
+    /* Extension register state; the i8257 transfer scheduler is still
+     * limited to legacy counts. Ring-buffer stop execution is not modeled.
+     */
+    uint8_t dma_count_high[8];
+    uint8_t dma_stop[8][3];
     IOMMUMemoryRegion dma_iommu;
     uint64_t csr_regs[16][128];
     uint8_t nvram[8192], nvram_page, rtc_index;
@@ -229,6 +242,52 @@ static void lynx_profile_init(Alpha2100AMachine *s)
     }
 }
 
+/* The shared PIT leaves mode-0 GATE inhibition unimplemented. ARC uses
+ * timer 2 with GATE low to verify both count bytes. Exclude the inhibited
+ * interval from the counter's time base, then resume from the retained
+ * count when GATE rises. Timer 2 has no independently scheduled IRQ.
+ */
+static void lynx_pit_sync(Alpha2100AMachine *s)
+{
+    PITChannelState *timer = &PIT_COMMON(s->pit)->channels[2];
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (timer->mode == 0 && !timer->gate) {
+        timer->count_load_time = now - s->pit2_elapsed_ns;
+    } else {
+        s->pit2_elapsed_ns = MAX(0, now - timer->count_load_time);
+    }
+}
+
+static unsigned lynx_pit2_count(Alpha2100AMachine *s)
+{
+    PITChannelState *timer = &PIT_COMMON(s->pit)->channels[2];
+    uint64_t ticks = muldiv64(s->pit2_elapsed_ns, PIT_FREQ,
+                              NANOSECONDS_PER_SECOND);
+
+    return (timer->count - ticks) & 0xffff;
+}
+
+/* ESC extension decoding; channel 4 is the inter-controller cascade. */
+static int lynx_dma_count_channel(unsigned port)
+{
+    if (port >= 0x401 && port <= 0x407 && (port & 1)) {
+        return (port - 0x401) / 2;
+    }
+    if (port >= 0x4c6 && port <= 0x4ce && (port & 3) == 2) {
+        return 5 + (port - 0x4c6) / 4;
+    }
+    return -1;
+}
+
+static int lynx_dma_page_channel(unsigned port)
+{
+    static const int map[8] = { -1, 2, 3, 1, -1, -1, -1, 0 };
+    int channel = map[port & 7];
+
+    return channel < 0 ? -1 : channel + (port & 8 ? 4 : 0);
+}
+
 static uint64_t lynx_io_read(void *opaque, hwaddr addr, unsigned size)
 {
     Alpha2100AMachine *s = opaque;
@@ -236,7 +295,25 @@ static uint64_t lynx_io_read(void *opaque, hwaddr addr, unsigned size)
     unsigned shift = len == 4 ? 0 : (port & 3) * 8;
     uint64_t value = 0xffffffff;
     MemTxResult result = MEMTX_DECODE_ERROR;
-    if (len == 1) {
+    PITChannelState *pit2 = &PIT_COMMON(s->pit)->channels[2];
+    int count_channel = lynx_dma_count_channel(port);
+
+    if ((port >= 0x40 && port <= 0x43) || port == 0x61) {
+        lynx_pit_sync(s);
+    }
+    if (port == 0x42 && len == 1 && pit2->mode == 0 && !pit2->gate &&
+        !pit2->count_latched && !pit2->status_latched) {
+        /* Do not let host time spent inside the port callback count as a
+         * timer clock while GATE is low. Preserve the normal byte phase.
+         */
+        unsigned state = pit2->read_state;
+
+        value = (lynx_pit2_count(s) >> (state == 1 || state == 3 ? 0 : 8)) & 255;
+        if (state == 3 || state == 4) {
+            pit2->read_state = state == 3 ? 4 : 3;
+        }
+        result = MEMTX_OK;
+    } else if (len == 1) {
         value = address_space_ldub(&s->io_as, port, MEMTXATTRS_UNSPECIFIED, &result);
     } else if (len == 2) {
         value = address_space_lduw_le(&s->io_as, port, MEMTXATTRS_UNSPECIFIED, &result);
@@ -247,7 +324,19 @@ static uint64_t lynx_io_read(void *opaque, hwaddr addr, unsigned size)
         /* Empty EISA slots must not appear as a board with ID 00000000. */
         value = UINT32_MAX >> ((4 - len) * 8);
     }
-    if (port == 0x61 && len == 1) {
+    if (len == 1 && count_channel >= 0) {
+        I8257State *dma = s->isa_dma[count_channel >> 2];
+        I8257Regs *r = &dma->regs[count_channel & 3];
+        uint32_t count = ((uint32_t)s->dma_count_high[count_channel] << 16) |
+                         r->base[1];
+
+        value = ((count - (r->now[1] >> dma->dshift)) >> 16) & 0xff;
+    } else if (len == 1 && port >= 0x4e0 && port <= 0x4ff) {
+        unsigned channel = (port - 0x4e0) / 4;
+        unsigned byte = port & 3;
+
+        value = channel == 4 || byte == 3 ? 0xff : s->dma_stop[channel][byte];
+    } else if (port == 0x61 && len == 1) {
         PITChannelInfo timer, refresh;
 
         /* ESC system control: PIT2 OUT is bit 5, refresh PIT1 OUT is bit 4.
@@ -256,7 +345,14 @@ static uint64_t lynx_io_read(void *opaque, hwaddr addr, unsigned size)
          */
         pit_get_channel_info(PIT_COMMON(s->pit), 2, &timer);
         pit_get_channel_info(PIT_COMMON(s->pit), 1, &refresh);
+        if (pit2->mode == 0 && !pit2->gate) {
+            timer.out = s->pit2_elapsed_ns >=
+                muldiv64(pit2->count, NANOSECONDS_PER_SECOND, PIT_FREQ);
+        }
         value = s->system_control | (timer.out << 5) | (refresh.out << 4);
+    } else if (len == 1 && (port == 0x0f || port == 0xde)) {
+        /* The ESC adds readback of the four legacy DMA channel masks. */
+        value = s->isa_dma[port == 0xde]->mask & 0x0f;
     } else if (port == 0xc00) {
         value = s->nvram_page;
     } else if (port >= 0xc80 && port + len <= 0xc84) {
@@ -282,12 +378,66 @@ static void lynx_io_write(void *opaque, hwaddr addr, uint64_t value, unsigned si
 {
     Alpha2100AMachine *s = opaque;
     unsigned port = addr >> 5, len = ((addr >> 3) & 3) + 1;
+    PITChannelState *pit2 = &PIT_COMMON(s->pit)->channels[2];
+    int64_t old_load;
+    bool count_latched = pit2->count_latched;
+    bool status_latched = pit2->status_latched;
+
     value >>= len == 4 ? 0 : (port & 3) * 8;
     trace_alpha2100a_io(true, port, len, value);
+    if ((port >= 0x40 && port <= 0x43) || port == 0x61) {
+        lynx_pit_sync(s);
+    }
+    old_load = pit2->count_load_time;
     if (port == 0x61 && len == 1) {
         s->system_control = value & 0x0f;
         pit_set_gate(PIT_COMMON(s->pit), 2, value & 1);
         return;
+    }
+    if (len == 1) {
+        int channel = lynx_dma_count_channel(port);
+
+        if (channel >= 0) {
+            s->dma_count_high[channel] = value;
+            return;
+        }
+        if (port >= 0x4e0 && port <= 0x4ff) {
+            unsigned ch = (port - 0x4e0) / 4;
+            unsigned byte = port & 3;
+
+            if (ch != 4 && byte != 3) {
+                s->dma_stop[ch][byte] = value & (byte ? 0xff : 0xfc);
+            }
+            return;
+        }
+        if ((port >= 0x80 && port <= 0x8f) || port < 8 ||
+            (port >= 0xc0 && port <= 0xce && !(port & 1))) {
+            /* Programming any legacy address byte selects compatibility
+             * mode and clears the high page (82374EB/SB 6.7.1). Ordinary
+             * count writes likewise clear the third count byte (3.2.2).
+             */
+            if (port >= 0x80 && port <= 0x8f) {
+                channel = lynx_dma_page_channel(port);
+            } else {
+                unsigned dshift = port >= 0xc0;
+                unsigned reg = (port - (dshift ? 0xc0 : 0)) >> dshift;
+
+                channel = (reg >> 1) + dshift * 4;
+                if (reg & 1) {
+                    s->dma_count_high[channel] = 0;
+                    channel = -1;
+                }
+            }
+            if (channel >= 0) {
+                s->isa_dma[channel >> 2]->regs[channel & 3].pageh = 0;
+            }
+        } else if (port == 0x0d || port == 0xda) {
+            unsigned controller = port == 0xda;
+
+            for (unsigned i = 0; i < 4; i++) {
+                s->isa_dma[controller]->regs[i].pageh = 0;
+            }
+        }
     }
     if (port == 0x70) {
         s->rtc_index = value & 127;
@@ -316,6 +466,20 @@ static void lynx_io_write(void *opaque, hwaddr addr, uint64_t value, unsigned si
         address_space_stw_le(&s->io_as, port, value, MEMTXATTRS_UNSPECIFIED, NULL);
     } else if (len == 4) {
         address_space_stl_le(&s->io_as, port, value, MEMTXATTRS_UNSPECIFIED, NULL);
+    }
+    if (port == 0x42 && pit2->count_load_time != old_load) {
+        s->pit2_elapsed_ns = 0;
+    }
+    if (port == 0x43 && pit2->mode == 0 && !pit2->gate) {
+        if (!count_latched && pit2->count_latched) {
+            pit2->latched_count = lynx_pit2_count(s);
+        }
+        if (!status_latched && pit2->status_latched) {
+            unsigned out = s->pit2_elapsed_ns >=
+                muldiv64(pit2->count, NANOSECONDS_PER_SECOND, PIT_FREQ);
+
+            pit2->status = (pit2->status & 0x7f) | out << 7;
+        }
     }
 }
 
@@ -1035,6 +1199,7 @@ static void lynx_isa_dma_init(Alpha2100AMachine *s, ISABus *isa)
         qdev_prop_set_int32(DEVICE(dev), "dshift", i);
         isa_realize_and_unref(dev, isa, &error_fatal);
         channels[i] = dev;
+        s->isa_dma[i] = I8257(dev);
     }
     isa_bus_dma(isa, ISADMA(channels[0]), ISADMA(channels[1]));
 }
@@ -1095,6 +1260,13 @@ static void lynx_reset(MachineState *machine, ResetType type)
     uint8_t scratch[SRM_BASE] = { 0 };
 
     qemu_devices_reset(type);
+    s->pit2_elapsed_ns = 0;
+    memset(s->dma_count_high, 0, sizeof(s->dma_count_high));
+    for (unsigned controller = 0; controller < 2; controller++) {
+        for (unsigned channel = 0; channel < 4; channel++) {
+            s->isa_dma[controller]->regs[channel].pageh = 0;
+        }
+    }
     if (s->firmware_is_arc) {
         unsigned mode = mc146818rtc_get_cmos_data(s->rtc, 0x0b);
 
