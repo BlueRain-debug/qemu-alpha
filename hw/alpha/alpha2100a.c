@@ -986,6 +986,7 @@ static void lynx_csr_write(void *opaque, hwaddr addr, uint64_t value, unsigned s
     if (reg < 128) {
         uint64_t *storage = &s->csr_regs[block][reg];
         uint64_t halted = *storage & BIT_ULL(35);
+        uint64_t old_value;
 
         if (block >= 14 && reg == 0x4a0 / 32) {
             unsigned air = s->csr_regs[block][0x460 / 32];
@@ -995,11 +996,21 @@ static void lynx_csr_write(void *opaque, hwaddr addr, uint64_t value, unsigned s
             }
             storage = &s->ic_regs[block - 14][air / 8];
         }
+        old_value = *storage;
         if (size == 4) {
             uint64_t mask = (uint64_t)UINT32_MAX << ((addr & 4) * 8);
             *storage = (*storage & ~mask) | (written & mask);
         } else {
             *storage = value;
+        }
+        if (block == 14 && reg == 0x4a0 / 32 &&
+            s->csr_regs[block][0x460 / 32] == 0x40) {
+            /* ARC polls PINT and acknowledges the device directly, without
+             * claiming VAR. Disabling a source must also disarm its stale
+             * edge; otherwise the next floppy command completes too early.
+             * Keep in-service claims and other sources independent.
+             */
+            s->irq_latched &= ~(*storage & ~old_value);
         }
         if (block == 8 && reg == 6) {
             bool active = !(*storage & BIT_ULL(31)) ||
