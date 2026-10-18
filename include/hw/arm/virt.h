@@ -173,6 +173,7 @@ struct VirtMachineState {
     bool winrt_sdhci_dma;
     bool winrt_sp804;
     bool winrt_tegra_timer;
+    bool winrt_qfprom_probe;
     int winrt_tegra_irqmap[VIRT_LOWMEMMAP_LAST];
     bool highmem;
     bool highmem_compact;

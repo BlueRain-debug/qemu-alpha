@@ -97,6 +97,7 @@
 #include "hw/watchdog/sbsa_gwdt.h"
 #include "hw/sd/sdhci.h"
 #include "hw/usb/hcd-ehci.h"
+#include "hw/misc/unimp.h"
 
 static GlobalProperty arm_virt_compat_defaults[] = {
     { TYPE_VIRTIO_IOMMU_PCI, "aw-bits", "48" },
@@ -1669,6 +1670,8 @@ static void create_gpio_devices(const VirtMachineState *vms, int gpio,
     hwaddr size = vms->memmap[gpio].size;
     int irq = vms->irqmap[gpio];
     const char compat[] = "arm,pl061\0arm,primecell";
+    const char winrt_compat[] =
+        "qemu,winrt-reset-gpio\0arm,pl061\0arm,primecell";
     SysBusDevice *s;
     MachineState *ms = MACHINE(vms);
 
@@ -1686,7 +1689,12 @@ static void create_gpio_devices(const VirtMachineState *vms, int gpio,
     qemu_fdt_add_subnode(ms->fdt, nodename);
     qemu_fdt_setprop_sized_cells(ms->fdt, nodename, "reg",
                                  2, base, 2, size);
-    qemu_fdt_setprop(ms->fdt, nodename, "compatible", compat, sizeof(compat));
+    if (vms->winrt && gpio == VIRT_SECURE_GPIO) {
+        qemu_fdt_setprop(ms->fdt, nodename, "compatible",
+                         winrt_compat, sizeof(winrt_compat));
+    } else {
+        qemu_fdt_setprop(ms->fdt, nodename, "compatible", compat, sizeof(compat));
+    }
     qemu_fdt_setprop_cell(ms->fdt, nodename, "#gpio-cells", 2);
     qemu_fdt_setprop(ms->fdt, nodename, "gpio-controller", NULL, 0);
     qemu_fdt_setprop_cells(ms->fdt, nodename, "interrupts",
@@ -1697,8 +1705,9 @@ static void create_gpio_devices(const VirtMachineState *vms, int gpio,
     qemu_fdt_setprop_cell(ms->fdt, nodename, "phandle", phandle);
 
     if (gpio != VIRT_GPIO) {
-        /* Mark as not usable by the normal world */
-        qemu_fdt_setprop_string(ms->fdt, nodename, "status", "disabled");
+        /* WinRT firmware claims this controller and hides it at handoff. */
+        qemu_fdt_setprop_string(ms->fdt, nodename, "status",
+                               vms->winrt ? "okay" : "disabled");
         qemu_fdt_setprop_string(ms->fdt, nodename, "secure-status", "okay");
     }
     g_free(nodename);
@@ -2886,6 +2895,19 @@ static void create_winrt_devices(const VirtMachineState *vms)
     SysBusDevice *sbd;
     DriveInfo *di = drive_get(IF_SD, 0, 0);
 
+    if (vms->winrt_qfprom_probe) {
+        const hwaddr base = 0xfc4b8000;
+
+        if (MACHINE(vms)->ram_size > base - vms->memmap[VIRT_MEM].base) {
+            error_report("winrt-qfprom-probe overlaps guest RAM");
+            exit(1);
+        }
+        /* Phone production self-tests use SOCProdTest to probe this range.
+         * This experimental placeholder returns zero, rather than raising
+         * an external abort. It does not model programmed fuses or OTP. */
+        create_unimplemented_device("winrt-qfprom-probe", base, 0x10000);
+    }
+
     sysbus_create_simple(TYPE_PLATFORM_EHCI, vms->memmap[VIRT_EHCI].base,
                          qdev_get_gpio_in(vms->gic, vms->irqmap[VIRT_EHCI]));
 
@@ -2962,6 +2984,11 @@ static void machvirt_init(MachineState *machine)
     unsigned int max_cpus = machine->smp.max_cpus;
 
     possible_cpus = mc->possible_cpu_arch_ids(machine);
+
+    if (vms->winrt_qfprom_probe && !vms->winrt) {
+        error_report("winrt-qfprom-probe requires winrt=on");
+        exit(1);
+    }
 
     if (vms->winrt_tegra_timer) {
         if (!vms->winrt || vms->winrt_sp804) {
@@ -3330,8 +3357,9 @@ static void machvirt_init(MachineState *machine)
         create_gpio_devices(vms, VIRT_GPIO, sysmem);
     }
 
-    if (vms->secure && !vmc->no_secure_gpio) {
-        create_gpio_devices(vms, VIRT_SECURE_GPIO, secure_sysmem);
+    if ((vms->secure || vms->winrt) && !vmc->no_secure_gpio) {
+        create_gpio_devices(vms, VIRT_SECURE_GPIO,
+                            secure_sysmem ?: sysmem);
     }
 
      /* connect powerdown request */
@@ -3406,6 +3434,16 @@ static bool virt_get_winrt_tegra_timer(Object *obj, Error **errp)
 static void virt_set_winrt_tegra_timer(Object *obj, bool value, Error **errp)
 {
     VIRT_MACHINE(obj)->winrt_tegra_timer = value;
+}
+
+static bool virt_get_winrt_qfprom_probe(Object *obj, Error **errp)
+{
+    return VIRT_MACHINE(obj)->winrt_qfprom_probe;
+}
+
+static void virt_set_winrt_qfprom_probe(Object *obj, bool value, Error **errp)
+{
+    VIRT_MACHINE(obj)->winrt_qfprom_probe = value;
 }
 
 static bool virt_get_winrt(Object *obj, Error **errp)
@@ -4387,6 +4425,12 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
         "WinRT firmware RAM reservations)");
     object_class_property_add_bool(oc, "winrt", virt_get_winrt,
                                    virt_set_winrt);
+    object_class_property_add_bool(oc, "winrt-qfprom-probe",
+                                   virt_get_winrt_qfprom_probe,
+                                   virt_set_winrt_qfprom_probe);
+    object_class_property_set_description(oc, "winrt-qfprom-probe",
+        "Expose an experimental zero-filled phone fuse probe window "
+        "(requires winrt=on; no programmed fuses or OTP emulation)");
     object_class_property_set_description(oc, "winrt",
         "Enable the experimental AArch32 Windows RT platform");
     object_class_property_add_bool(oc, "secure", virt_get_secure,

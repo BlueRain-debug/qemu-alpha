@@ -25,6 +25,8 @@ void qemu_edid_region_io(MemoryRegion *region, Object *owner,
 uint32_t qemu_edid_dpi_to_mm(uint32_t dpi, uint32_t res);
 
 #define DEFINE_EDID_PROPERTIES(_state, _edid_info)                         \
+    DEFINE_PROP_UINT16("width-mm", _state, _edid_info.width_mm, 0),       \
+    DEFINE_PROP_UINT16("height-mm", _state, _edid_info.height_mm, 0),     \
     DEFINE_PROP_UINT32("xres", _state, _edid_info.prefx, 0),               \
     DEFINE_PROP_UINT32("yres", _state, _edid_info.prefy, 0),               \
     DEFINE_PROP_UINT32("xmax", _state, _edid_info.maxx, 0),                \

@@ -41,6 +41,7 @@ config ARM_VIRT
     select SDHCI
     select ARM_TIMER
     select TEGRA20_TIMER
+    select UNIMP
 
 config CUBIEBOARD
     bool
