@@ -1345,7 +1345,8 @@ build_dsdt(GArray *table_data, BIOSLinker *linker, VirtMachineState *vms)
                          0, vms->virtio_transports);
     if (vms->winrt) {
         acpi_dsdt_add_winrt(scope, vms);
-    } else {
+    }
+    if (!vms->winrt || vms->winrt_pci) {
         acpi_dsdt_add_pci(scope, memmap, irqmap[VIRT_PCIE] + ARM_SPI_BASE, vms);
     }
     if (vms->acpi_dev) {
@@ -1381,7 +1382,7 @@ build_dsdt(GArray *table_data, BIOSLinker *linker, VirtMachineState *vms)
 
     aml_append(dsdt, scope);
 
-    if (!vms->winrt) {
+    if (!vms->winrt || vms->winrt_pci) {
         pci0_scope = aml_scope("\\_SB.PCI0");
 
         aml_append(pci0_scope, build_pci_bridge_edsm());

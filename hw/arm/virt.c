@@ -2990,6 +2990,11 @@ static void machvirt_init(MachineState *machine)
         exit(1);
     }
 
+    if (vms->winrt_pci && !vms->winrt) {
+        error_report("winrt-pci requires winrt=on");
+        exit(1);
+    }
+
     if (vms->winrt_tegra_timer) {
         if (!vms->winrt || vms->winrt_sp804) {
             error_report("winrt-tegra-timer requires winrt=on and "
@@ -3444,6 +3449,16 @@ static bool virt_get_winrt_qfprom_probe(Object *obj, Error **errp)
 static void virt_set_winrt_qfprom_probe(Object *obj, bool value, Error **errp)
 {
     VIRT_MACHINE(obj)->winrt_qfprom_probe = value;
+}
+
+static bool virt_get_winrt_pci(Object *obj, Error **errp)
+{
+    return VIRT_MACHINE(obj)->winrt_pci;
+}
+
+static void virt_set_winrt_pci(Object *obj, bool value, Error **errp)
+{
+    VIRT_MACHINE(obj)->winrt_pci = value;
 }
 
 static bool virt_get_winrt(Object *obj, Error **errp)
@@ -4431,6 +4446,11 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "winrt-qfprom-probe",
         "Expose an experimental zero-filled phone fuse probe window "
         "(requires winrt=on; no programmed fuses or OTP emulation)");
+    object_class_property_add_bool(oc, "winrt-pci", virt_get_winrt_pci,
+                                   virt_set_winrt_pci);
+    object_class_property_set_description(oc, "winrt-pci",
+        "Expose PCI in ACPI for Windows ARM guests with PCI bus support "
+        "(requires winrt=on; default off)");
     object_class_property_set_description(oc, "winrt",
         "Enable the experimental AArch32 Windows RT platform");
     object_class_property_add_bool(oc, "secure", virt_get_secure,
