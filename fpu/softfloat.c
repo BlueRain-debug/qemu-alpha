@@ -2883,8 +2883,9 @@ int16_t float32_to_int16_scalbn(float32 a, FloatRoundMode rmode, int scale,
     return parts64_float_to_sint(&p, rmode, scale, INT16_MIN, INT16_MAX, s);
 }
 
-int32_t float32_to_int32_scalbn(float32 a, FloatRoundMode rmode, int scale,
-                                float_status *s)
+int32_t QEMU_FLATTEN
+float32_to_int32_scalbn(float32 a, FloatRoundMode rmode, int scale,
+                       float_status *s)
 {
     FloatParts64 p = float32_unpack_canonical(a, s);
     return parts64_float_to_sint(&p, rmode, scale, INT32_MIN, INT32_MAX, s);
@@ -3343,8 +3344,9 @@ uint16_t float32_to_uint16_scalbn(float32 a, FloatRoundMode rmode, int scale,
     return parts64_float_to_uint(&p, rmode, scale, UINT16_MAX, s);
 }
 
-uint32_t float32_to_uint32_scalbn(float32 a, FloatRoundMode rmode, int scale,
-                                  float_status *s)
+uint32_t QEMU_FLATTEN
+float32_to_uint32_scalbn(float32 a, FloatRoundMode rmode, int scale,
+                        float_status *s)
 {
     FloatParts64 p = float32_unpack_canonical(a, s);
     return parts64_float_to_uint(&p, rmode, scale, UINT32_MAX, s);
@@ -4079,7 +4081,8 @@ bfloat16 bfloat16_minmax(bfloat16 a, bfloat16 b, float_status *s, int flags)
     return bfloat16_round_pack_canonical(pr, s);
 }
 
-float32 float32_minmax(float32 a, float32 b, float_status *s, int flags)
+float32 QEMU_FLATTEN
+float32_minmax(float32 a, float32 b, float_status *s, int flags)
 {
     FloatParts64 pa = float32_unpack_canonical(a, s);
     FloatParts64 pb = float32_unpack_canonical(b, s);
