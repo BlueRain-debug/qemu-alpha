@@ -362,6 +362,10 @@ usb_serial_set_data(int bus, int addr, int parity, int data, int stop) "dev %d:%
 usb_serial_set_flow_control(int bus, int addr, int index) "dev %d:%u flow control %d"
 usb_serial_set_xonxoff(int bus, int addr, uint8_t xon, uint8_t xoff) "dev %d:%u xon 0x%x xoff 0x%x"
 
+# dev-ax88772.c
+usb_ax88772_control(int request, int value, int index, int length) "request 0x%04x value 0x%04x index 0x%04x length %d"
+usb_ax88772_packet(bool transmit, size_t length) "tx %d length %zu"
+
 # canokey.c
 canokey_emu_stall_ep(uint8_t ep) "ep %d"
 canokey_emu_set_address(uint8_t addr) "addr %d"
