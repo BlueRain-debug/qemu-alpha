@@ -16,6 +16,7 @@
 #include "net/net.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
 #include "desc.h"
 #include "trace.h"
@@ -59,6 +60,7 @@ struct USBAX88772State {
     uint32_t rx_pos;
     uint8_t tx_buf[AX_TX_BUFSIZE];
     uint32_t tx_len;
+    bool tx_padding;
 };
 
 static const USBDescStrings ax_strings = {
@@ -112,6 +114,9 @@ static bool ax_link_up(USBAX88772State *s)
 
 static void ax_notify(USBAX88772State *s)
 {
+    trace_usb_ax88772_state("notify", qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),
+                           ax_link_up(s), s->rx_ctl, s->medium, s->sw_reset,
+                           s->rx_len, s->rx_pos, s->tx_len);
     s->intr_pending = true;
     usb_wakeup(s->intr, 0);
 }
@@ -149,6 +154,7 @@ static void ax_reset(USBDevice *dev)
     s->rx_ctl = 0;
     s->medium = 0;
     s->rx_len = s->rx_pos = s->tx_len = 0;
+    s->tx_padding = false;
     memset(s->multicast, 0, sizeof(s->multicast));
     s->ipg[0] = 0x15;
     s->ipg[1] = 0x0c;
@@ -157,6 +163,9 @@ static void ax_reset(USBDevice *dev)
     s->phy_select = 1;
     s->sw_mii = s->eeprom_write = false;
     ax_phy_reset(s);
+    trace_usb_ax88772_state("usb-reset", qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),
+                           ax_link_up(s), s->rx_ctl, s->medium, s->sw_reset,
+                           s->rx_len, s->rx_pos, s->tx_len);
     ax_notify(s);
 }
 
@@ -167,6 +176,7 @@ static void ax_control(USBDevice *dev, USBPacket *p, int request,
     uint8_t reply[8] = { 0 };
     int size = 0;
 
+    trace_usb_ax88772_control(request, value, index, length);
     if (usb_desc_handle_control(dev, p, request, value, index, length,
                                 data) >= 0) {
         if (request == (DeviceOutRequest | USB_REQ_SET_CONFIGURATION)) {
@@ -174,8 +184,28 @@ static void ax_control(USBDevice *dev, USBPacket *p, int request,
         }
         return;
     }
-    trace_usb_ax88772_control(request, value, index, length);
     switch (request) {
+    case EndpointOutRequest | USB_REQ_CLEAR_FEATURE:
+        if (value != 0 /* ENDPOINT_HALT */ || length ||
+            (index != 0x81 && index != 0x82 && index != 0x03)) {
+            goto stall;
+        }
+        if (index == 0x03) {
+            s->tx_len = 0;
+            s->tx_padding = false;
+        } else if (index == 0x82) {
+            s->rx_len = s->rx_pos = 0;
+            qemu_flush_queued_packets(qemu_get_queue(s->nic));
+        } else {
+            ax_notify(s);
+        }
+        usb_ep_set_halted(dev, index & USB_DIR_IN ? USB_TOKEN_IN : USB_TOKEN_OUT,
+                          index & 0x0f, false);
+        trace_usb_ax88772_state("clear-halt",
+                               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),
+                               ax_link_up(s), s->rx_ctl, s->medium, s->sw_reset,
+                               s->rx_len, s->rx_pos, s->tx_len);
+        break;
     case VendorDeviceOutRequest | 0x06: /* software MII ownership */
         s->sw_mii = true;
         break;
@@ -300,6 +330,7 @@ static void ax_control(USBDevice *dev, USBPacket *p, int request,
         s->sw_reset = value;
         if (value & 3) {
             s->rx_len = s->rx_pos = s->tx_len = 0;
+            s->tx_padding = false;
         }
         ax_notify(s);
         break;
@@ -320,6 +351,7 @@ static void ax_control(USBDevice *dev, USBPacket *p, int request,
     return;
 
 stall:
+    trace_usb_ax88772_error("control", 0, request, length, value, index);
     qemu_log_mask(LOG_UNIMP, "ax88772: unsupported control "
                   "%04x value %04x index %04x length %d\n",
                   request, value, index, length);
@@ -377,6 +409,14 @@ static ssize_t ax_receive(NetClientState *nc, const uint8_t *buf, size_t size)
     return size;
 }
 
+static bool ax_tx_header_valid(const uint8_t *buf)
+{
+    unsigned len = lduw_le_p(buf);
+    unsigned inverse = lduw_le_p(buf + 2);
+
+    return (len ^ inverse) == 0xffff && len <= AX_MAX_FRAME;
+}
+
 static void ax_data(USBDevice *dev, USBPacket *p)
 {
     USBAX88772State *s = USB_AX88772(dev);
@@ -391,6 +431,9 @@ static void ax_data(USBDevice *dev, USBPacket *p)
         status[0] = 0xa1;
         status[2] = ax_link_up(s);
         stw_le_p(status + 6, ax_phy_read(s, MII_BMSR));
+        trace_usb_ax88772_state("interrupt", qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),
+                               ax_link_up(s), s->rx_ctl, s->medium, s->sw_reset,
+                               s->rx_len, s->rx_pos, s->tx_len);
         usb_packet_copy(p, status, MIN(p->iov.size, sizeof(status)));
         s->intr_pending = false;
     } else if (p->pid == USB_TOKEN_IN && p->ep->nr == 2) {
@@ -408,18 +451,43 @@ static void ax_data(USBDevice *dev, USBPacket *p)
         }
     } else if (p->pid == USB_TOKEN_OUT && p->ep->nr == 3) {
         if (p->iov.size > sizeof(s->tx_buf) - s->tx_len) {
+            trace_usb_ax88772_error("tx-overflow", 3, p->pid, p->iov.size,
+                                   s->tx_len, sizeof(s->tx_buf));
             s->tx_len = 0;
+            s->tx_padding = false;
             p->status = USB_RET_STALL;
             return;
         }
         usb_packet_copy(p, s->tx_buf + s->tx_len, p->iov.size);
         s->tx_len += p->iov.size;
         while (s->tx_len >= 4) {
-            unsigned len = lduw_le_p(s->tx_buf);
-            unsigned inverse = lduw_le_p(s->tx_buf + 2);
-            unsigned framed = 4 + len;
+            unsigned len, inverse, framed;
+
+            /*
+             * Windows aligns odd-length frames to two bytes, including when
+             * aggregating frames. Other drivers send an unpadded frame.
+             * Only skip the optional byte if a valid header follows it;
+             * retain this state when a USB packet splits that header.
+             */
+            if (s->tx_padding && !ax_tx_header_valid(s->tx_buf)) {
+                if (s->tx_len < 5) {
+                    break;
+                }
+                if (ax_tx_header_valid(s->tx_buf + 1)) {
+                    trace_usb_ax88772_tx_padding(s->tx_len);
+                    s->tx_len--;
+                    memmove(s->tx_buf, s->tx_buf + 1, s->tx_len);
+                }
+            }
+            s->tx_padding = false;
+            len = lduw_le_p(s->tx_buf);
+            inverse = lduw_le_p(s->tx_buf + 2);
+            framed = 4 + len;
             if ((len ^ inverse) != 0xffff || len > AX_MAX_FRAME) {
+                trace_usb_ax88772_error("tx-header", 3, p->pid, p->iov.size,
+                                       len, inverse);
                 s->tx_len = 0;
+                s->tx_padding = false;
                 p->status = USB_RET_STALL;
                 return;
             }
@@ -432,11 +500,15 @@ static void ax_data(USBDevice *dev, USBPacket *p)
             }
             s->tx_len -= framed;
             memmove(s->tx_buf, s->tx_buf + framed, s->tx_len);
+            s->tx_padding = len & 1;
         }
         if (p->iov.size % max_packet || !p->iov.size) {
             s->tx_len = 0;
+            s->tx_padding = false;
         }
     } else {
+        trace_usb_ax88772_error("endpoint", p->ep->nr, p->pid,
+                               p->iov.size, s->rx_pos, s->tx_len);
         p->status = USB_RET_STALL;
     }
 }

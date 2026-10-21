@@ -365,6 +365,9 @@ usb_serial_set_xonxoff(int bus, int addr, uint8_t xon, uint8_t xoff) "dev %d:%u 
 # dev-ax88772.c
 usb_ax88772_control(int request, int value, int index, int length) "request 0x%04x value 0x%04x index 0x%04x length %d"
 usb_ax88772_packet(bool transmit, size_t length) "tx %d length %zu"
+usb_ax88772_state(const char *event, int64_t time_ms, bool link, unsigned rx_ctl, unsigned medium, unsigned reset, unsigned rx_len, unsigned rx_pos, unsigned tx_len) "%s at %" PRId64 " ms link %d rxctl 0x%04x medium 0x%04x reset 0x%02x rx %u/%u tx %u"
+usb_ax88772_error(const char *reason, unsigned endpoint, int request, size_t bytes, unsigned first, unsigned second) "%s ep %u request 0x%x bytes %zu first 0x%x second 0x%x"
+usb_ax88772_tx_padding(unsigned buffered) "buffered %u"
 
 # canokey.c
 canokey_emu_stall_ep(uint8_t ep) "ep %d"
