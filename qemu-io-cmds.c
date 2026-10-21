@@ -392,7 +392,7 @@ static void *qemu_io_alloc_from_file(BlockBackend *blk, size_t len,
 {
     size_t alloc_len = len + (qemuio_misalign ? MISALIGN_OFFSET : 0);
     char *alloc_buf, *buf, *end;
-    FILE *f = fopen(file_name, "r");
+    FILE *f = fopen(file_name, "rb");
     int pattern_len;
 
     if (!f) {
