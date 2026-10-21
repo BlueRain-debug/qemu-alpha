@@ -2933,6 +2933,42 @@ static void create_winrt_devices(const VirtMachineState *vms)
         }
     }
 
+    if (vms->winrt_omap_timer) {
+        static const hwaddr bases[] = {
+            0x4a318000, 0x48032000, 0x48034000, 0x48036000,
+            0x4a307000, 0x4a009000,
+        };
+        DeviceState *timer = qdev_new("omap4-dmtimer");
+        SysBusDevice *busdev = SYS_BUS_DEVICE(timer);
+        MachineState *ms = MACHINE(vms);
+
+        sysbus_realize_and_unref(busdev, &error_fatal);
+        for (unsigned i = 0; i < ARRAY_SIZE(bases); i++) {
+            char *node = g_strdup_printf("/reserved-memory/omap-timer@%"
+                                         HWADDR_PRIx, bases[i]);
+
+            sysbus_mmio_map_overlap(busdev, i, bases[i], 1);
+            if (i == 0) {
+                qemu_fdt_setprop(ms->fdt, "/", "qemu,winrt-omap-timer",
+                                 NULL, 0);
+                qemu_fdt_add_subnode(ms->fdt, "/reserved-memory");
+                qemu_fdt_setprop_cell(ms->fdt, "/reserved-memory",
+                                      "#address-cells", 2);
+                qemu_fdt_setprop_cell(ms->fdt, "/reserved-memory",
+                                      "#size-cells", 2);
+                qemu_fdt_setprop(ms->fdt, "/reserved-memory", "ranges",
+                                 NULL, 0);
+            }
+            qemu_fdt_add_subnode(ms->fdt, node);
+            qemu_fdt_setprop_cells(ms->fdt, node, "reg",
+                                  0, bases[i], 0, 0x1000);
+            g_free(node);
+        }
+        for (unsigned i = 0; i < 4; i++) {
+            sysbus_connect_irq(busdev, i, qdev_get_gpio_in(vms->gic, 37 + i));
+        }
+    }
+
     if (vms->winrt_sp804) {
         DeviceState *timer = qdev_new("sp804");
 
@@ -3000,6 +3036,25 @@ static void machvirt_init(MachineState *machine)
     if (vms->winrt_qfprom_probe && !vms->winrt) {
         error_report("winrt-qfprom-probe requires winrt=on");
         exit(1);
+    }
+
+    if (vms->winrt_omap_timer) {
+        if (!vms->winrt || vms->winrt_sp804 || vms->winrt_qcom_timer ||
+            vms->winrt_tegra_timer) {
+            error_report("winrt-omap-timer requires winrt=on and all other "
+                         "WinRT timer modes disabled");
+            exit(1);
+        }
+        /* The fixed OMAP GSIVs 69-72 overlap the default virtio range. */
+        memcpy(vms->winrt_tegra_irqmap, a15irqmap, sizeof(a15irqmap));
+        vms->winrt_tegra_irqmap[VIRT_MMIO] = 80;
+        vms->irqmap = vms->winrt_tegra_irqmap;
+        if (vms->msi_controller == VIRT_MSI_CTRL_AUTO) {
+            vms->msi_controller = VIRT_MSI_CTRL_NONE;
+        } else if (vms->msi_controller != VIRT_MSI_CTRL_NONE) {
+            error_report("winrt-omap-timer requires msi=none");
+            exit(1);
+        }
     }
 
     if (vms->winrt_qcom_timer &&
@@ -3463,6 +3518,16 @@ static bool virt_get_winrt_qcom_timer(Object *obj, Error **errp)
 static void virt_set_winrt_qcom_timer(Object *obj, bool value, Error **errp)
 {
     VIRT_MACHINE(obj)->winrt_qcom_timer = value;
+}
+
+static bool virt_get_winrt_omap_timer(Object *obj, Error **errp)
+{
+    return VIRT_MACHINE(obj)->winrt_omap_timer;
+}
+
+static void virt_set_winrt_omap_timer(Object *obj, bool value, Error **errp)
+{
+    VIRT_MACHINE(obj)->winrt_omap_timer = value;
 }
 
 static void virt_set_winrt_tegra_timer(Object *obj, bool value, Error **errp)
@@ -4469,6 +4534,12 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
                                    virt_set_winrt_qcom_timer);
     object_class_property_set_description(oc, "winrt-qcom-timer",
         "Expose experimental Qualcomm GPT/DGT timers for Windows ARM");
+    object_class_property_add_bool(oc, "winrt-omap-timer",
+                                   virt_get_winrt_omap_timer,
+                                   virt_set_winrt_omap_timer);
+    object_class_property_set_description(oc, "winrt-omap-timer",
+        "Expose experimental OMAP4 timers (requires matching firmware "
+        "RAM reservations)");
     object_class_property_set_description(oc, "winrt-tegra-timer",
         "Expose fixed-address Tegra timer/RTC interfaces (requires matching "
         "WinRT firmware RAM reservations)");

@@ -175,6 +175,14 @@ static void acpi_dsdt_add_winrt(Aml *scope, VirtMachineState *vms)
         aml_append(scope, dev);
     }
 
+    if (vms->winrt_omap_timer) {
+        Aml *dev = aml_device("OMT0");
+
+        /* The HAL owns the fixed timer resources through CSRT. */
+        aml_append(dev, aml_name_decl("_HID", aml_string("TXNW0001")));
+        aml_append(scope, dev);
+    }
+
     for (i = 0; i < ARRAY_SIZE(devices); i++) {
         int id = devices[i].id;
         uint32_t irq = vms->irqmap[id] + ARM_SPI_BASE;
@@ -1009,6 +1017,32 @@ static void build_winrt_tegra_csrt(GArray *table_data, BIOSLinker *linker,
     acpi_table_end(linker, &table);
 }
 
+static void build_winrt_omap_csrt(GArray *table_data, BIOSLinker *linker,
+                                VirtMachineState *vms)
+{
+    AcpiTable table = { .sig = "CSRT", .rev = 0, .oem_id = vms->oem_id,
+                        .oem_table_id = vms->oem_table_id };
+    /* Later HALs also expose timer 1 as a counter alongside the four timers. */
+    static const uint32_t uids[] = { 1, 2, 3, 4, 0x101 };
+
+    acpi_table_begin(&table, table_data);
+    build_append_int_noprefix(table_data, 24 + ARRAY_SIZE(uids) * 12, 4);
+    build_append_int_noprefix(table_data, 0x574e5854, 4); /* TXNW */
+    build_append_int_noprefix(table_data, 0, 4);
+    build_append_int_noprefix(table_data, 1, 2);
+    build_append_int_noprefix(table_data, 0, 2);
+    build_append_int_noprefix(table_data, 0, 2);
+    build_append_int_noprefix(table_data, 0, 2);
+    build_append_int_noprefix(table_data, 0, 4);
+    for (unsigned i = 0; i < ARRAY_SIZE(uids); i++) {
+        build_append_int_noprefix(table_data, 12, 4);
+        build_append_int_noprefix(table_data, 2, 2);
+        build_append_int_noprefix(table_data, 0, 2);
+        build_append_int_noprefix(table_data, uids[i], 4);
+    }
+    acpi_table_end(linker, &table);
+}
+
 /*
  * ACPI spec, Revision 6.5
  * 5.2.25 Generic Timer Description Table (GTDT)
@@ -1548,6 +1582,8 @@ void virt_acpi_build(VirtMachineState *vms, AcpiBuildTables *tables)
     acpi_add_table(table_offsets, tables_blob);
     if (vms->winrt_sp804) {
         build_winrt_csrt(tables_blob, tables->linker, vms);
+    } else if (vms->winrt_omap_timer) {
+        build_winrt_omap_csrt(tables_blob, tables->linker, vms);
     } else if (vms->winrt_qcom_timer) {
         build_winrt_qcom_csrt(tables_blob, tables->linker, vms);
     } else if (vms->winrt_tegra_timer) {

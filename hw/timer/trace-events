@@ -1,5 +1,11 @@
 # See docs/devel/tracing.rst for syntax documentation.
 
+# omap-dmtimer.c
+omap_dmtimer_write(unsigned channel, uint64_t offset, uint32_t value) "channel %u offset 0x%" PRIx64 " value 0x%x"
+omap_dmtimer_clock(unsigned bank, uint64_t offset, uint32_t value) "bank %u offset 0x%" PRIx64 " value 0x%x"
+omap_dmtimer_expire(unsigned channel, uint32_t status, uint32_t enable) "channel %u status 0x%x enable 0x%x"
+omap_dmtimer_compare(unsigned channel, uint32_t count, uint32_t match, uint32_t status) "channel %u count 0x%x match 0x%x status 0x%x"
+
 # slavio_timer.c
 slavio_timer_get_out(uint64_t limit, uint32_t counthigh, uint32_t count) "limit 0x%"PRIx64" count 0x%x0x%08x"
 slavio_timer_irq(uint32_t counthigh, uint32_t count) "callback: count 0x%x0x%08x"

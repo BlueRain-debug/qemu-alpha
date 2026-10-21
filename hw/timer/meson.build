@@ -38,3 +38,4 @@ system_ss.add(when: 'CONFIG_AVR_TIMER16', if_true: files('avr_timer16.c'))
 
 system_ss.add(when: 'CONFIG_HEX_QTIMER', if_true: files('qct-qtimer.c'))
 system_ss.add(when: 'CONFIG_QCOM_GPT', if_true: files('qcom-gpt.c'))
+system_ss.add(when: 'CONFIG_OMAP4_DMTIMER', if_true: files('omap-dmtimer.c'))

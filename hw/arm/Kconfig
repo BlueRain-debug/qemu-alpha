@@ -42,6 +42,7 @@ config ARM_VIRT
     select ARM_TIMER
     select TEGRA20_TIMER
     select QCOM_GPT
+    select OMAP4_DMTIMER
     select UNIMP
 
 config CUBIEBOARD

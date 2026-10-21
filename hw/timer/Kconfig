@@ -74,3 +74,6 @@ config HEX_QTIMER
 
 config QCOM_GPT
     bool
+
+config OMAP4_DMTIMER
+    bool
