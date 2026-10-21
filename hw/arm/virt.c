@@ -2921,6 +2921,18 @@ static void create_winrt_devices(const VirtMachineState *vms)
     sysbus_connect_irq(sbd, 0,
                       qdev_get_gpio_in(vms->gic, vms->irqmap[VIRT_SDHCI]));
 
+    if (vms->winrt_qcom_timer) {
+        DeviceState *timer = qdev_new("qcom-gpt");
+        SysBusDevice *busdev = SYS_BUS_DEVICE(timer);
+
+        sysbus_realize_and_unref(busdev, &error_fatal);
+        sysbus_mmio_map(busdev, 0, vms->memmap[VIRT_WINRT_TIMER].base);
+        for (unsigned i = 0; i < 2; i++) {
+            sysbus_connect_irq(busdev, i, qdev_get_gpio_in(vms->gic,
+                                    vms->irqmap[VIRT_WINRT_TIMER] + i));
+        }
+    }
+
     if (vms->winrt_sp804) {
         DeviceState *timer = qdev_new("sp804");
 
@@ -2987,6 +2999,13 @@ static void machvirt_init(MachineState *machine)
 
     if (vms->winrt_qfprom_probe && !vms->winrt) {
         error_report("winrt-qfprom-probe requires winrt=on");
+        exit(1);
+    }
+
+    if (vms->winrt_qcom_timer &&
+        (!vms->winrt || vms->winrt_sp804 || vms->winrt_tegra_timer)) {
+        error_report("winrt-qcom-timer requires winrt=on, winrt-sp804=off "
+                     "and winrt-tegra-timer=off");
         exit(1);
     }
 
@@ -3434,6 +3453,16 @@ static void virt_set_winrt_sp804(Object *obj, bool value, Error **errp)
 static bool virt_get_winrt_tegra_timer(Object *obj, Error **errp)
 {
     return VIRT_MACHINE(obj)->winrt_tegra_timer;
+}
+
+static bool virt_get_winrt_qcom_timer(Object *obj, Error **errp)
+{
+    return VIRT_MACHINE(obj)->winrt_qcom_timer;
+}
+
+static void virt_set_winrt_qcom_timer(Object *obj, bool value, Error **errp)
+{
+    VIRT_MACHINE(obj)->winrt_qcom_timer = value;
 }
 
 static void virt_set_winrt_tegra_timer(Object *obj, bool value, Error **errp)
@@ -4435,6 +4464,11 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_bool(oc, "winrt-tegra-timer",
                                    virt_get_winrt_tegra_timer,
                                    virt_set_winrt_tegra_timer);
+    object_class_property_add_bool(oc, "winrt-qcom-timer",
+                                   virt_get_winrt_qcom_timer,
+                                   virt_set_winrt_qcom_timer);
+    object_class_property_set_description(oc, "winrt-qcom-timer",
+        "Expose experimental Qualcomm GPT/DGT timers for Windows ARM");
     object_class_property_set_description(oc, "winrt-tegra-timer",
         "Expose fixed-address Tegra timer/RTC interfaces (requires matching "
         "WinRT firmware RAM reservations)");

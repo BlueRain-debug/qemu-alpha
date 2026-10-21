@@ -168,6 +168,13 @@ static void acpi_dsdt_add_winrt(Aml *scope, VirtMachineState *vms)
         aml_append(scope, dev);
     }
 
+    if (vms->winrt_qcom_timer) {
+        Aml *dev = aml_device("QGT0");
+
+        aml_append(dev, aml_name_decl("_HID", aml_string("QCOM1001")));
+        aml_append(scope, dev);
+    }
+
     for (i = 0; i < ARRAY_SIZE(devices); i++) {
         int id = devices[i].id;
         uint32_t irq = vms->irqmap[id] + ARM_SPI_BASE;
@@ -939,6 +946,42 @@ static void build_winrt_csrt(GArray *table_data, BIOSLinker *linker,
     acpi_table_end(linker, &table);
 }
 
+static void build_winrt_qcom_csrt(GArray *table_data, BIOSLinker *linker,
+                                 VirtMachineState *vms)
+{
+    AcpiTable table = { .sig = "CSRT", .rev = 0, .oem_id = vms->oem_id,
+                        .oem_table_id = vms->oem_table_id };
+
+    acpi_table_begin(&table, table_data);
+    build_append_int_noprefix(table_data, 48 + 2 * 28, 4);
+    build_append_int_noprefix(table_data, 0x4d4f4351, 4); /* QCOM */
+    build_append_int_noprefix(table_data, 0, 4);
+    build_append_int_noprefix(table_data, 0x1001, 2);
+    build_append_int_noprefix(table_data, 0, 2);
+    build_append_int_noprefix(table_data, 0, 2);
+    build_append_int_noprefix(table_data, 0, 2);
+    build_append_int_noprefix(table_data, 24, 4);
+    /* Qualcomm shared mapping information. */
+    build_append_int_noprefix(table_data, 1, 4);
+    build_append_int_noprefix(table_data, 0, 4);
+    build_append_int_noprefix(table_data, 0x1000, 4);
+    build_append_int_noprefix(table_data, 0, 4);
+    build_append_int_noprefix(table_data,
+                             vms->memmap[VIRT_WINRT_TIMER].base, 8);
+    for (unsigned i = 0; i < 2; i++) {
+        build_append_int_noprefix(table_data, 28, 4);
+        build_append_int_noprefix(table_data, 2, 2);
+        build_append_int_noprefix(table_data, 0, 2);
+        build_append_int_noprefix(table_data, i, 4);
+        build_append_int_noprefix(table_data, i + 1, 4); /* GPT / DGT */
+        build_append_int_noprefix(table_data, i ? 9 : 0, 4); /* Word offset */
+        build_append_int_noprefix(table_data, i ? 6750000 : 32768, 4);
+        build_append_int_noprefix(table_data,
+                    vms->irqmap[VIRT_WINRT_TIMER] + ARM_SPI_BASE + i, 4);
+    }
+    acpi_table_end(linker, &table);
+}
+
 /* Match the fixed resource UIDs registered by the Tegra HAL. */
 static void build_winrt_tegra_csrt(GArray *table_data, BIOSLinker *linker,
                                   VirtMachineState *vms)
@@ -1505,6 +1548,8 @@ void virt_acpi_build(VirtMachineState *vms, AcpiBuildTables *tables)
     acpi_add_table(table_offsets, tables_blob);
     if (vms->winrt_sp804) {
         build_winrt_csrt(tables_blob, tables->linker, vms);
+    } else if (vms->winrt_qcom_timer) {
+        build_winrt_qcom_csrt(tables_blob, tables->linker, vms);
     } else if (vms->winrt_tegra_timer) {
         /* The Tegra HAL has its own counter and always-on RTC. Do not
          * also register the architecture counter through GTDT/EGIT. */
