@@ -43,6 +43,14 @@ struct USBHIDState {
     uint32_t usb_version;
     char *display;
     uint32_t head;
+    bool touchscreen;
+    USBDesc touch_desc[2];
+    USBDescDevice touch_device[2];
+    USBDescConfig touch_config[2];
+    USBDescIface touch_iface[2];
+    USBDescOther touch_other[2];
+    USBDescEndpoint touch_ep[2];
+    uint8_t touch_hid_desc[9];
 };
 
 #define TYPE_USB_HID "usb-hid"
@@ -60,6 +68,9 @@ enum {
     STR_SERIAL_MOUSE,
     STR_SERIAL_TABLET,
     STR_SERIAL_KEYBOARD,
+    STR_PRODUCT_TOUCHSCREEN,
+    STR_CONFIG_TOUCHSCREEN,
+    STR_SERIAL_TOUCHSCREEN,
 };
 
 static const USBDescStrings desc_strings = {
@@ -74,6 +85,9 @@ static const USBDescStrings desc_strings = {
     [STR_SERIAL_MOUSE]     = "89126",
     [STR_SERIAL_TABLET]    = "28754",
     [STR_SERIAL_KEYBOARD]  = "68284",
+    [STR_PRODUCT_TOUCHSCREEN] = "QEMU USB Touchscreen",
+    [STR_CONFIG_TOUCHSCREEN] = "HID Touchscreen",
+    [STR_SERIAL_TOUCHSCREEN] = "28755",
 };
 
 static const USBDescIface desc_iface_mouse = {
@@ -523,6 +537,38 @@ static const uint8_t qemu_tablet_hid_report_descriptor[] = {
     0xc0,		/* End Collection */
 };
 
+/* Single-contact digitizer. The host pointer's left button is the tip switch. */
+static const uint8_t qemu_touch_hid_report_descriptor[] = {
+    0x05, 0x0d,             /* Usage Page (Digitizers) */
+    0x09, 0x04,             /* Usage (Touch Screen) */
+    0xa1, 0x01,             /* Collection (Application) */
+    0x85, 0x01,             /*   Report ID (Touch) */
+    0x09, 0x22,             /*   Usage (Finger) */
+    0xa1, 0x02,             /*   Collection (Logical) */
+    0x09, 0x42,             /*     Usage (Tip Switch) */
+    0x09, 0x32,             /*     Usage (In Range) */
+    0x09, 0x47,             /*     Usage (Confidence) */
+    0x15, 0x00, 0x25, 0x01,
+    0x75, 0x01, 0x95, 0x03, 0x81, 0x02,
+    0x75, 0x05, 0x95, 0x01, 0x81, 0x03, /* padding */
+    0x09, 0x51,             /*     Usage (Contact Identifier) */
+    0x75, 0x08, 0x25, 0x00, 0x81, 0x02,
+    0x05, 0x01,             /*     Usage Page (Generic Desktop) */
+    0x09, 0x30, 0x09, 0x31, /*     Usage (X), Usage (Y) */
+    0x26, 0xff, 0x7f,       /*     Logical Maximum (32767) */
+    0x35, 0x00, 0x46, 0xff, 0x7f,
+    0x75, 0x10, 0x95, 0x02, 0x81, 0x02,
+    0xc0,                   /*   End Finger */
+    0x05, 0x0d, 0x09, 0x54, /*   Usage (Contact Count) */
+    0x25, 0x01, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02,
+    0x09, 0x56,             /*   Usage (Scan Time), units of 100 us */
+    0x27, 0xff, 0xff, 0x00, 0x00,
+    0x75, 0x10, 0x81, 0x02,
+    0x85, 0x02, 0x09, 0x55, /*   Feature: Contact Count Maximum */
+    0x25, 0x01, 0x75, 0x08, 0xb1, 0x02,
+    0xc0,
+};
+
 static const uint8_t qemu_keyboard_hid_report_descriptor[] = {
     0x05, 0x01,		/* Usage Page (Generic Desktop) */
     0x09, 0x06,		/* Usage (Keyboard) */
@@ -572,6 +618,30 @@ static void usb_hid_handle_reset(USBDevice *dev)
     hid_reset(&us->hid);
 }
 
+static int usb_hid_pointer_poll(USBHIDState *us, uint8_t *data, int length)
+{
+    uint8_t pointer[6], report[10];
+    uint16_t scan_time;
+
+    if (!us->touchscreen) {
+        return hid_pointer_poll(&us->hid, data, length);
+    }
+    if (length < sizeof(report)) {
+        return 0;
+    }
+    hid_pointer_poll(&us->hid, pointer, sizeof(pointer));
+    report[0] = 1;
+    report[1] = (pointer[0] & 1) ? 7 : 4;
+    report[2] = 0;
+    memcpy(report + 3, pointer + 1, 4);
+    report[7] = 1; /* Include the contact's tip-up report as well. */
+    scan_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 100000;
+    report[8] = scan_time;
+    report[9] = scan_time >> 8;
+    memcpy(data, report, sizeof(report));
+    return sizeof(report);
+}
+
 static void usb_hid_handle_control(USBDevice *dev, USBPacket *p,
                int request, int value, int index, int length, uint8_t *data)
 {
@@ -593,6 +663,10 @@ static void usb_hid_handle_control(USBDevice *dev, USBPacket *p,
                 memcpy(data, qemu_mouse_hid_report_descriptor,
                        sizeof(qemu_mouse_hid_report_descriptor));
                 p->actual_length = sizeof(qemu_mouse_hid_report_descriptor);
+            } else if (us->touchscreen) {
+                memcpy(data, qemu_touch_hid_report_descriptor,
+                       sizeof(qemu_touch_hid_report_descriptor));
+                p->actual_length = sizeof(qemu_touch_hid_report_descriptor);
             } else if (hs->kind == HID_TABLET) {
                 memcpy(data, qemu_tablet_hid_report_descriptor,
                        sizeof(qemu_tablet_hid_report_descriptor));
@@ -608,8 +682,14 @@ static void usb_hid_handle_control(USBDevice *dev, USBPacket *p,
         }
         break;
     case HID_GET_REPORT:
+        if (us->touchscreen && value == 0x302) {
+            data[0] = 2;
+            data[1] = 1;
+            p->actual_length = MIN(length, 2);
+            break;
+        }
         if (hs->kind == HID_MOUSE || hs->kind == HID_TABLET) {
-            p->actual_length = hid_pointer_poll(hs, data, length);
+            p->actual_length = usb_hid_pointer_poll(us, data, length);
         } else if (hs->kind == HID_KEYBOARD) {
             p->actual_length = hid_keyboard_poll(hs, data, length);
         }
@@ -671,7 +751,7 @@ static void usb_hid_handle_data(USBDevice *dev, USBPacket *p)
             }
             hid_set_next_idle(hs);
             if (hs->kind == HID_MOUSE || hs->kind == HID_TABLET) {
-                len = hid_pointer_poll(hs, buf, p->iov.size);
+                len = usb_hid_pointer_poll(us, buf, p->iov.size);
             } else if (hs->kind == HID_KEYBOARD) {
                 len = hid_keyboard_poll(hs, buf, p->iov.size);
             }
@@ -727,7 +807,42 @@ static void usb_hid_initfn(USBDevice *dev, int kind,
 
 static void usb_tablet_realize(USBDevice *dev, Error **errp)
 {
+    USBHIDState *us = USB_HID(dev);
 
+    if (us->touchscreen) {
+        const USBDescDevice *devices[] = {
+            &desc_device_tablet, &desc_device_tablet2,
+        };
+
+        memcpy(us->touch_hid_desc, desc_iface_tablet.descs[0].data, 9);
+        us->touch_hid_desc[2] = 0x11;
+        us->touch_hid_desc[3] = 0x01; /* HID 1.11 */
+        us->touch_hid_desc[7] = sizeof(qemu_touch_hid_report_descriptor);
+        us->touch_hid_desc[8] = sizeof(qemu_touch_hid_report_descriptor) >> 8;
+        for (unsigned i = 0; i < 2; i++) {
+            us->touch_device[i] = *devices[i];
+            us->touch_config[i] = devices[i]->confs[0];
+            us->touch_iface[i] = devices[i]->confs[0].ifs[0];
+            us->touch_other[i] = us->touch_iface[i].descs[0];
+            us->touch_ep[i] = us->touch_iface[i].eps[0];
+            us->touch_ep[i].wMaxPacketSize = 16;
+            us->touch_other[i].data = us->touch_hid_desc;
+            us->touch_iface[i].descs = &us->touch_other[i];
+            us->touch_iface[i].eps = &us->touch_ep[i];
+            us->touch_config[i].ifs = &us->touch_iface[i];
+            us->touch_config[i].iConfiguration = STR_CONFIG_TOUCHSCREEN;
+            us->touch_device[i].confs = &us->touch_config[i];
+            us->touch_desc[i] = i ? desc_tablet2 : desc_tablet;
+            us->touch_desc[i].full = &us->touch_device[0];
+            us->touch_desc[i].id.idProduct = 0x0002;
+            us->touch_desc[i].id.iProduct = STR_PRODUCT_TOUCHSCREEN;
+            us->touch_desc[i].id.iSerialNumber = STR_SERIAL_TOUCHSCREEN;
+        }
+        us->touch_desc[1].high = &us->touch_device[1];
+        usb_hid_initfn(dev, HID_TABLET, &us->touch_desc[0],
+                       &us->touch_desc[1], errp);
+        return;
+    }
     usb_hid_initfn(dev, HID_TABLET, &desc_tablet, &desc_tablet2, errp);
 }
 
@@ -794,6 +909,7 @@ static const TypeInfo usb_hid_type_info = {
 };
 
 static const Property usb_tablet_properties[] = {
+        DEFINE_PROP_BOOL("touchscreen", USBHIDState, touchscreen, false),
         DEFINE_PROP_UINT32("usb_version", USBHIDState, usb_version, 2),
         DEFINE_PROP_STRING("display", USBHIDState, display),
         DEFINE_PROP_UINT32("head", USBHIDState, head, 0),
