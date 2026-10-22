@@ -168,6 +168,13 @@ static void acpi_dsdt_add_winrt(Aml *scope, VirtMachineState *vms)
         aml_append(scope, dev);
     }
 
+    if (vms->winrt_omap_dma) {
+        Aml *dev = aml_device("OMD0");
+
+        aml_append(dev, aml_name_decl("_HID", aml_string("ap4.0003")));
+        aml_append(scope, dev);
+    }
+
     if (vms->winrt_qcom_timer) {
         Aml *dev = aml_device("QGT0");
 
@@ -1017,6 +1024,25 @@ static void build_winrt_tegra_csrt(GArray *table_data, BIOSLinker *linker,
     acpi_table_end(linker, &table);
 }
 
+static void build_winrt_omap_dma_group(GArray *table_data)
+{
+    /* Legacy DMA HAL: one controller and 32 logical channels. */
+    build_append_int_noprefix(table_data, 24 + 33 * 12, 4);
+    build_append_int_noprefix(table_data, 0x2e347061, 4); /* ap4. */
+    build_append_int_noprefix(table_data, 0, 4);
+    build_append_int_noprefix(table_data, 3, 2);
+    build_append_int_noprefix(table_data, 0, 2);
+    build_append_int_noprefix(table_data, 0, 2);
+    build_append_int_noprefix(table_data, 0, 2);
+    build_append_int_noprefix(table_data, 0, 4);
+    for (unsigned i = 0; i < 33; i++) {
+        build_append_int_noprefix(table_data, 12, 4);
+        build_append_int_noprefix(table_data, 3, 2);
+        build_append_int_noprefix(table_data, i == 0 ? 1 : 0, 2);
+        build_append_int_noprefix(table_data, i == 0 ? 0 : BIT(31) | i, 4);
+    }
+}
+
 static void build_winrt_omap_csrt(GArray *table_data, BIOSLinker *linker,
                                 VirtMachineState *vms)
 {
@@ -1039,6 +1065,9 @@ static void build_winrt_omap_csrt(GArray *table_data, BIOSLinker *linker,
         build_append_int_noprefix(table_data, 2, 2);
         build_append_int_noprefix(table_data, 0, 2);
         build_append_int_noprefix(table_data, uids[i], 4);
+    }
+    if (vms->winrt_omap_dma) {
+        build_winrt_omap_dma_group(table_data);
     }
     acpi_table_end(linker, &table);
 }

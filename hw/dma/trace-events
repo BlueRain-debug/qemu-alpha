@@ -1,5 +1,10 @@
 # See docs/devel/tracing.rst for syntax documentation.
 
+# omap4-dma.c
+omap4_dma_read(uint64_t offset, uint32_t value) "offset 0x%" PRIx64 " value 0x%x"
+omap4_dma_write(uint64_t offset, uint32_t value) "offset 0x%" PRIx64 " value 0x%x"
+omap4_dma_complete(unsigned channel, uint32_t status) "channel %u status 0x%x"
+
 # rc4030.c
 jazzio_read(uint64_t addr, uint32_t ret) "read reg[0x%"PRIx64"] = 0x%x"
 jazzio_write(uint64_t addr, uint32_t val) "write reg[0x%"PRIx64"] = 0x%x"

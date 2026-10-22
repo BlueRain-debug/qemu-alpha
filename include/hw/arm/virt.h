@@ -175,6 +175,7 @@ struct VirtMachineState {
     bool winrt_tegra_timer;
     bool winrt_qcom_timer;
     bool winrt_omap_timer;
+    bool winrt_omap_dma;
     bool winrt_qfprom_probe;
     bool winrt_pci;
     int winrt_tegra_irqmap[VIRT_LOWMEMMAP_LAST];

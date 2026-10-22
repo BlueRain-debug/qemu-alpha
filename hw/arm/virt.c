@@ -56,6 +56,7 @@
 #include "qemu/cutils.h"
 #include "qemu/error-report.h"
 #include "qemu/module.h"
+#include "qemu/main-loop.h"
 #include "hw/pci/pci_bus.h"
 #include "hw/pci-host/gpex.h"
 #include "hw/pci-bridge/pci_expander_bridge.h"
@@ -2889,6 +2890,42 @@ static void virt_post_cpus_gic_realized(VirtMachineState *vms,
 }
 
 /* Platform devices used by the Windows RT drivers, based on GH Cao's port. */
+static bool winrt_omap_smc(ARMCPU *cpu)
+{
+    CPUARMState *env = &cpu->env;
+    hwaddr offset;
+    uint8_t data[4];
+
+    if (is_a64(env)) {
+        return false;
+    }
+    /* TI's OMAP4 monitor ABI passes the service in r12 and its value in r0. */
+    switch (env->regs[12]) {
+    case 0x100:
+        offset = 0xf40; /* PL310 debug control */
+        break;
+    case 0x102:
+        offset = 0x100; /* PL310 control */
+        break;
+    case 0x109:
+        offset = 0x104; /* PL310 auxiliary control */
+        break;
+    case 0x113:
+        offset = 0xf60; /* PL310 prefetch control */
+        break;
+    default:
+        return false;
+    }
+
+    BQL_LOCK_GUARD();
+    stl_le_p(data, env->regs[0]);
+    env->regs[0] = address_space_write(cpu_get_address_space(CPU(cpu), 0),
+                                      0x48242000 + offset,
+                                      MEMTXATTRS_UNSPECIFIED,
+                                      data, sizeof(data)) == MEMTX_OK ? 0 : 1;
+    return true;
+}
+
 static void create_winrt_devices(const VirtMachineState *vms)
 {
     DeviceState *dev, *card;
@@ -2967,6 +3004,29 @@ static void create_winrt_devices(const VirtMachineState *vms)
         for (unsigned i = 0; i < 4; i++) {
             sysbus_connect_irq(busdev, i, qdev_get_gpio_in(vms->gic, 37 + i));
         }
+        if (vms->winrt_omap_dma) {
+            DeviceState *dma = qdev_new("omap4-dma");
+            SysBusDevice *dmabus = SYS_BUS_DEVICE(dma);
+            const char *node = "/reserved-memory/omap-dma@4a056000";
+
+            sysbus_realize_and_unref(dmabus, &error_fatal);
+            sysbus_mmio_map_overlap(dmabus, 0, 0x4a056000, 1);
+            sysbus_connect_irq(dmabus, 0, qdev_get_gpio_in(vms->gic, 12));
+            qemu_fdt_setprop(ms->fdt, "/", "qemu,winrt-omap-dma", NULL, 0);
+            qemu_fdt_add_subnode(ms->fdt, node);
+            qemu_fdt_setprop_cells(ms->fdt, node, "reg",
+                                  0, 0x4a056000, 0, 0x1000);
+
+            DeviceState *l2 = qdev_new("l2x0");
+            SysBusDevice *l2bus = SYS_BUS_DEVICE(l2);
+
+            sysbus_realize_and_unref(l2bus, &error_fatal);
+            sysbus_mmio_map_overlap(l2bus, 0, 0x48242000, 1);
+            node = "/reserved-memory/omap-l2@48242000";
+            qemu_fdt_add_subnode(ms->fdt, node);
+            qemu_fdt_setprop_cells(ms->fdt, node, "reg",
+                                  0, 0x48242000, 0, 0x1000);
+        }
     }
 
     if (vms->winrt_sp804) {
@@ -3038,6 +3098,11 @@ static void machvirt_init(MachineState *machine)
         exit(1);
     }
 
+    if (vms->winrt_omap_dma && !vms->winrt_omap_timer) {
+        error_report("winrt-omap-dma requires winrt-omap-timer=on");
+        exit(1);
+    }
+
     if (vms->winrt_omap_timer) {
         if (!vms->winrt || vms->winrt_sp804 || vms->winrt_qcom_timer ||
             vms->winrt_tegra_timer) {
@@ -3048,6 +3113,10 @@ static void machvirt_init(MachineState *machine)
         /* The fixed OMAP GSIVs 69-72 overlap the default virtio range. */
         memcpy(vms->winrt_tegra_irqmap, a15irqmap, sizeof(a15irqmap));
         vms->winrt_tegra_irqmap[VIRT_MMIO] = 80;
+        if (vms->winrt_omap_dma) {
+            /* The legacy OMAP DMA HAL owns fixed GSIV 44 (SPI 12). */
+            vms->winrt_tegra_irqmap[VIRT_SDHCI] = 41;
+        }
         vms->irqmap = vms->winrt_tegra_irqmap;
         if (vms->msi_controller == VIRT_MSI_CTRL_AUTO) {
             vms->msi_controller = VIRT_MSI_CTRL_NONE;
@@ -3266,6 +3335,9 @@ static void machvirt_init(MachineState *machine)
             }
             /* Windows RT probes the AArch32 Security Extensions. */
             object_property_set_bool(cpuobj, "has_el3", true, &error_fatal);
+            if (vms->winrt_omap_dma) {
+                ARM_CPU(cpuobj)->firmware_smc = winrt_omap_smc;
+            }
         } else if (!vms->secure) {
             object_property_set_bool(cpuobj, "has_el3", false, NULL);
         }
@@ -3523,6 +3595,16 @@ static void virt_set_winrt_qcom_timer(Object *obj, bool value, Error **errp)
 static bool virt_get_winrt_omap_timer(Object *obj, Error **errp)
 {
     return VIRT_MACHINE(obj)->winrt_omap_timer;
+}
+
+static bool virt_get_winrt_omap_dma(Object *obj, Error **errp)
+{
+    return VIRT_MACHINE(obj)->winrt_omap_dma;
+}
+
+static void virt_set_winrt_omap_dma(Object *obj, bool value, Error **errp)
+{
+    VIRT_MACHINE(obj)->winrt_omap_dma = value;
 }
 
 static void virt_set_winrt_omap_timer(Object *obj, bool value, Error **errp)
@@ -4540,6 +4622,12 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "winrt-omap-timer",
         "Expose experimental OMAP4 timers (requires matching firmware "
         "RAM reservations)");
+    object_class_property_add_bool(oc, "winrt-omap-dma",
+                                   virt_get_winrt_omap_dma,
+                                   virt_set_winrt_omap_dma);
+    object_class_property_set_description(oc, "winrt-omap-dma",
+        "Expose experimental OMAP4 DMA for the legacy Windows ARM HAL "
+        "(requires winrt-omap-timer and matching firmware)");
     object_class_property_set_description(oc, "winrt-tegra-timer",
         "Expose fixed-address Tegra timer/RTC interfaces (requires matching "
         "WinRT firmware RAM reservations)");

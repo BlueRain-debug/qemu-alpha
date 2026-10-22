@@ -1047,6 +1047,9 @@ struct ArchCPU {
      */
     uint32_t psci_conduit;
 
+    /* Optional board firmware service for an architecturally valid SMC. */
+    bool (*firmware_smc)(ARMCPU *cpu);
+
     /* For v8M, initial value of the Secure VTOR */
     uint32_t init_svtor;
     /* For v8M, initial value of the Non-secure VTOR */
