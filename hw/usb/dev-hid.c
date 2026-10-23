@@ -45,6 +45,7 @@ struct USBHIDState {
     char *display;
     uint32_t head;
     bool touchscreen;
+    bool windows_phone;
     uint16_t touch_width_mm;
     uint16_t touch_height_mm;
     uint16_t touch_x_max;
@@ -702,6 +703,19 @@ static void usb_hid_handle_control(USBDevice *dev, USBPacket *p,
             } else if (hs->kind == HID_KEYBOARD) {
                 memcpy(data, qemu_keyboard_hid_report_descriptor,
                        sizeof(qemu_keyboard_hid_report_descriptor));
+                if (us->windows_phone) {
+                    /* Native phone KbdClassWP binds Generic Desktop/0xee. */
+                    data[3] = 0xee;
+                    /* 0xf0..0xf4 select a custom layout in that driver. */
+                    for (size_t i = 0;
+                         i + 1 < sizeof(qemu_keyboard_hid_report_descriptor);
+                         i++) {
+                        if ((data[i] == 0x25 || data[i] == 0x29) &&
+                            data[i + 1] == 0xff) {
+                            data[i + 1] = 0xe7;
+                        }
+                    }
+                }
                 p->actual_length = sizeof(qemu_keyboard_hid_report_descriptor);
             }
             break;
@@ -995,6 +1009,7 @@ static const TypeInfo usb_mouse_info = {
 };
 
 static const Property usb_keyboard_properties[] = {
+        DEFINE_PROP_BOOL("windows-phone", USBHIDState, windows_phone, false),
         DEFINE_PROP_UINT32("usb_version", USBHIDState, usb_version, 2),
         DEFINE_PROP_STRING("display", USBHIDState, display),
 };
