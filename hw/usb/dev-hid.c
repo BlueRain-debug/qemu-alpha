@@ -24,6 +24,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/bswap.h"
 #include "ui/console.h"
 #include "hw/usb/usb.h"
 #include "migration/vmstate.h"
@@ -44,6 +45,10 @@ struct USBHIDState {
     char *display;
     uint32_t head;
     bool touchscreen;
+    uint16_t touch_width_mm;
+    uint16_t touch_height_mm;
+    uint16_t touch_x_max;
+    uint16_t touch_y_max;
     USBDesc touch_desc[2];
     USBDescDevice touch_device[2];
     USBDescConfig touch_config[2];
@@ -538,36 +543,56 @@ static const uint8_t qemu_tablet_hid_report_descriptor[] = {
 };
 
 /* Single-contact digitizer. The host pointer's left button is the tip switch. */
-static const uint8_t qemu_touch_hid_report_descriptor[] = {
-    0x05, 0x0d,             /* Usage Page (Digitizers) */
-    0x09, 0x04,             /* Usage (Touch Screen) */
-    0xa1, 0x01,             /* Collection (Application) */
-    0x85, 0x01,             /*   Report ID (Touch) */
-    0x09, 0x22,             /*   Usage (Finger) */
-    0xa1, 0x02,             /*   Collection (Logical) */
-    0x09, 0x42,             /*     Usage (Tip Switch) */
-    0x09, 0x32,             /*     Usage (In Range) */
-    0x09, 0x47,             /*     Usage (Confidence) */
-    0x15, 0x00, 0x25, 0x01,
-    0x75, 0x01, 0x95, 0x03, 0x81, 0x02,
-    0x75, 0x05, 0x95, 0x01, 0x81, 0x03, /* padding */
-    0x09, 0x51,             /*     Usage (Contact Identifier) */
-    0x75, 0x08, 0x25, 0x00, 0x81, 0x02,
-    0x05, 0x01,             /*     Usage Page (Generic Desktop) */
-    0x09, 0x30, 0x09, 0x31, /*     Usage (X), Usage (Y) */
-    0x26, 0xff, 0x7f,       /*     Logical Maximum (32767) */
-    0x35, 0x00, 0x46, 0xff, 0x7f,
-    0x75, 0x10, 0x95, 0x02, 0x81, 0x02,
-    0xc0,                   /*   End Finger */
-    0x05, 0x0d, 0x09, 0x54, /*   Usage (Contact Count) */
-    0x25, 0x01, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02,
-    0x09, 0x56,             /*   Usage (Scan Time), units of 100 us */
-    0x27, 0xff, 0xff, 0x00, 0x00,
-    0x75, 0x10, 0x81, 0x02,
-    0x85, 0x02, 0x09, 0x55, /*   Feature: Contact Count Maximum */
-    0x25, 0x01, 0x75, 0x08, 0xb1, 0x02,
-    0xc0,
-};
+static size_t usb_hid_touch_report_descriptor(USBHIDState *us, uint8_t *data)
+{
+    const uint8_t descriptor[] = {
+        0x05, 0x0d,             /* Usage Page (Digitizers) */
+        0x09, 0x04,             /* Usage (Touch Screen) */
+        0xa1, 0x01,             /* Collection (Application) */
+        0x85, 0x01,             /*   Report ID (Touch) */
+        0x09, 0x22,             /*   Usage (Finger) */
+        0xa1, 0x02,             /*   Collection (Logical) */
+        0x09, 0x42,             /*     Usage (Tip Switch) */
+        0x09, 0x32,             /*     Usage (In Range) */
+        0x09, 0x47,             /*     Usage (Confidence) */
+        0x15, 0x00, 0x25, 0x01,
+        0x75, 0x01, 0x95, 0x03, 0x81, 0x02,
+        0x75, 0x05, 0x95, 0x01, 0x81, 0x03, /* padding */
+        0x09, 0x51,             /*     Usage (Contact Identifier) */
+        0x75, 0x08, 0x26, 0xff, 0x00, 0x81, 0x02,
+        0x05, 0x01,             /*     Usage Page (Generic Desktop) */
+        0x09, 0x30,             /*     Usage (X) */
+        0x26, us->touch_x_max, us->touch_x_max >> 8,
+        0x35, 0x00,             /*     Physical Minimum (0) */
+        0x55, 0x0f, 0x65, 0x11, /*     Unit: centimetres, exponent -1 (mm) */
+        0x46, us->touch_width_mm, us->touch_width_mm >> 8,
+        0x75, 0x10, 0x95, 0x01, 0x81, 0x02,
+        0x09, 0x31,             /*     Usage (Y) */
+        0x26, us->touch_y_max, us->touch_y_max >> 8,
+        0x46, us->touch_height_mm, us->touch_height_mm >> 8,
+        0x81, 0x02,
+        0xc0,                   /*   End Finger */
+        0x65, 0x00, 0x55, 0x00, /*   Unit: None, exponent 0 */
+        0x35, 0x00, 0x45, 0x00, /*   Unspecified physical range */
+        0x05, 0x0d, 0x09, 0x54, /*   Usage (Contact Count) */
+        0x25, 0x01, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02,
+        0x09, 0x56,             /*   Usage (Scan Time), units of 100 us */
+        0x55, 0x0c, 0x66, 0x01, 0x10, /* Unit: seconds, exponent -4 */
+        0x47, 0xff, 0xff, 0x00, 0x00,
+        0x27, 0xff, 0xff, 0x00, 0x00,
+        0x75, 0x10, 0x81, 0x02,
+        0x85, 0x02, 0x09, 0x55, /*   Feature: Contact Count Maximum */
+        0x65, 0x00, 0x55, 0x00,
+        0x35, 0x00, 0x45, 0x00,
+        0x25, 0x01, 0x75, 0x08, 0xb1, 0x02,
+        0xc0,
+    };
+
+    if (data) {
+        memcpy(data, descriptor, sizeof(descriptor));
+    }
+    return sizeof(descriptor);
+}
 
 static const uint8_t qemu_keyboard_hid_report_descriptor[] = {
     0x05, 0x01,		/* Usage Page (Generic Desktop) */
@@ -621,6 +646,7 @@ static void usb_hid_handle_reset(USBDevice *dev)
 static int usb_hid_pointer_poll(USBHIDState *us, uint8_t *data, int length)
 {
     uint8_t pointer[6], report[10];
+    uint32_t x, y;
     uint16_t scan_time;
 
     if (!us->touchscreen) {
@@ -633,7 +659,11 @@ static int usb_hid_pointer_poll(USBHIDState *us, uint8_t *data, int length)
     report[0] = 1;
     report[1] = (pointer[0] & 1) ? 7 : 4;
     report[2] = 0;
-    memcpy(report + 3, pointer + 1, 4);
+    /* Some phone input stacks consume HID coordinates as display pixels. */
+    x = (lduw_le_p(pointer + 1) * (uint32_t)us->touch_x_max + 0x3fff) / 0x7fff;
+    y = (lduw_le_p(pointer + 3) * (uint32_t)us->touch_y_max + 0x3fff) / 0x7fff;
+    stw_le_p(report + 3, x);
+    stw_le_p(report + 5, y);
     report[7] = 1; /* Include the contact's tip-up report as well. */
     scan_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 100000;
     report[8] = scan_time;
@@ -664,9 +694,7 @@ static void usb_hid_handle_control(USBDevice *dev, USBPacket *p,
                        sizeof(qemu_mouse_hid_report_descriptor));
                 p->actual_length = sizeof(qemu_mouse_hid_report_descriptor);
             } else if (us->touchscreen) {
-                memcpy(data, qemu_touch_hid_report_descriptor,
-                       sizeof(qemu_touch_hid_report_descriptor));
-                p->actual_length = sizeof(qemu_touch_hid_report_descriptor);
+                p->actual_length = usb_hid_touch_report_descriptor(us, data);
             } else if (hs->kind == HID_TABLET) {
                 memcpy(data, qemu_tablet_hid_report_descriptor,
                        sizeof(qemu_tablet_hid_report_descriptor));
@@ -813,12 +841,19 @@ static void usb_tablet_realize(USBDevice *dev, Error **errp)
         const USBDescDevice *devices[] = {
             &desc_device_tablet, &desc_device_tablet2,
         };
+        size_t report_len = usb_hid_touch_report_descriptor(us, NULL);
+
+        if (!us->touch_width_mm || !us->touch_height_mm ||
+            !us->touch_x_max || !us->touch_y_max) {
+            error_setg(errp, "Touchscreen dimensions and ranges must be nonzero");
+            return;
+        }
 
         memcpy(us->touch_hid_desc, desc_iface_tablet.descs[0].data, 9);
         us->touch_hid_desc[2] = 0x11;
         us->touch_hid_desc[3] = 0x01; /* HID 1.11 */
-        us->touch_hid_desc[7] = sizeof(qemu_touch_hid_report_descriptor);
-        us->touch_hid_desc[8] = sizeof(qemu_touch_hid_report_descriptor) >> 8;
+        us->touch_hid_desc[7] = report_len;
+        us->touch_hid_desc[8] = report_len >> 8;
         for (unsigned i = 0; i < 2; i++) {
             us->touch_device[i] = *devices[i];
             us->touch_config[i] = devices[i]->confs[0];
@@ -910,6 +945,10 @@ static const TypeInfo usb_hid_type_info = {
 
 static const Property usb_tablet_properties[] = {
         DEFINE_PROP_BOOL("touchscreen", USBHIDState, touchscreen, false),
+        DEFINE_PROP_UINT16("touch-width-mm", USBHIDState, touch_width_mm, 100),
+        DEFINE_PROP_UINT16("touch-height-mm", USBHIDState, touch_height_mm, 100),
+        DEFINE_PROP_UINT16("touch-x-max", USBHIDState, touch_x_max, 32767),
+        DEFINE_PROP_UINT16("touch-y-max", USBHIDState, touch_y_max, 32767),
         DEFINE_PROP_UINT32("usb_version", USBHIDState, usb_version, 2),
         DEFINE_PROP_STRING("display", USBHIDState, display),
         DEFINE_PROP_UINT32("head", USBHIDState, head, 0),
