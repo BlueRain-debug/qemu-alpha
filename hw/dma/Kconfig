@@ -36,3 +36,6 @@ config K230_GSDMA
 
 config OMAP4_DMA
     bool
+
+config TEGRA20_APB_DMA
+    bool

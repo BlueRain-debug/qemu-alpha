@@ -1377,6 +1377,21 @@ static void create_gicv2(VirtMachineState *vms, MemoryRegion *mem)
     sysbus_realize_and_unref(gicbusdev, &error_fatal);
     sysbus_mmio_map(gicbusdev, 0, vms->memmap[VIRT_GIC_DIST].base);
     sysbus_mmio_map(gicbusdev, 1, vms->memmap[VIRT_GIC_CPU].base);
+    if (vms->winrt_tegra2) {
+        /* Keep the firmware/ACPI view and the native HAL view on one GIC. */
+        memory_region_init_alias(&vms->winrt_tegra2_gic_dist_alias, OBJECT(vms),
+                                 "winrt-tegra2-gic-dist",
+                                 sysbus_mmio_get_region(gicbusdev, 0),
+                                 0, 0x1000);
+        memory_region_add_subregion(mem, 0x50041000,
+                                    &vms->winrt_tegra2_gic_dist_alias);
+        memory_region_init_alias(&vms->winrt_tegra2_gic_cpu_alias, OBJECT(vms),
+                                 "winrt-tegra2-gic-cpu",
+                                 sysbus_mmio_get_region(gicbusdev, 1),
+                                 0, 0x100);
+        memory_region_add_subregion(mem, 0x50040100,
+                                    &vms->winrt_tegra2_gic_cpu_alias);
+    }
     if (vms->virt) {
         sysbus_mmio_map(gicbusdev, 2, vms->memmap[VIRT_GIC_HYP].base);
         sysbus_mmio_map(gicbusdev, 3, vms->memmap[VIRT_GIC_VCPU].base);
@@ -2550,6 +2565,10 @@ static void virt_set_memmap(VirtMachineState *vms, int pa_bits)
         vms->memmap[i] = base_memmap[i];
     }
 
+    if (vms->winrt_legacy_ram) {
+        vms->memmap[VIRT_MEM].base = 2 * GiB;
+    }
+
     if (ms->ram_slots > ACPI_MAX_RAM_SLOTS) {
         error_report("unsupported number of memory slots: %"PRIu64,
                      ms->ram_slots);
@@ -2945,6 +2964,14 @@ static void create_winrt_devices(const VirtMachineState *vms)
         create_unimplemented_device("winrt-qfprom-probe", base, 0x10000);
     }
 
+    if (vms->winrt_tegra2) {
+        /* The native HAL initializes USB3's UTMI PHY before enumerating USB. */
+        sysbus_create_simple(TYPE_TEGRA2_EHCI, 0xc5008000,
+                             qdev_get_gpio_in(vms->gic, 97));
+        sysbus_create_simple("tegra20-apb-dma", 0x6000a000, NULL);
+    }
+
+    /* Default USB peripherals use the last-created, firmware-visible bus. */
     sysbus_create_simple(TYPE_PLATFORM_EHCI, vms->memmap[VIRT_EHCI].base,
                          qdev_get_gpio_in(vms->gic, vms->irqmap[VIRT_EHCI]));
 
@@ -3093,6 +3120,21 @@ static void machvirt_init(MachineState *machine)
 
     possible_cpus = mc->possible_cpu_arch_ids(machine);
 
+    if (vms->winrt_tegra2 &&
+        (!vms->winrt_legacy_ram || !vms->winrt_tegra_timer ||
+         vms->gic_version != VIRT_GIC_VERSION_2)) {
+        error_report("winrt-tegra2 requires winrt-legacy-ram=on "
+                     "winrt-tegra-timer=on and gic-version=2");
+        exit(1);
+    }
+
+    if (vms->winrt_legacy_ram &&
+        (!vms->winrt || vms->highmem || machine->maxram_size > GiB)) {
+        error_report("winrt-legacy-ram requires winrt=on, highmem=off "
+                     "and at most 1 GiB RAM");
+        exit(1);
+    }
+
     if (vms->winrt_qfprom_probe && !vms->winrt) {
         error_report("winrt-qfprom-probe requires winrt=on");
         exit(1);
@@ -3150,6 +3192,10 @@ static void machvirt_init(MachineState *machine)
         vms->winrt_tegra_irqmap[VIRT_RTC] = 15;
         vms->winrt_tegra_irqmap[VIRT_MMIO] = 80;
         vms->irqmap = vms->winrt_tegra_irqmap;
+        if (vms->winrt_tegra2) {
+            /* Keep the native USB3 SPI 97 out of the virtio transport range. */
+            vms->winrt_tegra_irqmap[VIRT_MMIO] = 160;
+        }
         if (vms->msi_controller == VIRT_MSI_CTRL_AUTO) {
             vms->msi_controller = VIRT_MSI_CTRL_NONE;
         } else if (vms->msi_controller != VIRT_MSI_CTRL_NONE) {
@@ -3580,6 +3626,26 @@ static void virt_set_winrt_sp804(Object *obj, bool value, Error **errp)
 static bool virt_get_winrt_tegra_timer(Object *obj, Error **errp)
 {
     return VIRT_MACHINE(obj)->winrt_tegra_timer;
+}
+
+static bool virt_get_winrt_legacy_ram(Object *obj, Error **errp)
+{
+    return VIRT_MACHINE(obj)->winrt_legacy_ram;
+}
+
+static void virt_set_winrt_legacy_ram(Object *obj, bool value, Error **errp)
+{
+    VIRT_MACHINE(obj)->winrt_legacy_ram = value;
+}
+
+static bool virt_get_winrt_tegra2(Object *obj, Error **errp)
+{
+    return VIRT_MACHINE(obj)->winrt_tegra2;
+}
+
+static void virt_set_winrt_tegra2(Object *obj, bool value, Error **errp)
+{
+    VIRT_MACHINE(obj)->winrt_tegra2 = value;
 }
 
 static bool virt_get_winrt_qcom_timer(Object *obj, Error **errp)
@@ -4633,6 +4699,18 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
         "WinRT firmware RAM reservations)");
     object_class_property_add_bool(oc, "winrt", virt_get_winrt,
                                    virt_set_winrt);
+    object_class_property_add_bool(oc, "winrt-legacy-ram",
+                                   virt_get_winrt_legacy_ram,
+                                   virt_set_winrt_legacy_ram);
+    object_class_property_set_description(oc, "winrt-legacy-ram",
+        "Place RAM at 0x80000000 for early Windows ARM linear mappings "
+        "(requires matching firmware, winrt=on, highmem=off and RAM <= 1 GiB)");
+    object_class_property_add_bool(oc, "winrt-tegra2",
+                                   virt_get_winrt_tegra2,
+                                   virt_set_winrt_tegra2);
+    object_class_property_set_description(oc, "winrt-tegra2",
+        "Expose experimental Tegra2 HAL peripherals "
+        "(requires winrt-legacy-ram=on, winrt-tegra-timer=on and gic-version=2)");
     object_class_property_add_bool(oc, "winrt-qfprom-probe",
                                    virt_get_winrt_qfprom_probe,
                                    virt_set_winrt_qfprom_probe);

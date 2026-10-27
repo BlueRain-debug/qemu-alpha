@@ -20,6 +20,36 @@
 #include "hw/usb/hcd-ehci.h"
 #include "migration/vmstate.h"
 
+#define TEGRA2_PHY_BASE          0x400
+#define TEGRA2_PHY_REGS          (0xc00 / sizeof(uint32_t))
+#define TEGRA2_PHY_CLK_VALID     BIT(7)
+#define TEGRA2_UTMIP_RESET       BIT(11)
+#define TEGRA2_UTMIP_ENABLE      BIT(12)
+
+OBJECT_DECLARE_SIMPLE_TYPE(Tegra2EHCIState, TEGRA2_EHCI)
+
+struct Tegra2EHCIState {
+    EHCISysBusState parent_obj;
+    MemoryRegion phy;
+    uint32_t phy_regs[TEGRA2_PHY_REGS];
+};
+
+static bool tegra2_phy_needed(void *opaque)
+{
+    return object_dynamic_cast(OBJECT(opaque), TYPE_TEGRA2_EHCI) != NULL;
+}
+
+static const VMStateDescription vmstate_tegra2_phy = {
+    .name = "ehci-sysbus/tegra2-phy",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = tegra2_phy_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_ARRAY(phy_regs, Tegra2EHCIState, TEGRA2_PHY_REGS),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_ehci_sysbus = {
     .name        = "ehci-sysbus",
     .version_id  = 2,
@@ -27,7 +57,11 @@ static const VMStateDescription vmstate_ehci_sysbus = {
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT(ehci, EHCISysBusState, 2, vmstate_ehci, EHCIState),
         VMSTATE_END_OF_LIST()
-    }
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_tegra2_phy,
+        NULL
+    },
 };
 
 static const Property ehci_sysbus_properties[] = {
@@ -137,6 +171,59 @@ static void ehci_npcm7xx_class_init(ObjectClass *oc, const void *data)
     set_bit(DEVICE_CATEGORY_USB, dc->categories);
 }
 
+static uint64_t tegra2_phy_read(void *opaque, hwaddr addr, unsigned size)
+{
+    Tegra2EHCIState *s = opaque;
+    uint32_t value = s->phy_regs[addr / sizeof(uint32_t)];
+
+    if (addr == 0 && (value & TEGRA2_UTMIP_ENABLE) &&
+        !(value & TEGRA2_UTMIP_RESET)) {
+        /* The virtual PHY's fixed clock settles immediately after reset. */
+        value |= TEGRA2_PHY_CLK_VALID;
+    }
+    return value;
+}
+
+static void tegra2_phy_write(void *opaque, hwaddr addr, uint64_t value,
+                            unsigned size)
+{
+    Tegra2EHCIState *s = opaque;
+
+    if (addr == 0) {
+        /* USB_PHY_CLK_VALID is a read-only status bit in USB_SUSP_CTRL. */
+        value &= ~TEGRA2_PHY_CLK_VALID;
+    }
+    s->phy_regs[addr / sizeof(uint32_t)] = value;
+}
+
+static const MemoryRegionOps tegra2_phy_ops = {
+    .read = tegra2_phy_read,
+    .write = tegra2_phy_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+};
+
+static void ehci_tegra2_reset(DeviceState *dev)
+{
+    Tegra2EHCIState *s = TEGRA2_EHCI(dev);
+
+    usb_ehci_sysbus_reset(dev);
+    memset(s->phy_regs, 0, sizeof(s->phy_regs));
+    s->phy_regs[0] = TEGRA2_UTMIP_ENABLE | TEGRA2_UTMIP_RESET;
+}
+
+static void ehci_tegra2_init(Object *obj)
+{
+    Tegra2EHCIState *s = TEGRA2_EHCI(obj);
+
+    /* UTMI control/tuning registers share the EHCI register window. */
+    memory_region_init_io(&s->phy, obj, &tegra2_phy_ops, s,
+                          "tegra2-usb-phy", 0xc00);
+    memory_region_add_subregion(&s->parent_obj.ehci.mem, TEGRA2_PHY_BASE,
+                                &s->phy);
+}
+
 static void ehci_tegra2_class_init(ObjectClass *oc, const void *data)
 {
     SysBusEHCIClass *sec = SYS_BUS_EHCI_CLASS(oc);
@@ -144,6 +231,7 @@ static void ehci_tegra2_class_init(ObjectClass *oc, const void *data)
 
     sec->capsbase = 0x100;
     sec->opregbase = 0x140;
+    device_class_set_legacy_reset(dc, ehci_tegra2_reset);
     set_bit(DEVICE_CATEGORY_USB, dc->categories);
 }
 
@@ -266,6 +354,8 @@ static const TypeInfo ehci_sysbus_types[] = {
     {
         .name          = TYPE_TEGRA2_EHCI,
         .parent        = TYPE_SYS_BUS_EHCI,
+        .instance_size = sizeof(Tegra2EHCIState),
+        .instance_init = ehci_tegra2_init,
         .class_init    = ehci_tegra2_class_init,
     },
     {

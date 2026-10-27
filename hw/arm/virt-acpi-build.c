@@ -202,7 +202,15 @@ static void acpi_dsdt_add_winrt(Aml *scope, VirtMachineState *vms)
         dev = aml_device("%s", devices[i].name);
         crs = aml_resource_template();
 
-        aml_append(dev, aml_name_decl("_HID", aml_string("%s", devices[i].hid)));
+        if (vms->winrt_tegra2 && (id == VIRT_EHCI || id == VIRT_SDHCI)) {
+            /* Early boot-critical bindings use these draft hardware IDs. */
+            aml_append(dev, aml_name_decl("_HID", aml_string("%s",
+                                         id == VIRT_EHCI ? "NVD_USBEHCI" :
+                                                          "NVD_SDBUS")));
+        } else {
+            aml_append(dev, aml_name_decl("_HID",
+                                         aml_string("%s", devices[i].hid)));
+        }
         aml_append(dev, aml_name_decl("_CID", aml_string("%s", devices[i].hid)));
         aml_append(dev, aml_name_decl("_UID", aml_int(0)));
         aml_append(crs, aml_memory32_fixed(vms->memmap[id].base,

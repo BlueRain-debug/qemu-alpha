@@ -170,6 +170,10 @@ struct VirtMachineState {
     PFlashCFI01 *flash[2];
     bool secure;
     bool winrt;
+    bool winrt_legacy_ram;
+    bool winrt_tegra2;
+    MemoryRegion winrt_tegra2_gic_dist_alias;
+    MemoryRegion winrt_tegra2_gic_cpu_alias;
     bool winrt_sdhci_dma;
     bool winrt_sp804;
     bool winrt_tegra_timer;
