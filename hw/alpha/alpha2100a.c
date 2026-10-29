@@ -94,6 +94,7 @@ struct Alpha2100AMachine {
     uint64_t mem_size_strap;
     bool mem_uncorrectable;
     PCIBus *pci_bus;
+    PCIDevice *pceb;
     bool s3_928;
     char *s3_romfile;
     AddressSpace io_as, mem_as, dma_as;
@@ -1308,12 +1309,22 @@ static const MemoryRegionOps lynx_conf_ops = {
     .valid.min_access_size = 4, .valid.max_access_size = 8,
 };
 
+static void lynx_pceb_reset(PCIDevice *dev)
+{
+    /* The PCEB enables all three address paths out of reset. */
+    pci_set_word(dev->config + PCI_COMMAND, PCI_COMMAND_IO |
+                 PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+    pci_set_word(dev->config + PCI_STATUS, PCI_STATUS_DEVSEL_MEDIUM);
+}
+
 static void lynx_reset(MachineState *machine, ResetType type)
 {
     Alpha2100AMachine *s = ALPHA2100A_MACHINE(machine);
     uint8_t scratch[SRM_BASE] = { 0 };
 
     qemu_devices_reset(type);
+    /* PCI bus reset clears COMMAND first; restore the PCEB's defaults. */
+    lynx_pceb_reset(s->pceb);
     s->pit2_elapsed_ns = 0;
     memset(s->dma_count_high, 0, sizeof(s->dma_count_high));
     for (unsigned controller = 0; controller < 2; controller++) {
@@ -1510,7 +1521,10 @@ static void lynx_init(MachineState *machine)
     pci_bridge_map_irq(PCI_BRIDGE(bridge), "pci.1", lynx_secondary_map_irq);
     pci_realize_and_unref(bridge, s->pci_bus, &error_fatal);
     pci_bus_irqs(&PCI_BRIDGE(bridge)->sec_bus, lynx_pci_set_irq, s, 64);
-    isa = isa_bus_new(NULL, &s->isa_mem, &s->isa_io, &error_fatal);
+    /* Lynx's onboard PCI-EISA bridge is at primary IDSEL2. */
+    s->pceb = pci_create_simple(s->pci_bus, PCI_DEVFN(2, 0),
+                                "alpha2100a-i82375");
+    isa = isa_bus_new(DEVICE(s->pceb), &s->isa_mem, &s->isa_io, &error_fatal);
     s->pic_irqs = i8259_init(isa, NULL);
     irqs = qemu_allocate_irqs(lynx_isa_irq, s, 16);
     isa_bus_register_input_irqs(isa, irqs);
@@ -1720,6 +1734,46 @@ static const TypeInfo lynx_host_type = {
     .parent = TYPE_PCI_HOST_BRIDGE,
 };
 
+/* The PCEB's PCI presence is required for NT5 to enumerate the legacy bus.
+ * The existing board-local ESC devices still supply its ISA/EISA services.
+ * PCI header reset values were cross-checked against 86Box
+ * src/chipset/intel_pceb_esc.c:
+ * Copyright 2026 Michael Pratte.
+ * This does not implement the PCEB's programmable address-decode windows.
+ */
+static void lynx_pceb_realize(PCIDevice *dev, Error **errp)
+{
+    lynx_pceb_reset(dev);
+    /* These PCI 2.x subsystem fields are reserved on the PCI 1.0 PCEB. */
+    pci_set_word(dev->config + PCI_SUBSYSTEM_VENDOR_ID, 0);
+    pci_set_word(dev->config + PCI_SUBSYSTEM_ID, 0);
+}
+
+static void lynx_pceb_class_init(ObjectClass *oc, const void *data)
+{
+    PCIDeviceClass *pc = PCI_DEVICE_CLASS(oc);
+
+    pc->realize = lynx_pceb_realize;
+    pc->vendor_id = PCI_VENDOR_ID_INTEL;
+    pc->device_id = 0x0482;
+    pc->revision = 0x04;
+    /* The PCI 1.0 82375EB reserves the class-code bytes as zero. */
+    pc->class_id = 0;
+    DEVICE_CLASS(oc)->desc = "Alpha2100A Intel 82375EB PCI-EISA bridge";
+    DEVICE_CLASS(oc)->user_creatable = false;
+    DEVICE_CLASS(oc)->hotpluggable = false;
+}
+
+static const TypeInfo lynx_pceb_type = {
+    .name = "alpha2100a-i82375",
+    .parent = TYPE_PCI_DEVICE,
+    .class_init = lynx_pceb_class_init,
+    .interfaces = (const InterfaceInfo[]) {
+        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+        { }
+    },
+};
+
 static void lynx_register(void)
 {
     type_register_static(&lynx_iommu_type);
@@ -1727,6 +1781,7 @@ static void lynx_register(void)
     type_register_static(&lynx_cirrus_type);
     type_register_static(&lynx_host_type);
     type_register_static(&lynx_bridge_type);
+    type_register_static(&lynx_pceb_type);
     type_register_static(&lynx_type);
 }
 type_init(lynx_register)
