@@ -1229,6 +1229,20 @@ void define_pm_cpregs(ARMCPU *cpu)
         define_one_arm_cp_reg(cpu, &pmcr);
         define_one_arm_cp_reg(cpu, &pmcr64);
         define_arm_cp_regs(cpu, v7_pm_reginfo);
+        /* PMCEID0/1 are available with ARMv7 PMUs as well as ARMv8 PMUs. */
+        const ARMCPRegInfo pmceid_regs[] = {
+            { .name = "PMCEID0", .state = ARM_CP_STATE_AA32,
+              .cp = 15, .opc1 = 0, .crn = 9, .crm = 12, .opc2 = 6,
+              .access = PL0_R, .accessfn = pmreg_access, .type = ARM_CP_CONST,
+              .fgt = FGT_PMCEIDN_EL0,
+              .resetvalue = extract64(cpu->pmceid0, 0, 32) },
+            { .name = "PMCEID1", .state = ARM_CP_STATE_AA32,
+              .cp = 15, .opc1 = 0, .crn = 9, .crm = 12, .opc2 = 7,
+              .access = PL0_R, .accessfn = pmreg_access, .type = ARM_CP_CONST,
+              .fgt = FGT_PMCEIDN_EL0,
+              .resetvalue = extract64(cpu->pmceid1, 0, 32) },
+        };
+        define_arm_cp_regs(cpu, pmceid_regs);
         /*
          * 32-bit AArch32 PMCCNTR. We don't expose this to GDB if the
          * new-in-v8 PMUv3 64-bit AArch32 PMCCNTR register is implemented
@@ -1291,21 +1305,11 @@ void define_pm_cpregs(ARMCPU *cpu)
 
     if (arm_feature(env, ARM_FEATURE_V8)) {
         const ARMCPRegInfo v8_pm_reginfo[] = {
-            { .name = "PMCEID0", .state = ARM_CP_STATE_AA32,
-              .cp = 15, .opc1 = 0, .crn = 9, .crm = 12, .opc2 = 6,
-              .access = PL0_R, .accessfn = pmreg_access, .type = ARM_CP_CONST,
-              .fgt = FGT_PMCEIDN_EL0,
-              .resetvalue = extract64(cpu->pmceid0, 0, 32) },
             { .name = "PMCEID0_EL0", .state = ARM_CP_STATE_AA64,
               .opc0 = 3, .opc1 = 3, .crn = 9, .crm = 12, .opc2 = 6,
               .access = PL0_R, .accessfn = pmreg_access, .type = ARM_CP_CONST,
               .fgt = FGT_PMCEIDN_EL0,
               .resetvalue = cpu->pmceid0 },
-            { .name = "PMCEID1", .state = ARM_CP_STATE_AA32,
-              .cp = 15, .opc1 = 0, .crn = 9, .crm = 12, .opc2 = 7,
-              .access = PL0_R, .accessfn = pmreg_access, .type = ARM_CP_CONST,
-              .fgt = FGT_PMCEIDN_EL0,
-              .resetvalue = extract64(cpu->pmceid1, 0, 32) },
             { .name = "PMCEID1_EL0", .state = ARM_CP_STATE_AA64,
               .opc0 = 3, .opc1 = 3, .crn = 9, .crm = 12, .opc2 = 7,
               .access = PL0_R, .accessfn = pmreg_access, .type = ARM_CP_CONST,
