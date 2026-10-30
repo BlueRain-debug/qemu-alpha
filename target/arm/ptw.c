@@ -1131,6 +1131,81 @@ static int simple_ap_to_rw_prot(CPUARMState *env, ARMMMUIdx mmu_idx, int ap)
     return simple_ap_to_rw_prot_is_user(ap, regime_is_user(mmu_idx));
 }
 
+static ARMCacheAttrs short_desc_cacheattrs(CPUARMState *env, ARMMMUIdx mmu_idx,
+                                          unsigned texcb, bool shareable,
+                                          bool remap)
+{
+    /* Short-descriptor Normal memory policies, converted to MAIR format. */
+    static const uint8_t normal_attrs[] = { 0x4, 0xf, 0xa, 0xe };
+    ARMCacheAttrs attrs = { .is_s2_format = false };
+    bool inner_shareable = arm_feature(env, ARM_FEATURE_V7MP);
+
+    if (remap) {
+        uint32_t prrr = regime_el(mmu_idx) == 1 ? env->cp15.mair0_ns
+                                               : env->cp15.mair0_s;
+        uint32_t nmrr = regime_el(mmu_idx) == 1 ? env->cp15.mair1_ns
+                                               : env->cp15.mair1_s;
+        unsigned index = texcb & 7;
+
+        switch (extract32(prrr, index * 2, 2)) {
+        case 1: /* Device */
+            attrs.attrs = 0x04;
+            attrs.shareability = extract32(prrr, 16 + shareable, 1) ? 2 : 0;
+            return attrs;
+        case 2: /* Normal */
+            attrs.attrs = normal_attrs[extract32(nmrr, index * 2, 2)] |
+                          normal_attrs[extract32(nmrr, 16 + index * 2, 2)] << 4;
+            if (extract32(prrr, 18 + shareable, 1)) {
+                attrs.shareability = extract32(prrr, 24 + index, 1) ? 3 : 2;
+            }
+            return attrs;
+        default: /* Strongly-ordered, or a reserved encoding. */
+            attrs.attrs = 0x00;
+            attrs.shareability = 2;
+            return attrs;
+        }
+    }
+
+    switch (texcb) {
+    case 0: /* Strongly-ordered */
+        attrs.attrs = 0x00;
+        attrs.shareability = 2;
+        return attrs;
+    case 1: /* Shareable Device */
+        attrs.attrs = 0x04;
+        attrs.shareability = 2;
+        return attrs;
+    case 2: /* Normal, Write-Through, no Write-Allocate */
+        attrs.attrs = 0xaa;
+        break;
+    case 3: /* Normal, Write-Back, no Write-Allocate */
+        attrs.attrs = 0xee;
+        break;
+    case 4: /* Normal, Non-cacheable */
+        attrs.attrs = 0x44;
+        break;
+    case 7: /* Normal, Write-Back, Write-Allocate */
+        attrs.attrs = 0xff;
+        break;
+    case 8: /* Non-shareable Device */
+        attrs.attrs = 0x04;
+        return attrs;
+    default:
+        if (texcb & 16) {
+            attrs.attrs = normal_attrs[texcb & 3] |
+                          normal_attrs[extract32(texcb, 2, 2)] << 4;
+        } else {
+            /* Reserved encodings have an arbitrary Strongly-ordered result. */
+            attrs.attrs = 0x00;
+            attrs.shareability = 2;
+            return attrs;
+        }
+        break;
+    }
+    attrs.shareability = shareable ? (inner_shareable ? 3 : 2) : 0;
+    return attrs;
+}
+
 static bool get_phys_addr_v5(CPUARMState *env, S1Translate *ptw,
                              uint32_t address, MMUAccessType access_type,
                              GetPhysAddrResult *result, ARMMMUFaultInfo *fi)
@@ -1247,6 +1322,9 @@ static bool get_phys_addr_v5(CPUARMState *env, S1Translate *ptw,
         goto do_fault;
     }
     result->f.phys_addr = phys_addr;
+    result->cacheattrs = short_desc_cacheattrs(env, ptw->in_mmu_idx,
+                                              extract32(desc, 2, 2), false,
+                                              false);
     return true;
 do_fault:
     fi->domain = domain;
@@ -1271,6 +1349,8 @@ static bool get_phys_addr_v6(CPUARMState *env, S1Translate *ptw,
     int domain_prot;
     hwaddr phys_addr;
     uint32_t dacr;
+    unsigned texcb;
+    bool shareable;
     bool ns;
     ARMSecuritySpace out_space;
 
@@ -1330,6 +1410,8 @@ static bool get_phys_addr_v6(CPUARMState *env, S1Translate *ptw,
         xn = desc & (1 << 4);
         pxn = desc & 1;
         ns = extract32(desc, 19, 1);
+        texcb = (extract32(desc, 12, 3) << 2) | extract32(desc, 2, 2);
+        shareable = extract32(desc, 16, 1);
     } else {
         if (cpu_isar_feature(aa32_pxn, cpu)) {
             pxn = (desc >> 2) & 1;
@@ -1353,16 +1435,19 @@ static bool get_phys_addr_v6(CPUARMState *env, S1Translate *ptw,
             phys_addr = (desc & 0xffff0000) | (address & 0xffff);
             xn = desc & (1 << 15);
             result->f.lg_page_size = 16;
+            texcb = (extract32(desc, 12, 3) << 2) | extract32(desc, 2, 2);
             break;
         case 2: case 3: /* 4k page.  */
             phys_addr = (desc & 0xfffff000) | (address & 0xfff);
             xn = desc & 1;
             result->f.lg_page_size = 12;
+            texcb = (extract32(desc, 6, 3) << 2) | extract32(desc, 2, 2);
             break;
         default:
             /* Never happens, but compiler isn't smart enough to tell.  */
             g_assert_not_reached();
         }
+        shareable = extract32(desc, 10, 1);
     }
     out_space = ptw->cur_space;
     if (ns) {
@@ -1404,6 +1489,9 @@ static bool get_phys_addr_v6(CPUARMState *env, S1Translate *ptw,
     result->f.attrs.space = out_space;
     result->f.attrs.secure = arm_space_is_secure(out_space);
     result->f.phys_addr = phys_addr;
+    result->cacheattrs = short_desc_cacheattrs(env, mmu_idx, texcb, shareable,
+                                              regime_sctlr(env, mmu_idx) &
+                                              SCTLR_TRE);
     return true;
 do_fault:
     fi->domain = domain;

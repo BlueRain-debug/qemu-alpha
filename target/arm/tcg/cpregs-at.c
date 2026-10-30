@@ -24,6 +24,36 @@ static int par_el1_shareability(GetPhysAddrResult *res)
     return res->cacheattrs.shareability;
 }
 
+static uint32_t par32_attrs(CPUARMState *env, GetPhysAddrResult *res)
+{
+    uint8_t attrs = res->cacheattrs.attrs;
+    unsigned inner, outer;
+    unsigned shareability = res->cacheattrs.shareability;
+    uint32_t par;
+
+    if ((attrs & 0xf0) == 0) {
+        /* Strongly-ordered and Device, respectively. Outer is UNKNOWN. */
+        inner = attrs == 0 ? 1 : 3;
+        outer = 0;
+    } else {
+        inner = attrs & 0xf;
+        outer = attrs >> 4;
+        inner = inner == 4 ? 0 : (inner & 4) ? (inner & 1 ? 5 : 7) : 6;
+        outer = outer == 4 ? 0 : (outer & 4) ? (outer & 1 ? 1 : 3) : 2;
+    }
+    if (arm_feature(env, ARM_FEATURE_LPAE)) {
+        shareability = par_el1_shareability(res);
+    }
+    par = (inner << 4) | (outer << 2);
+    if (shareability) {
+        par |= 1 << 7; /* SH */
+    }
+    if (shareability == 3) {
+        par |= 1 << 10; /* NOS */
+    }
+    return par;
+}
+
 static uint64_t do_ats_write(CPUARMState *env, uint64_t value,
                              unsigned prot_check, ARMMMUIdx mmu_idx,
                              ARMSecuritySpace ss)
@@ -171,7 +201,6 @@ static uint64_t do_ats_write(CPUARMState *env, uint64_t value,
          * Convert it to a 32-bit PAR.
          */
         if (ok) {
-            /* We do not set any attribute bits in the PAR */
             if (res.f.lg_page_size == 24
                 && arm_feature(env, ARM_FEATURE_V7)) {
                 par64 = (res.f.phys_addr & 0xff000000) | (1 << 1);
@@ -181,6 +210,7 @@ static uint64_t do_ats_write(CPUARMState *env, uint64_t value,
             if (!res.f.attrs.secure) {
                 par64 |= (1 << 9); /* NS */
             }
+            par64 |= par32_attrs(env, &res);
         } else {
             uint32_t fsr = arm_fi_to_sfsc(&fi);
 
