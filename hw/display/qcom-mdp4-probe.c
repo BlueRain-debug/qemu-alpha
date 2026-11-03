@@ -61,10 +61,15 @@ struct QcomMdp4ProbeState {
     uint32_t me_init[18];
     bool me_initialized;
     bool upload_endian_workaround;
+    bool boot_lcdc;
+    uint32_t boot_width;
+    uint32_t boot_height;
     QEMUTimer *command_timer;
     QEMUTimer *display_timer;
     QemuConsole *console;
-    uint32_t rgb1[24];
+    uint32_t scanout[25];
+    uint32_t scanout_flush;
+    bool scanout_identity_csc;
     uint32_t solid_color;
     bool overlay_pending;
     QcomProbeCommandStream streams[QCOM_CP_MAX_STREAMS];
@@ -139,7 +144,7 @@ struct QcomMdp4ProbeState {
 #define SMMU_TTBR1 0x14
 #define SMMU_TTBCR 0x18
 
-/* MDP4 primary LCD path: RGB1 -> mixer 0 -> DMA_P -> LCDC. */
+/* MDP4 primary LCD path: RGB1 or VIG1 -> mixer 0 -> DMA_P -> LCDC. */
 #define MDP_BANK 0
 #define MDP_SMMU_BANK 9
 #define MDP_IRQ 0
@@ -148,12 +153,30 @@ struct QcomMdp4ProbeState {
 #define MDP_INTR_CLEAR 0x58
 #define MDP_MIXER_CONFIG 0x10100
 #define MDP_OVERLAY_FLUSH 0x18000
+#define MDP_OVERLAY0_SIZE 0x10008
+#define MDP_DMA_P_SIZE 0x90004
+#define MDP_DMA_P_ADDRESS 0x90008
+#define MDP_DMA_P_STRIDE 0x9000c
+#define MDP_VIG1_BASE 0x20000
 #define MDP_RGB1_BASE 0x40000
+#define MDP_VIG1_COLOR 0x21008
 #define MDP_RGB1_COLOR 0x41008
 #define MDP_LCDC_ENABLE 0xc0000
 #define MDP_RGB1_FLUSH (1U << 4)
+#define MDP_VIG1_FLUSH (1U << 2)
 #define MDP_OVERLAY0_FLUSH (1U << 0)
 #define MDP_RGB1_MIXER0_BASE (1U << 8)
+#define MDP_VIG1_MIXER0_BASE 1U
+#define MDP_SCALE_X_ENABLE (1U << 0)
+#define MDP_SCALE_Y_ENABLE (1U << 1)
+#define MDP_CSC_ENABLE (1U << 11)
+#define MDP_SCALE_PHASE_BITS 29
+#define MDP_VIG1_CSC_MATRIX 0x24400
+#define MDP_VIG1_CSC_PRE_BIAS 0x24500
+#define MDP_VIG1_CSC_POST_BIAS 0x24580
+#define MDP_VIG1_CSC_PRE_LIMIT 0x24600
+#define MDP_VIG1_CSC_POST_LIMIT 0x24680
+#define MDP_CSC_UNITY (1U << 9)
 #define MDP_IRQ_OVERLAY0_DONE (1U << 0)
 #define MDP_IRQ_DMA_P_DONE (1U << 4)
 #define MDP_IRQ_PRIMARY_VSYNC (1U << 7)
@@ -287,46 +310,92 @@ static bool qcom_probe_display_read(QcomMdp4ProbeState *s, uint32_t address,
     return true;
 }
 
+static bool qcom_probe_identity_csc(const uint32_t *regs)
+{
+    for (unsigned i = 0; i < 9; i++) {
+        if (regs[MDP_VIG1_CSC_MATRIX / 4 + i] !=
+            (i % 4 == 0 ? MDP_CSC_UNITY : 0)) {
+            return false;
+        }
+    }
+    for (unsigned i = 0; i < 3; i++) {
+        if (regs[MDP_VIG1_CSC_PRE_BIAS / 4 + i] ||
+            regs[MDP_VIG1_CSC_POST_BIAS / 4 + i]) {
+            return false;
+        }
+    }
+    for (unsigned i = 0; i < 6; i++) {
+        if (regs[MDP_VIG1_CSC_PRE_LIMIT / 4 + i] != (i & 1 ? 255 : 0) ||
+            regs[MDP_VIG1_CSC_POST_LIMIT / 4 + i] != (i & 1 ? 255 : 0)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool qcom_probe_display_update(void *opaque)
 {
     QcomMdp4ProbeState *s = opaque;
     uint32_t *regs = s->banks[MDP_BANK].registers;
-    uint32_t format = s->rgb1[0x50 / 4];
-    uint32_t unpack = s->rgb1[0x54 / 4];
-    unsigned width = s->rgb1[0] & 0xffff;
-    unsigned height = s->rgb1[0] >> 16;
-    unsigned stride = s->rgb1[0x40 / 4] & 0xffff;
+    uint32_t format = s->scanout[0x50 / 4];
+    uint32_t unpack = s->scanout[0x54 / 4];
+    uint32_t scale = s->scanout[0x58 / 4];
+    unsigned source_width = s->scanout[0] & 0xffff;
+    unsigned source_height = s->scanout[0] >> 16;
+    unsigned width = s->scanout[2] & 0xffff;
+    unsigned height = s->scanout[2] >> 16;
+    unsigned stride = s->scanout[0x40 / 4] & 0xffff;
+    bool vig = s->scanout_flush == MDP_VIG1_FLUSH;
     bool solid = format & (1U << 22);
     DisplaySurface *surface;
     g_autofree uint8_t *row = NULL;
 
     if (!(regs[MDP_LCDC_ENABLE / 4] & 1) ||
-        (regs[MDP_MIXER_CONFIG / 4] & 0xf00) != MDP_RGB1_MIXER0_BASE ||
+        (vig ? (regs[MDP_MIXER_CONFIG / 4] & 0xf) != MDP_VIG1_MIXER0_BASE :
+         (regs[MDP_MIXER_CONFIG / 4] & 0xf00) != MDP_RGB1_MIXER0_BASE) ||
+        !source_width || !source_height ||
+        source_width > MDP_MAX_DIMENSION || source_height > MDP_MAX_DIMENSION ||
         !width || !height || width > MDP_MAX_DIMENSION ||
-        height > MDP_MAX_DIMENSION || s->rgb1[1] || s->rgb1[3] ||
-        s->rgb1[2] != s->rgb1[0] || s->rgb1[0x58 / 4] ||
+        height > MDP_MAX_DIMENSION || s->scanout[1] || s->scanout[3] ||
+        (vig ? (scale & ~(MDP_SCALE_X_ENABLE | MDP_SCALE_Y_ENABLE |
+                         MDP_CSC_ENABLE)) : scale != 0) ||
+        ((scale & MDP_CSC_ENABLE) && !s->scanout_identity_csc) ||
+        (!(scale & MDP_SCALE_X_ENABLE) && width != source_width) ||
+        (!(scale & MDP_SCALE_Y_ENABLE) && height != source_height) ||
+        ((scale & MDP_SCALE_X_ENABLE) && !s->scanout[0x5c / 4]) ||
+        ((scale & MDP_SCALE_Y_ENABLE) && !s->scanout[0x60 / 4]) ||
         /* Only tightly packed, interleaved 8-bit RGBA is implemented. */
         (format & 0x7e0a67ff) != 0x000267ff ||
-        (!solid && (stride < width * 4 ||
-          (uint64_t)s->rgb1[4] + (uint64_t)stride * height > UINT32_MAX))) {
+        (!solid && (stride < source_width * 4 ||
+          (uint64_t)s->scanout[4] +
+          (uint64_t)stride * source_height > UINT32_MAX))) {
         return false;
     }
     if (!s->console) {
         return false;
     }
-    row = g_malloc(width * 4);
+    row = g_malloc(source_width * 4);
     qemu_console_resize(s->console, width, height);
     surface = qemu_console_surface(s->console);
     for (unsigned y = 0; y < height; y++) {
         uint32_t *destination = (uint32_t *)(surface_data(surface) +
                                              y * surface_stride(surface));
+        /* VIG phase steps are unsigned Q29 source-pixel increments. Use
+         * bounded nearest sampling for this experimental linear RGBA path;
+         * hardware polyphase filtering and nonidentity CSC are unsupported. */
+        unsigned source_y = scale & MDP_SCALE_Y_ENABLE ?
+            MIN((uint64_t)y * s->scanout[0x60 / 4] >> MDP_SCALE_PHASE_BITS,
+                source_height - 1) : y;
 
-        if (!solid && !qcom_probe_display_read(s, s->rgb1[4] + y * stride,
-                                               row, width * 4)) {
+        if (!solid && !qcom_probe_display_read(s,
+                    s->scanout[4] + source_y * stride, row, source_width * 4)) {
             return false;
         }
         for (unsigned x = 0; x < width; x++) {
             uint8_t components[4] = {0};
+            unsigned source_x = scale & MDP_SCALE_X_ENABLE ?
+                MIN((uint64_t)x * s->scanout[0x5c / 4] >> MDP_SCALE_PHASE_BITS,
+                    source_width - 1) : x;
 
             if (solid) {
                 destination[x] = s->solid_color & 0xffffff;
@@ -338,7 +407,7 @@ static bool qcom_probe_display_update(void *opaque)
                 if (selector > 3) {
                     return false;
                 }
-                components[selector] = row[x * 4 + component];
+                components[selector] = row[source_x * 4 + component];
             }
             /* MDP component numbers: 0=G, 1=B, 2=R, 3=A. */
             destination[x] = rgb_to_pixel32(components[2], components[0],
@@ -371,7 +440,8 @@ static void qcom_probe_display_tick(void *opaque)
         /* FLUSH bits remain busy until the supported plane has reached a
          * real frame boundary. The miniport polls these before completing
          * a present. Preserve unsupported bits and pending failed scanout. */
-        regs[MDP_OVERLAY_FLUSH / 4] &= ~(MDP_RGB1_FLUSH | MDP_OVERLAY0_FLUSH);
+        regs[MDP_OVERLAY_FLUSH / 4] &= ~(s->scanout_flush |
+                                        MDP_OVERLAY0_FLUSH);
         /* Model read-pointer progress at frame granularity. The native
          * driver enables RDPTR as well as VSYNC and uses it to schedule
          * subsequent presents. Do not signal either on a failed scanout. */
@@ -932,16 +1002,26 @@ static void qcom_mdp4_probe_write(void *opaque, hwaddr offset, uint64_t value,
         if (offset == MDP_INTR_ENABLE) {
             qcom_probe_update_mdp_irq(s);
         }
-        if (offset == MDP_OVERLAY_FLUSH && (value & MDP_RGB1_FLUSH)) {
-            memcpy(s->rgb1, &bank->registers[MDP_RGB1_BASE / 4], sizeof(s->rgb1));
-            s->solid_color = bank->registers[MDP_RGB1_COLOR / 4];
+        if (offset == MDP_OVERLAY_FLUSH &&
+            (value & (MDP_RGB1_FLUSH | MDP_VIG1_FLUSH))) {
+            bool vig = (value & MDP_VIG1_FLUSH) &&
+                (bank->registers[MDP_MIXER_CONFIG / 4] & 0xf) ==
+                    MDP_VIG1_MIXER0_BASE;
+            unsigned base = vig ? MDP_VIG1_BASE : MDP_RGB1_BASE;
+            unsigned color = vig ? MDP_VIG1_COLOR : MDP_RGB1_COLOR;
+
+            s->scanout_flush = vig ? MDP_VIG1_FLUSH : MDP_RGB1_FLUSH;
+            memcpy(s->scanout, &bank->registers[base / 4], sizeof(s->scanout));
+            s->scanout_identity_csc = vig &&
+                                     qcom_probe_identity_csc(bank->registers);
+            s->solid_color = bank->registers[color / 4];
             if (!s->console) {
                 s->console = qemu_graphic_console_create(DEVICE(s), 0,
                                                           &qcom_probe_display_ops, s);
             }
         }
         if (offset == MDP_OVERLAY_FLUSH &&
-            (value & (MDP_RGB1_FLUSH | MDP_OVERLAY0_FLUSH))) {
+            (value & (MDP_RGB1_FLUSH | MDP_VIG1_FLUSH | MDP_OVERLAY0_FLUSH))) {
             s->overlay_pending = true;
         }
         if (offset == MDP_OVERLAY_FLUSH || offset == MDP_LCDC_ENABLE) {
@@ -989,7 +1069,21 @@ static void qcom_mdp4_probe_reset(DeviceState *dev)
     memset(s->gmem, 0, sizeof(s->gmem));
     timer_del(s->command_timer);
     timer_del(s->display_timer);
-    memset(s->rgb1, 0, sizeof(s->rgb1));
+    memset(s->scanout, 0, sizeof(s->scanout));
+    s->scanout_flush = 0;
+    s->scanout_identity_csc = false;
+    /* Some miniports preserve an output enabled by the platform firmware.
+     * Keep this opt-in: a cold, disabled controller is still the default. */
+    if (s->boot_lcdc) {
+        uint32_t *regs = s->banks[MDP_BANK].registers;
+        uint32_t size = s->boot_width | (s->boot_height << 16);
+
+        regs[MDP_LCDC_ENABLE / 4] = 1;
+        regs[MDP_OVERLAY0_SIZE / 4] = size;
+        regs[MDP_DMA_P_SIZE / 4] = size;
+        regs[MDP_DMA_P_ADDRESS / 4] = QCOM_MDP4_VIDEO_BASE;
+        regs[MDP_DMA_P_STRIDE / 4] = s->boot_width * 4;
+    }
     s->overlay_pending = false;
     for (unsigned i = 0; i < QCOM_MDP4_PROBE_IRQS; i++) {
         qemu_set_irq(s->irq[i], 0);
@@ -1042,14 +1136,30 @@ static const VMStateDescription qcom_mdp4_probe_vmstate = {
 };
 
 static const Property qcom_mdp4_probe_properties[] = {
+    DEFINE_PROP_BOOL("boot-lcdc", QcomMdp4ProbeState, boot_lcdc, false),
+    DEFINE_PROP_UINT32("boot-width", QcomMdp4ProbeState, boot_width, 480),
+    DEFINE_PROP_UINT32("boot-height", QcomMdp4ProbeState, boot_height, 800),
     DEFINE_PROP_BOOL("upload-endian-workaround", QcomMdp4ProbeState,
                      upload_endian_workaround, false),
 };
+
+static void qcom_mdp4_probe_realize(DeviceState *dev, Error **errp)
+{
+    QcomMdp4ProbeState *s = QCOM_MDP4_PROBE(dev);
+
+    if (s->boot_lcdc && (!s->boot_width || !s->boot_height ||
+        s->boot_width > MDP_MAX_DIMENSION ||
+        s->boot_height > MDP_MAX_DIMENSION)) {
+        error_setg(errp, "boot LCDC dimensions must be between 1 and %u",
+                   MDP_MAX_DIMENSION);
+    }
+}
 
 static void qcom_mdp4_probe_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
+    dc->realize = qcom_mdp4_probe_realize;
     device_class_set_legacy_reset(dc, qcom_mdp4_probe_reset);
     device_class_set_props(dc, qcom_mdp4_probe_properties);
     dc->vmsd = &qcom_mdp4_probe_vmstate;
