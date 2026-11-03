@@ -565,6 +565,11 @@ static QcomProbeCommandResult qcom_probe_execute_packet(
         if (count == 3 && !payload[0] && payload[2] == 3 &&
             (payload[1] & ~0x4800U) == 0x88) {
             success = qcom_a2xx_draw_rect(&context);
+        } else if (count == 3 && !payload[0] &&
+                   (payload[1] & ~0x4800U) == 0x86) {
+            /* DI_PT_TRISTRIP with AUTO_INDEX: the phone soft keyboard uses
+             * this for its key popup. Index width has no effect in this mode. */
+            success = qcom_a2xx_draw_triangle_strip(&context, payload[2]);
         } else if (count == 5 && !payload[0] &&
                    (payload[1] & ~0x4000U) == 4) {
             success = qcom_a2xx_draw_triangles(&context, payload[3],

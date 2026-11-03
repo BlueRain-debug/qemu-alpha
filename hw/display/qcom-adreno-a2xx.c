@@ -58,6 +58,9 @@
 /* Bound command work, while allowing a scrolling UI's batched glyph quads.
  * Each quad contributes six indices; 3072 allows 512 quads per draw. */
 #define A2XX_MAX_TRIANGLE_INDICES 3072
+#define A2XX_MAX_TRIANGLES (A2XX_MAX_TRIANGLE_INDICES / 3)
+#define A2XX_VERTEX_FETCH_SIGNED (1U << 12)
+#define A2XX_VERTEX_FETCH_INTEGER (1U << 13)
 
 typedef struct A2xxInvocation {
     float temporary[64][4];
@@ -66,6 +69,8 @@ typedef struct A2xxInvocation {
     float fetch_index;
     bool fetch_index_valid;
     bool trace_texture;
+    int constant_address;
+    bool constant_address_valid;
 } A2xxInvocation;
 
 typedef struct A2xxPendingPixel {
@@ -91,14 +96,16 @@ static float a2xx_float(uint32_t word)
 
 /* A 32x32 macro tile contains 8x16 micro tiles. The Y low bit, pipe,
  * and bank bits are interleaved with the byte offset within a micro tile.
- * This is the common 32-bit A2xx/Xenos texture layout (also documented in
- * Xenia's texture_address.h). For example, (2,2) in pitch 32 is byte 0x108.
+ * The byte scale selects R8 or RGBA8 storage. This A2xx/Xenos layout is also
+ * documented in Xenia's texture_address.h. For RGBA8, (2,2) in pitch 32
+ * is byte 0x108.
  */
-static uint32_t a2xx_tiled_offset(unsigned x, unsigned y, unsigned pitch)
+static uint32_t a2xx_tiled_offset(unsigned x, unsigned y, unsigned pitch,
+                                 unsigned bytes_per_texel)
 {
     uint32_t outer = (((y >> 5) * (pitch >> 5)) + (x >> 5)) << 6;
     uint32_t inner = (((y >> 1) & 7) << 3) | (x & 7);
-    uint32_t bytes = (outer | inner) << 2;
+    uint32_t bytes = (outer | inner) * bytes_per_texel;
     unsigned pipe = ((x >> 3) & 3) ^ (((y >> 3) & 1) << 1);
 
     return (bytes & 15) | ((y & 1) << 4) | ((bytes & 16) << 1) |
@@ -143,6 +150,7 @@ static bool a2xx_vertex_fetch(QcomA2xxDrawContext *context,
     unsigned fetch = ((first >> 20) & 31) * 6 + ((first >> 25) & 3) * 2;
     unsigned format = (second >> 16) & 63;
     unsigned components, fetch_bytes;
+    bool packed = format == 6 || format == 25;
     const uint32_t *constant = context->registers + A2XX_FETCH_CONSTANTS + fetch;
     /* Subsequent mini-fetches reuse the full fetch's index, even when an
      * earlier attribute fetch has overwritten the source temporary. */
@@ -170,18 +178,24 @@ static bool a2xx_vertex_fetch(QcomA2xxDrawContext *context,
     case 57: components = 3; break;
     case 38: components = 4; break;
     case 6: components = 4; break; /* Packed, unsigned normalized RGBA8. */
+    case 25: /* FMT_16_16: two packed integer components, e.g. SHORT2. */
+        if (!(second & A2XX_VERTEX_FETCH_INTEGER)) {
+            return a2xx_fail(context, "normalized 16-bit vertex", second);
+        }
+        components = 2;
+        break;
     default: return a2xx_fail(context, "vertex format", format);
     }
     offset = ((uint64_t)(unsigned)index * (third & 255) +
               ((third >> 8) & 0x3fffff)) * 4;
-    fetch_bytes = format == 6 ? 4 : components * 4;
+    fetch_bytes = packed ? 4 : components * 4;
     /* Vertex fetch constant size is in bytes. Check the entire attribute. */
     address = (constant[0] & ~3U) + offset;
     if (offset + fetch_bytes > constant[1] ||
         address + fetch_bytes > (1ULL << 32)) {
         return a2xx_fail(context, "vertex buffer bounds", offset);
     }
-    for (unsigned component = 0; component < (format == 6 ? 1 : components); component++) {
+    for (unsigned component = 0; component < (packed ? 1 : components); component++) {
         uint32_t word;
 
         if (!context->read_word(context->opaque, address + component * 4,
@@ -194,6 +208,17 @@ static bool a2xx_vertex_fetch(QcomA2xxDrawContext *context,
             }
             for (unsigned channel = 0; channel < 4; channel++) {
                 value[channel] = ((word >> (channel * 8)) & 255) / 255.0f;
+            }
+        } else if (format == 25) {
+            /* Integer fetch ignores SIGNED_RF_MODE. FORMAT_COMP_ALL selects
+             * sign extension; the two components occupy one DWORD, even
+             * when a mini-fetch reads them within a larger vertex stride. */
+            for (unsigned channel = 0; channel < 2; channel++) {
+                if (second & A2XX_VERTEX_FETCH_SIGNED) {
+                    value[channel] = sextract32(word, channel * 16, 16);
+                } else {
+                    value[channel] = (word >> (channel * 16)) & 0xffff;
+                }
             }
         } else {
             /* SIGNED_RF_MODE selects signed normalized integer conversion;
@@ -218,12 +243,15 @@ static bool a2xx_texture_texel(QcomA2xxDrawContext *context,
     uint64_t address = texture[1] & 0xfffff000U;
     uint32_t packed;
     unsigned endian = (texture[1] >> 6) & 3;
-    float components[4];
+    float components[4] = {0, 0, 0, 1};
+    unsigned format = texture[1] & 63;
+    unsigned bytes_per_texel = format == 2 ? 1 : 4;
 
-    address += texture[0] & (1U << 31) ? a2xx_tiled_offset(x, y, pitch) :
-               (y * pitch + x) * 4;
+    address += texture[0] & (1U << 31) ?
+               a2xx_tiled_offset(x, y, pitch, bytes_per_texel) :
+               (y * pitch + x) * bytes_per_texel;
     if (address > UINT32_MAX ||
-        !context->read_word(context->opaque, address, &packed)) {
+        !context->read_word(context->opaque, address & ~3ULL, &packed)) {
         return a2xx_fail(context, "texture RAM translation", address);
     }
     /* The observed QCDX CPU-upload descriptors request 8IN16 even though
@@ -232,7 +260,7 @@ static bool a2xx_texture_texel(QcomA2xxDrawContext *context,
      * The missing hardware/driver contract is not understood yet: keep this
      * local diagnostic opt-in, and preserve all descriptor modes by default.
      */
-    if (context->upload_endian_workaround && endian == 1) {
+    if (context->upload_endian_workaround && format == 6 && endian == 1) {
         endian = 0;
     }
     if (trace_sample) {
@@ -240,8 +268,12 @@ static bool a2xx_texture_texel(QcomA2xxDrawContext *context,
                                     a2xx_endian(packed, endian));
     }
     packed = a2xx_endian(packed, endian);
-    for (unsigned component = 0; component < 4; component++) {
-        components[component] = ((packed >> (component * 8)) & 255) / 255.0f;
+    if (format == 2) { /* FMT_8: normalized R8; G/B=0, A=1 before swizzling. */
+        components[0] = ((packed >> ((address & 3) * 8)) & 255) / 255.0f;
+    } else {
+        for (unsigned component = 0; component < 4; component++) {
+            components[component] = ((packed >> (component * 8)) & 255) / 255.0f;
+        }
     }
     return a2xx_fetch_result(value, components, (texture[3] >> 1) & 0xfff) ||
            a2xx_fail(context, "texture constant swizzle", texture[3]);
@@ -281,7 +313,8 @@ static bool a2xx_texture_fetch(QcomA2xxDrawContext *context,
     }
     if ((first & ((1U << 11) | (1U << 18))) ||
         (second & 0xe0000000) || instruction[2] != 2 ||
-        (texture[0] & 0x3ff) != 2 || (texture[1] & 63) != 6 ||
+        (texture[0] & 0x3ff) != 2 ||
+        ((texture[1] & 63) != 6 && (texture[1] & 63) != 2) ||
         (texture[3] & 0x7e000) || (texture[5] & 0x600) != 0x200 ||
         min_filter > 1 || min_filter != mag_filter || !pitch || width > pitch ||
         width > A2XX_MAX_DIMENSION || height > A2XX_MAX_DIMENSION) {
@@ -374,13 +407,30 @@ static bool a2xx_alu_source(QcomA2xxDrawContext *context,
     } else {
         unsigned base = context->registers[stage ? A2XX_PS_CONSTANT_BASE :
                                                   A2XX_VS_CONSTANT_BASE] & 511;
+        unsigned constant_slot = 0;
+        int constant_index = base + index;
 
-        if (base + index >= 512) {
-            return a2xx_fail(context, "ALU constant bounds", base + index);
+        /* The first constant operand uses CONST_0_REL_ABS; subsequent
+         * constants use CONST_1_REL_ABS, regardless of their source slot. */
+        for (unsigned previous = 2; previous > source; previous--) {
+            if (!(instruction[2] & (1U << (29 + previous)))) {
+                constant_slot = 1;
+            }
+        }
+        if (instruction[1] & (1U << (31 - constant_slot))) {
+            if (!(instruction[1] & (1U << 29)) ||
+                !invocation->constant_address_valid) {
+                return a2xx_fail(context, "ALU constant address mode", index);
+            }
+            constant_index += invocation->constant_address;
+        }
+
+        if (constant_index < 0 || constant_index >= 512) {
+            return a2xx_fail(context, "ALU constant bounds", constant_index);
         }
         for (unsigned component = 0; component < 4; component++) {
             input[component] = a2xx_float(context->registers[
-                A2XX_ALU_CONSTANTS + (base + index) * 4 + component]);
+                A2XX_ALU_CONSTANTS + constant_index * 4 + component]);
         }
     }
     for (unsigned component = 0; component < 4; component++) {
@@ -403,17 +453,20 @@ static bool a2xx_alu(QcomA2xxDrawContext *context, A2xxInvocation *invocation,
     unsigned vector_mask = (first >> 16) & 15;
     unsigned scalar_mask = (first >> 20) & 15;
     unsigned opcode = (instruction[2] >> 24) & 31;
+    unsigned scalar_opcode = first >> 26;
+    bool sets_address = scalar_opcode == 23 || scalar_opcode == 24;
     bool exported = first & (1U << 15);
     unsigned destination = first & 63;
     unsigned scalar_destination = (first >> 8) & 63;
     unsigned constant_one = exported ? vector_mask & scalar_mask : 0;
     unsigned constant_zero = exported && (first & (1U << 14)) ?
                              (~(vector_mask | scalar_mask) & 15) : 0;
-    float source1[4], source2[4], source3[4], result[4], scalar = 0, dot = 0;
+    float source1[4], source2[4], source3[4], result[4] = {0};
+    float scalar = 0, dot = 0;
 
     if ((first & ((1U << 6) | (1U << 7))) ||
         (!exported && (first & (1U << 14))) ||
-        (instruction[1] & 0xf8000000)) {
+        (instruction[1] & 0x18000000)) {
         return a2xx_fail(context, "predicated or relative ALU", first);
     }
     if (exported) {
@@ -421,22 +474,37 @@ static bool a2xx_alu(QcomA2xxDrawContext *context, A2xxInvocation *invocation,
         scalar_mask &= ~constant_one;
         scalar_destination = destination;
     }
-    if (!(vector_mask | scalar_mask | constant_one | constant_zero)) {
+    if (!(vector_mask | scalar_mask | constant_one | constant_zero) &&
+        !sets_address) {
         return true; /* Unpredicated ALU with no destination writes is NOP. */
     }
-    if (!a2xx_alu_source(context, invocation, stage, instruction, 2, source1) ||
-        !a2xx_alu_source(context, invocation, stage, instruction, 1, source2) ||
-        ((opcode == 11 || scalar_mask) &&
+    if ((vector_mask &&
+         (!a2xx_alu_source(context, invocation, stage, instruction, 2, source1) ||
+          !a2xx_alu_source(context, invocation, stage, instruction, 1, source2))) ||
+        (((vector_mask && opcode == 11) || scalar_mask || sets_address) &&
          !a2xx_alu_source(context, invocation, stage, instruction, 0, source3))) {
         return false;
     }
-    if (scalar_mask) {
-        switch (first >> 26) {
+    if (scalar_mask || sets_address) {
+        switch (scalar_opcode) {
         case 0: scalar = source3[3] + source3[0]; break;
         case 2: scalar = source3[3] * source3[0]; break;
         case 5: scalar = fmaxf(source3[3], source3[0]); break;
         case 6: scalar = fminf(source3[3], source3[0]); break;
         case 19: scalar = 1.0f / source3[3]; break;
+        case 23:
+        case 24:
+            if (!isfinite(source3[3])) {
+                return a2xx_fail(context, "nonfinite ALU address", scalar_opcode);
+            }
+            /* MOVA/MOVA_FLOOR update a0 even with an empty scalar mask.
+             * Their co-issued scalar result is MAX(W, X), not the index. */
+            invocation->constant_address = CLAMP(
+                floorf(source3[3] + (scalar_opcode == 23 ? 0.5f : 0)),
+                -256, 255);
+            invocation->constant_address_valid = true;
+            scalar = fmaxf(source3[3], source3[0]);
+            break;
         default: return a2xx_fail(context, "scalar ALU opcode", first >> 26);
         }
         if (first & (1U << 25)) {
@@ -446,12 +514,12 @@ static bool a2xx_alu(QcomA2xxDrawContext *context, A2xxInvocation *invocation,
             return a2xx_fail(context, "nonfinite scalar ALU", first >> 26);
         }
     }
-    if (opcode == 15 || opcode == 16) {
+    if (vector_mask && (opcode == 15 || opcode == 16)) {
         for (unsigned component = 0; component < (opcode == 15 ? 4 : 3); component++) {
             dot += source1[component] * source2[component];
         }
     }
-    for (unsigned component = 0; component < 4; component++) {
+    for (unsigned component = 0; vector_mask && component < 4; component++) {
         switch (opcode) {
         case 0: result[component] = source1[component] + source2[component]; break;
         case 1: result[component] = source1[component] * source2[component]; break;
@@ -821,13 +889,13 @@ static bool a2xx_primitive(QcomA2xxDrawContext *context,
                 pixel.export_mask[0] = 15;
                 address = (uint64_t)regs[A2XX_COPY_DEST_BASE] +
                     (copy_info & 8 ? (destination_y * copy_pitch + destination_x) * 4 :
-                     a2xx_tiled_offset(destination_x, destination_y, copy_pitch));
+                     a2xx_tiled_offset(destination_x, destination_y, copy_pitch, 4));
             } else {
                 if (!a2xx_shader(context, 1, &pixel)) {
                     return false;
                 }
                 address += gmem || (color & 0x40) ? (y * pitch + x) * 4 :
-                           a2xx_tiled_offset(x, y, pitch);
+                           a2xx_tiled_offset(x, y, pitch, 4);
             }
             if (pixel.export_mask[0] != 15) {
                 return a2xx_fail(context, "pixel color missing", pixel.export_mask[0]);
@@ -929,6 +997,30 @@ bool qcom_a2xx_draw_triangles(QcomA2xxDrawContext *context,
     }
     for (unsigned index = 0; index < index_count; index += 3) {
         if (!a2xx_primitive(context, &indices[index], false)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool qcom_a2xx_draw_triangle_strip(QcomA2xxDrawContext *context,
+                                   unsigned vertex_count)
+{
+    /* Auto indexing uses consecutive vertex IDs. Apply the same primitive
+     * budget as indexed triangle lists, including degenerate triangles. */
+    if (vertex_count < 3 || vertex_count - 2 > A2XX_MAX_TRIANGLES) {
+        return a2xx_fail(context, "triangle strip vertex bounds", vertex_count);
+    }
+    for (unsigned vertex = 2; vertex < vertex_count; vertex++) {
+        uint32_t indices[3] = {vertex - 2, vertex - 1, vertex};
+
+        /* Strip winding alternates in the submitted vertex order. Reverse
+         * every odd triangle so face culling sees a consistent front face. */
+        if (vertex & 1) {
+            indices[0] = vertex - 1;
+            indices[1] = vertex - 2;
+        }
+        if (!a2xx_primitive(context, indices, false)) {
             return false;
         }
     }
