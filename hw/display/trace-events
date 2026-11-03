@@ -1,5 +1,20 @@
 # See docs/devel/tracing.rst for syntax documentation.
 
+# qcom-adreno-a2xx.c
+qcom_mdp4_probe_texel(uint32_t address, uint32_t constant, uint32_t memory, uint32_t converted) "address=0x%x constant=0x%x memory=0x%08x converted=0x%08x"
+qcom_mdp4_probe_draw(bool success, uint32_t detail, const char *reason) "success=%d detail=0x%08x %s"
+qcom_mdp4_probe_primitive(unsigned mode, uint32_t color, unsigned pitch, uint32_t raster, uint32_t control, uint32_t blend, uint32_t copy, unsigned pixels, uint32_t first_address, uint32_t first_value) "mode=%u color=0x%x pitch=%u raster=0x%x control=0x%x blend=0x%x copy=0x%x pixels=%u first=0x%x:0x%x"
+
+# qcom-mdp4-probe.c
+qcom_mdp4_probe_read(unsigned bank, uint64_t address, uint32_t value, uint64_t pc) "bank=%u read addr=0x%"PRIx64" value=0x%x pc=0x%"PRIx64
+qcom_mdp4_probe_read_repeat(unsigned bank, uint64_t address, uint32_t value, uint64_t count) "bank=%u repeat addr=0x%"PRIx64" value=0x%x count=%"PRIu64
+qcom_mdp4_probe_write(unsigned bank, uint64_t address, uint32_t value, uint64_t pc) "bank=%u write addr=0x%"PRIx64" value=0x%x pc=0x%"PRIx64
+qcom_mdp4_probe_packet(uint32_t header, uint32_t rptr, uint32_t wptr) "header=0x%x rptr=0x%x wptr=0x%x"
+qcom_mdp4_probe_ring_stall(uint32_t rptr, uint32_t header, const char *reason) "rptr=0x%x header=0x%x reason=%s"
+qcom_mdp4_probe_command(unsigned depth, uint32_t address, uint32_t header, uint32_t first, uint32_t second) "depth=%u address=0x%x header=0x%x first=0x%x second=0x%x"
+qcom_mdp4_probe_cond(uint32_t enable, uint32_t timestamp, uint32_t reference, uint32_t skip) "enable=0x%x timestamp=0x%x ref=0x%x skip=%u"
+qcom_mdp4_probe_irq(uint32_t status, uint32_t mask, bool level) "status=0x%x mask=0x%x level=%d"
+
 # jazz_led.c
 jazz_led_read(uint64_t addr, uint8_t val) "read addr=0x%"PRIx64": 0x%x"
 jazz_led_write(uint64_t addr, uint8_t new) "write addr=0x%"PRIx64": 0x%x"

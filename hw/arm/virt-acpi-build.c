@@ -1450,7 +1450,7 @@ build_dsdt(GArray *table_data, BIOSLinker *linker, VirtMachineState *vms)
         acpi_dsdt_add_uart(scope, &memmap[VIRT_UART1],
                            (irqmap[VIRT_UART1] + ARM_SPI_BASE), 1);
     }
-    if (vmc->acpi_expose_flash) {
+    if (vmc->acpi_expose_flash && !vms->winrt_qcdx_probe) {
         acpi_dsdt_add_flash(scope, &memmap[VIRT_FLASH]);
     }
     fw_cfg_acpi_dsdt_add(scope, &memmap[VIRT_FW_CFG]);
@@ -1598,6 +1598,17 @@ void virt_acpi_build(VirtMachineState *vms, AcpiBuildTables *tables)
 
     acpi_add_table(table_offsets, tables_blob);
     build_madt(tables_blob, tables->linker, vms);
+
+    if (vms->winrt_qcdx_probe && vms->winrt_qcdx_ssdt) {
+        size_t length;
+        const void *data = g_bytes_get_data(vms->winrt_qcdx_ssdt, &length);
+
+        /* A local image's original panel data is supplied at runtime, rather
+         * than embedding a vendor firmware payload in the device model. The
+         * machine property setter validates the header, length and checksum. */
+        acpi_add_table(table_offsets, tables_blob);
+        g_array_append_vals(tables_blob, data, length);
+    }
 
     acpi_add_table(table_offsets, tables_blob);
     if (wdt && has_wdat) {

@@ -1,5 +1,7 @@
 hw_display_modules = {}
 
+system_ss.add(when: 'CONFIG_QCOM_MDP4_PROBE', if_true: files('qcom-mdp4-probe.c', 'qcom-adreno-a2xx.c'))
+
 system_ss.add(when: 'CONFIG_DDC', if_true: files('i2c-ddc.c'))
 system_ss.add(when: 'CONFIG_EDID', if_true: files('edid-generate.c', 'edid-region.c'))
 

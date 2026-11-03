@@ -39,6 +39,7 @@
 #include "hw/arm/virt.h"
 #include "hw/block/flash.h"
 #include "hw/display/ramfb.h"
+#include "hw/display/qcom-mdp4-probe.h"
 #include "net/net.h"
 #include "system/device_tree.h"
 #include "system/numa.h"
@@ -1869,7 +1870,8 @@ static void virt_flash_map(VirtMachineState *vms,
 
     virt_flash_map1(vms->flash[0], flashbase, flashsize,
                     secure_sysmem);
-    virt_flash_map1(vms->flash[1], flashbase + flashsize, flashsize,
+    virt_flash_map1(vms->flash[1], vms->winrt_qcdx_probe ? QCOM_MDP4_NVRAM_BASE :
+                    flashbase + flashsize, flashsize,
                     sysmem);
 }
 
@@ -1879,6 +1881,8 @@ static void virt_flash_fdt(VirtMachineState *vms,
 {
     hwaddr flashsize = vms->memmap[VIRT_FLASH].size / 2;
     hwaddr flashbase = vms->memmap[VIRT_FLASH].base;
+    hwaddr variable_base = vms->winrt_qcdx_probe ? QCOM_MDP4_NVRAM_BASE :
+                          flashbase + flashsize;
     MachineState *ms = MACHINE(vms);
     char *nodename;
 
@@ -1889,7 +1893,7 @@ static void virt_flash_fdt(VirtMachineState *vms,
         qemu_fdt_setprop_string(ms->fdt, nodename, "compatible", "cfi-flash");
         qemu_fdt_setprop_sized_cells(ms->fdt, nodename, "reg",
                                      2, flashbase, 2, flashsize,
-                                     2, flashbase + flashsize, 2, flashsize);
+                                     2, variable_base, 2, flashsize);
         qemu_fdt_setprop_cell(ms->fdt, nodename, "bank-width", 4);
         g_free(nodename);
     } else {
@@ -1907,11 +1911,11 @@ static void virt_flash_fdt(VirtMachineState *vms,
         qemu_fdt_setprop_string(ms->fdt, nodename, "secure-status", "okay");
         g_free(nodename);
 
-        nodename = g_strdup_printf("/flash@%" PRIx64, flashbase + flashsize);
+        nodename = g_strdup_printf("/flash@%" PRIx64, variable_base);
         qemu_fdt_add_subnode(ms->fdt, nodename);
         qemu_fdt_setprop_string(ms->fdt, nodename, "compatible", "cfi-flash");
         qemu_fdt_setprop_sized_cells(ms->fdt, nodename, "reg",
-                                     2, flashbase + flashsize, 2, flashsize);
+                                     2, variable_base, 2, flashsize);
         qemu_fdt_setprop_cell(ms->fdt, nodename, "bank-width", 4);
         g_free(nodename);
     }
@@ -2964,6 +2968,29 @@ static void create_winrt_devices(const VirtMachineState *vms)
         create_unimplemented_device("winrt-qfprom-probe", base, 0x10000);
     }
 
+    if (vms->winrt_qcdx_probe) {
+        SysBusDevice *gpu = SYS_BUS_DEVICE(qdev_new(TYPE_QCOM_MDP4_PROBE));
+        MachineState *ms = MACHINE(vms);
+
+        DEVICE(gpu)->id = g_strdup("qcdx");
+        sysbus_realize_and_unref(gpu, &error_fatal);
+        for (unsigned i = 0; i < QCOM_MDP4_PROBE_BANKS; i++) {
+            /* Native vendor MMIO occupies otherwise unused portions of NOR. */
+            sysbus_mmio_map_overlap(gpu, i, qcom_mdp4_probe_banks[i].base, 1);
+        }
+        sysbus_mmio_map_overlap(gpu, QCOM_MDP4_PROBE_BANKS,
+                               QCOM_MDP4_VRAM_BASE, 1);
+        for (unsigned i = 0; i < QCOM_MDP4_PROBE_IRQS; i++) {
+            sysbus_connect_irq(gpu, i, qdev_get_gpio_in(vms->gic,
+                                  qcom_mdp4_probe_gsis[i] - 32));
+        }
+        /* The matching WinRT firmware excludes this native video pool from
+         * its allocator and the OS memory map. Backing remains guest RAM. */
+        qemu_fdt_setprop_cells(ms->fdt, "/", "qemu,winrt-qcdx-carveout",
+                              0, QCOM_MDP4_VIDEO_BASE,
+                              0, QCOM_MDP4_VIDEO_SIZE);
+    }
+
     if (vms->winrt_tegra2) {
         /* The native HAL initializes USB3's UTMI PHY before enumerating USB. */
         sysbus_create_simple(TYPE_TEGRA2_EHCI, 0xc5008000,
@@ -3140,6 +3167,21 @@ static void machvirt_init(MachineState *machine)
         exit(1);
     }
 
+    if (vms->winrt_qcdx_ssdt && !vms->winrt_qcdx_probe) {
+        error_report("winrt-qcdx-ssdt requires winrt-qcdx-probe=on");
+        exit(1);
+    }
+    if (vms->winrt_qcdx_probe &&
+        (!vms->winrt || !vms->winrt_qcom_timer || vms->winrt_pci ||
+         vms->winrt_legacy_ram || vms->gic_version != VIRT_GIC_VERSION_2 ||
+         machine->ram_size < 64 * MiB ||
+         machine->maxram_size > QCOM_MDP4_NVRAM_BASE - GiB)) {
+        error_report("winrt-qcdx-probe requires winrt=on, "
+                     "winrt-qcom-timer=on, gic-version=2, winrt-pci=off, "
+                     "winrt-legacy-ram=off and 64 MiB to 2944 MiB RAM");
+        exit(1);
+    }
+
     if (vms->winrt_omap_dma && !vms->winrt_omap_timer) {
         error_report("winrt-omap-dma requires winrt-omap-timer=on");
         exit(1);
@@ -3209,7 +3251,8 @@ static void machvirt_init(MachineState *machine)
         exit(1);
     }
 
-    if (vms->winrt && (!tcg_enabled() || vms->secure || vms->virt ||
+    if (vms->winrt && ((!tcg_enabled() && !qtest_enabled()) ||
+                      vms->secure || vms->virt ||
                       machine->smp.cpus > 4 ||
                       machine->smp.max_cpus != machine->smp.cpus)) {
         error_report("winrt requires TCG, one to four CPUs, secure=off, "
@@ -3696,6 +3739,51 @@ static void virt_set_winrt_qfprom_probe(Object *obj, bool value, Error **errp)
 static bool virt_get_winrt_pci(Object *obj, Error **errp)
 {
     return VIRT_MACHINE(obj)->winrt_pci;
+}
+
+static bool virt_get_winrt_qcdx_probe(Object *obj, Error **errp)
+{
+    return VIRT_MACHINE(obj)->winrt_qcdx_probe;
+}
+
+static void virt_set_winrt_qcdx_probe(Object *obj, bool value, Error **errp)
+{
+    VIRT_MACHINE(obj)->winrt_qcdx_probe = value;
+}
+
+static char *virt_get_winrt_qcdx_ssdt(Object *obj, Error **errp)
+{
+    return g_strdup(VIRT_MACHINE(obj)->winrt_qcdx_ssdt_file);
+}
+
+static void virt_set_winrt_qcdx_ssdt(Object *obj, const char *value, Error **errp)
+{
+    VirtMachineState *vms = VIRT_MACHINE(obj);
+    g_autofree char *data = NULL;
+    g_autoptr(GError) error = NULL;
+    size_t length;
+    uint8_t checksum = 0;
+
+    if (!g_file_get_contents(value, &data, &length, &error)) {
+        error_setg(errp, "Cannot read QCDX SSDT: %s", error->message);
+        return;
+    }
+    if (length < 36 || length > MiB || memcmp(data, "SSDT", 4) ||
+        ldl_le_p(data + 4) != length) {
+        error_setg(errp, "QCDX SSDT must be one valid SSDT, at most 1 MiB");
+        return;
+    }
+    for (size_t i = 0; i < length; i++) {
+        checksum += (uint8_t)data[i];
+    }
+    if (checksum) {
+        error_setg(errp, "QCDX SSDT checksum is invalid");
+        return;
+    }
+    g_clear_pointer(&vms->winrt_qcdx_ssdt, g_bytes_unref);
+    g_free(vms->winrt_qcdx_ssdt_file);
+    vms->winrt_qcdx_ssdt_file = g_strdup(value);
+    vms->winrt_qcdx_ssdt = g_bytes_new_take(g_steal_pointer(&data), length);
 }
 
 static void virt_set_winrt_pci(Object *obj, bool value, Error **errp)
@@ -4717,6 +4805,19 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "winrt-qfprom-probe",
         "Expose an experimental zero-filled phone fuse probe window "
         "(requires winrt=on; no programmed fuses or OTP emulation)");
+    object_class_property_add_bool(oc, "winrt-qcdx-probe",
+                                   virt_get_winrt_qcdx_probe,
+                                   virt_set_winrt_qcdx_probe);
+    object_class_property_set_description(oc, "winrt-qcdx-probe",
+        "Expose native MSM8x60 graphics MMIO for local driver bring-up; "
+        "requires matching reserved-memory firmware and an external SSDT; "
+        "bounded experimental drawing and MDP scanout, not a complete GPU");
+    object_class_property_add_str(oc, "winrt-qcdx-ssdt",
+                                  virt_get_winrt_qcdx_ssdt,
+                                  virt_set_winrt_qcdx_ssdt);
+    object_class_property_set_description(oc, "winrt-qcdx-ssdt",
+        "Local original-machine SSDT containing the SMMU/GPU resources "
+        "and panel data for the QCDX probe");
     object_class_property_add_bool(oc, "winrt-pci", virt_get_winrt_pci,
                                    virt_set_winrt_pci);
     object_class_property_set_description(oc, "winrt-pci",
@@ -4929,6 +5030,8 @@ static void virt_instance_finalize(Object *obj)
     }
     g_free(vms->oem_id);
     g_free(vms->oem_table_id);
+    g_free(vms->winrt_qcdx_ssdt_file);
+    g_clear_pointer(&vms->winrt_qcdx_ssdt, g_bytes_unref);
     g_ptr_array_free(vms->smmuv3_devices, TRUE);
 }
 

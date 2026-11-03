@@ -83,6 +83,9 @@ config SM501
 config TCX
     bool
 
+config QCOM_MDP4_PROBE
+    bool
+
 config CG3
     bool
 

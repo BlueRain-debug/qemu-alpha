@@ -43,6 +43,7 @@ config ARM_VIRT
     select TEGRA20_TIMER
     select TEGRA20_APB_DMA
     select QCOM_GPT
+    select QCOM_MDP4_PROBE
     select OMAP4_DMTIMER
     select OMAP4_DMA
     select PL310

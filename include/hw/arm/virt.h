@@ -181,6 +181,9 @@ struct VirtMachineState {
     bool winrt_omap_timer;
     bool winrt_omap_dma;
     bool winrt_qfprom_probe;
+    bool winrt_qcdx_probe;
+    char *winrt_qcdx_ssdt_file;
+    GBytes *winrt_qcdx_ssdt;
     bool winrt_pci;
     int winrt_tegra_irqmap[VIRT_LOWMEMMAP_LAST];
     bool highmem;
