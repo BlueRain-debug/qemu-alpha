@@ -55,6 +55,9 @@
 #define A2XX_MAX_PARAMETERS 16
 #define A2XX_MAX_DIMENSION 2048
 #define A2XX_MAX_PIXELS (1024 * 1024)
+/* Bound command work, while allowing a scrolling UI's batched glyph quads.
+ * Each quad contributes six indices; 3072 allows 512 quads per draw. */
+#define A2XX_MAX_TRIANGLE_INDICES 3072
 
 typedef struct A2xxInvocation {
     float temporary[64][4];
@@ -908,13 +911,14 @@ bool qcom_a2xx_draw_triangles(QcomA2xxDrawContext *context,
                                uint32_t index_address, unsigned index_count,
                                unsigned index_bytes)
 {
-    uint32_t indices[192];
+    g_autofree uint32_t *indices = NULL;
 
-    if (!index_count || index_count > ARRAY_SIZE(indices) || index_count % 3 ||
+    if (!index_count || index_count > A2XX_MAX_TRIANGLE_INDICES || index_count % 3 ||
         index_bytes != index_count * 2 || (index_address & 1) ||
         (uint64_t)index_address + index_bytes > (1ULL << 32)) {
         return a2xx_fail(context, "16-bit triangle index bounds", index_count);
     }
+    indices = g_new(uint32_t, index_count);
     for (unsigned index = 0; index < index_count; index++) {
         uint32_t address = index_address + index * 2, word;
 
