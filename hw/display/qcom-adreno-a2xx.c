@@ -1003,6 +1003,26 @@ bool qcom_a2xx_draw_triangles(QcomA2xxDrawContext *context,
     return true;
 }
 
+bool qcom_a2xx_draw_auto_triangles(QcomA2xxDrawContext *context,
+                                    unsigned vertex_count)
+{
+    /* AUTO_INDEX supplies consecutive vertex IDs, without an index buffer.
+     * A list starts a new triangle every three vertices and keeps their
+     * submitted winding. Use the same work bound as the indexed list. */
+    if (!vertex_count || vertex_count > A2XX_MAX_TRIANGLE_INDICES ||
+        vertex_count % 3) {
+        return a2xx_fail(context, "auto triangle vertex bounds", vertex_count);
+    }
+    for (unsigned vertex = 0; vertex < vertex_count; vertex += 3) {
+        uint32_t indices[3] = {vertex, vertex + 1, vertex + 2};
+
+        if (!a2xx_primitive(context, indices, false)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool qcom_a2xx_draw_triangle_strip(QcomA2xxDrawContext *context,
                                    unsigned vertex_count)
 {

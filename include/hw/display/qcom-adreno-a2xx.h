@@ -26,6 +26,8 @@ bool qcom_a2xx_draw_rect(QcomA2xxDrawContext *context);
 bool qcom_a2xx_draw_triangles(QcomA2xxDrawContext *context,
                                uint32_t index_address, unsigned index_count,
                                unsigned index_bytes);
+bool qcom_a2xx_draw_auto_triangles(QcomA2xxDrawContext *context,
+                                    unsigned vertex_count);
 bool qcom_a2xx_draw_triangle_strip(QcomA2xxDrawContext *context,
                                    unsigned vertex_count);
 
