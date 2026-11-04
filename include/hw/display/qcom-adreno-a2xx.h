@@ -14,6 +14,7 @@ typedef struct QcomA2xxDrawContext {
     /* Opt-in diagnostic for QCDX CPU uploads; not a general endian rule. */
     bool upload_endian_workaround;
     bool fast_resolve;
+    bool fast_fragments;
     void *opaque;
     bool (*read_word)(void *opaque, uint32_t address, uint32_t *value);
     /* Validate a primitive's destinations before committing its pixels. */

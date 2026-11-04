@@ -66,6 +66,8 @@ typedef struct A2xxInvocation {
     float temporary[64][4];
     float exported[64][4];
     uint8_t export_mask[64];
+    /* Register-granular writes since the previous fragment reset. */
+    uint64_t temporary_written;
     float fetch_index;
     bool fetch_index_valid;
     bool trace_texture;
@@ -85,6 +87,76 @@ typedef struct A2xxCoverageEdge {
     bool reverse;
     bool inclusive;
 } A2xxCoverageEdge;
+
+/*
+ * Keep the CRT's NaN and mixed signed-zero behavior on the uncommon path.
+ * Shader MAX is also used as MOV, so equal nonzero operands are common.
+ */
+static float a2xx_max(float left, float right)
+{
+    if (left > right) {
+        return left;
+    }
+    if (left < right) {
+        return right;
+    }
+    if (left == right && signbit(left) == signbit(right)) {
+        return left;
+    }
+    return fmaxf(left, right);
+}
+
+static float a2xx_min(float left, float right)
+{
+    if (left < right) {
+        return left;
+    }
+    if (left > right) {
+        return right;
+    }
+    if (left == right && signbit(left) == signbit(right)) {
+        return left;
+    }
+    return fminf(left, right);
+}
+
+/*
+ * Texture coordinates have already been checked and reduced to [0, 2048].
+ * Bilinear centering can extend this to -0.5, still safely inside int range.
+ */
+static int a2xx_texture_floor(float coordinate)
+{
+    int truncated = coordinate;
+
+    return truncated - (coordinate < truncated);
+}
+
+static void a2xx_fragment_begin(A2xxInvocation *pixel, uint16_t parameters,
+                                 bool trace_texture)
+{
+    uint64_t written = pixel->temporary_written & ~(uint64_t)parameters;
+
+    /*
+     * Interpolated parameters are overwritten below. Other temporaries
+     * start at zero, including the unwritten lanes of partial writes. Only
+     * registers changed by the last invocation need clearing again.
+     */
+    while (written) {
+        unsigned reg = ctz64(written);
+
+        memset(pixel->temporary[reg], 0, sizeof(pixel->temporary[reg]));
+        written &= written - 1;
+    }
+    pixel->temporary_written = 0;
+    /*
+     * Exports are write-only. A color is consumed only after all four lanes
+     * have been written in this invocation, so their values need no reset.
+     */
+    memset(pixel->export_mask, 0, sizeof(pixel->export_mask));
+    pixel->fetch_index_valid = false;
+    pixel->constant_address_valid = false;
+    pixel->trace_texture = trace_texture;
+}
 
 static bool a2xx_fail(QcomA2xxDrawContext *context, const char *reason,
                       unsigned detail)
@@ -238,6 +310,7 @@ static bool a2xx_vertex_fetch(QcomA2xxDrawContext *context,
             return a2xx_fail(context, "nonfinite vertex", word);
         }
     }
+    invocation->temporary_written |= 1ULL << destination;
     return a2xx_fetch_result(invocation->temporary[destination], value,
                               second & 0xfff) ||
            a2xx_fail(context, "vertex destination swizzle", second & 0xfff);
@@ -354,8 +427,10 @@ static bool a2xx_texture_fetch(QcomA2xxDrawContext *context,
         }
     }
     if (min_filter == 0) {
-        unsigned x = a2xx_texture_axis(floorf(coordinates[0]), width, clamp[0]);
-        unsigned y = a2xx_texture_axis(floorf(coordinates[1]), height, clamp[1]);
+        unsigned x = a2xx_texture_axis(a2xx_texture_floor(coordinates[0]),
+                                         width, clamp[0]);
+        unsigned y = a2xx_texture_axis(a2xx_texture_floor(coordinates[1]),
+                                         height, clamp[1]);
 
         if (!a2xx_texture_texel(context, texture, pitch, x, y, value,
                                  invocation->trace_texture)) {
@@ -368,7 +443,7 @@ static bool a2xx_texture_fetch(QcomA2xxDrawContext *context,
         for (unsigned axis = 0; axis < 2; axis++) {
             float centered = coordinates[axis] - 0.5f;
 
-            origin[axis] = floorf(centered);
+            origin[axis] = a2xx_texture_floor(centered);
             fraction[axis] = centered - origin[axis];
         }
         for (unsigned tap = 0; tap < 4; tap++) {
@@ -389,6 +464,7 @@ static bool a2xx_texture_fetch(QcomA2xxDrawContext *context,
             }
         }
     }
+    invocation->temporary_written |= 1ULL << destination;
     if (!a2xx_fetch_result(invocation->temporary[destination], value,
                             second & 0xfff)) {
         return a2xx_fail(context, "texture destination swizzle", second);
@@ -497,8 +573,12 @@ static bool a2xx_alu(QcomA2xxDrawContext *context, A2xxInvocation *invocation,
         switch (scalar_opcode) {
         case 0: scalar = source3[3] + source3[0]; break;
         case 2: scalar = source3[3] * source3[0]; break;
-        case 5: scalar = fmaxf(source3[3], source3[0]); break;
-        case 6: scalar = fminf(source3[3], source3[0]); break;
+        case 5:
+            scalar = a2xx_max(source3[3], source3[0]);
+            break;
+        case 6:
+            scalar = a2xx_min(source3[3], source3[0]);
+            break;
         case 19: scalar = 1.0f / source3[3]; break;
         case 23:
         case 24:
@@ -511,7 +591,7 @@ static bool a2xx_alu(QcomA2xxDrawContext *context, A2xxInvocation *invocation,
                 floorf(source3[3] + (scalar_opcode == 23 ? 0.5f : 0)),
                 -256, 255);
             invocation->constant_address_valid = true;
-            scalar = fmaxf(source3[3], source3[0]);
+            scalar = a2xx_max(source3[3], source3[0]);
             break;
         default: return a2xx_fail(context, "scalar ALU opcode", first >> 26);
         }
@@ -531,8 +611,14 @@ static bool a2xx_alu(QcomA2xxDrawContext *context, A2xxInvocation *invocation,
         switch (opcode) {
         case 0: result[component] = source1[component] + source2[component]; break;
         case 1: result[component] = source1[component] * source2[component]; break;
-        case 2: result[component] = fmaxf(source1[component], source2[component]); break;
-        case 3: result[component] = fminf(source1[component], source2[component]); break;
+        case 2:
+            result[component] = a2xx_max(source1[component],
+                                          source2[component]);
+            break;
+        case 3:
+            result[component] = a2xx_min(source1[component],
+                                          source2[component]);
+            break;
         case 11: result[component] = source1[component] * source2[component] +
                                       source3[component]; break;
         case 15:
@@ -544,6 +630,14 @@ static bool a2xx_alu(QcomA2xxDrawContext *context, A2xxInvocation *invocation,
         }
         if (!isfinite(result[component])) {
             return a2xx_fail(context, "nonfinite ALU result", opcode);
+        }
+    }
+    if (!exported) {
+        if (vector_mask) {
+            invocation->temporary_written |= 1ULL << destination;
+        }
+        if (scalar_mask) {
+            invocation->temporary_written |= 1ULL << scalar_destination;
         }
     }
     for (unsigned component = 0; component < 4; component++) {
@@ -799,6 +893,8 @@ static bool a2xx_primitive(QcomA2xxDrawContext *context,
     uint32_t color = regs[A2XX_COLOR_INFO];
     unsigned pitch = regs[A2XX_SURFACE_INFO] & 0x3fff;
     A2xxInvocation vertex[3] = {0};
+    A2xxInvocation pixel = {0};
+    uint16_t parameters = 0, parameter_inputs;
     A2xxCoverageEdge edges[3];
     g_autofree A2xxPendingPixel *pending = NULL;
     unsigned pixel_count = 0;
@@ -971,10 +1067,18 @@ static bool a2xx_primitive(QcomA2xxDrawContext *context,
     if (resolve && context->fast_resolve) {
         return a2xx_resolve(context, pitch, left, top, right, bottom);
     }
+    for (unsigned parameter = 0; parameter < A2XX_MAX_PARAMETERS; parameter++) {
+        if (vertex[0].export_mask[parameter] |
+            vertex[1].export_mask[parameter] |
+            vertex[2].export_mask[parameter]) {
+            parameters |= 1U << parameter;
+        }
+    }
+    parameter_inputs = context->fast_fragments ? parameters : UINT16_MAX;
     pending = g_new(A2xxPendingPixel, (right - left) * (bottom - top));
     for (int y = top; y < bottom; y++) {
         for (int x = left; x < right; x++) {
-            A2xxInvocation pixel = {.trace_texture = pixel_count == 0};
+            uint16_t remaining_parameters = resolve ? 0 : parameter_inputs;
             float delta_x = x + sample_offset - vertex[0].exported[A2XX_POSITION_EXPORT][0];
             float delta_y = y + sample_offset - vertex[0].exported[A2XX_POSITION_EXPORT][1];
             float weights[2] = {
@@ -1007,6 +1111,12 @@ static bool a2xx_primitive(QcomA2xxDrawContext *context,
                     continue;
                 }
             }
+            if (context->fast_fragments) {
+                a2xx_fragment_begin(&pixel, parameters, pixel_count == 0);
+            } else {
+                memset(&pixel, 0, sizeof(pixel));
+                pixel.trace_texture = pixel_count == 0;
+            }
             /* Perspective-correct interpolation after the viewport divide. */
             if (viewport == 0x43f) {
                 float denominator = (1 - weights[0] - weights[1]) * reciprocal_w[0] +
@@ -1016,7 +1126,19 @@ static bool a2xx_primitive(QcomA2xxDrawContext *context,
                 weights[1] = weights[1] * reciprocal_w[2] / denominator;
             }
 
-            for (unsigned parameter = 0; !resolve && parameter < A2XX_MAX_PARAMETERS; parameter++) {
+            if (!resolve && (!isfinite(weights[0]) || !isfinite(weights[1]))) {
+                /*
+                 * Preserve zero-times-nonfinite interpolation on unusual
+                 * extrapolated rectangles. Reset these inputs next time,
+                 * even when the VS never exported their registers.
+                 */
+                remaining_parameters = UINT16_MAX;
+                pixel.temporary_written |= UINT16_MAX;
+            }
+            while (remaining_parameters) {
+                unsigned parameter = ctz32(remaining_parameters);
+
+                remaining_parameters &= remaining_parameters - 1;
                 for (unsigned component = 0; component < 4; component++) {
                     pixel.temporary[parameter][component] =
                         vertex[0].exported[parameter][component] +
@@ -1092,8 +1214,12 @@ static bool a2xx_primitive(QcomA2xxDrawContext *context,
             }
             for (unsigned component = 0; component < 4; component++) {
                 unsigned output = component;
-                unsigned byte = floorf(CLAMP(pixel.exported[0][component], 0, 1) *
-                                         255 + 0.5f);
+                /*
+                 * After clamping, truncation and floor are identical for
+                 * every finite value in the UNORM8 rounding interval.
+                 */
+                unsigned byte = (unsigned)(CLAMP(pixel.exported[0][component],
+                                                  0, 1) * 255 + 0.5f);
 
                 unsigned swap = resolve ? ((copy_info >> 8) & 3) : ((color >> 9) & 3);
 

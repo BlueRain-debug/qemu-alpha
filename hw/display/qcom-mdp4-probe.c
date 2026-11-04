@@ -81,6 +81,8 @@ struct QcomMdp4ProbeState {
     bool upload_endian_workaround;
     bool draw_cache_enabled;
     bool fast_resolve;
+    bool fast_fragments;
+    bool damage_scanout;
     QcomProbeDrawCache *draw_cache;
     bool boot_lcdc;
     uint32_t boot_width;
@@ -91,6 +93,7 @@ struct QcomMdp4ProbeState {
     uint32_t scanout[25];
     uint32_t scanout_flush;
     bool scanout_identity_csc;
+    bool scanout_needs_full_update;
     uint32_t solid_color;
     bool overlay_pending;
     QcomProbeCommandStream streams[QCOM_CP_MAX_STREAMS];
@@ -445,8 +448,12 @@ static bool qcom_probe_display_update(void *opaque)
     unsigned stride = s->scanout[0x40 / 4] & 0xffff;
     bool vig = s->scanout_flush == MDP_VIG1_FLUSH;
     bool solid = format & (1U << 22);
+    unsigned component_shift[3] = {0};
+    unsigned component_mask[3] = {0};
+    unsigned first_changed = height, last_changed = 0;
     DisplaySurface *surface;
     g_autofree uint8_t *row = NULL;
+    g_autofree uint32_t *converted = NULL;
 
     if (!(regs[MDP_LCDC_ENABLE / 4] & 1) ||
         (vig ? (regs[MDP_MIXER_CONFIG / 4] & 0xf) != MDP_VIG1_MIXER0_BASE :
@@ -467,12 +474,38 @@ static bool qcom_probe_display_update(void *opaque)
         (!solid && (stride < source_width * 4 ||
           (uint64_t)s->scanout[4] +
           (uint64_t)stride * source_height > UINT32_MAX))) {
+        s->scanout_needs_full_update = true;
         return false;
     }
     if (!s->console) {
+        s->scanout_needs_full_update = true;
         return false;
     }
+    if (!solid) {
+        /*
+         * Decode the byte routing once per scanout, including the original
+         * last-write-wins behavior for repeated component selectors.
+         */
+        for (unsigned byte = 0; byte < 4; byte++) {
+            unsigned selector = (unpack >> (byte * 8)) & 0xff;
+
+            if (selector > 3) {
+                s->scanout_needs_full_update = true;
+                return false;
+            }
+            if (selector < 3) {
+                component_shift[selector] = byte * 8;
+                component_mask[selector] = 255;
+            }
+        }
+    }
     row = g_malloc(source_width * 4);
+    converted = g_new(uint32_t, width);
+    surface = qemu_console_surface(s->console);
+    if (!surface || surface_width(surface) != width ||
+        surface_height(surface) != height || surface_is_placeholder(surface)) {
+        s->scanout_needs_full_update = true;
+    }
     qemu_console_resize(s->console, width, height);
     surface = qemu_console_surface(s->console);
     for (unsigned y = 0; y < height; y++) {
@@ -487,32 +520,47 @@ static bool qcom_probe_display_update(void *opaque)
 
         if (!solid && !qcom_probe_display_read(s,
                     s->scanout[4] + source_y * stride, row, source_width * 4)) {
+            /*
+             * Earlier rows may already have changed in the surface. Ensure
+             * the next successful frame also notifies those partial writes.
+             */
+            s->scanout_needs_full_update = true;
             return false;
         }
         for (unsigned x = 0; x < width; x++) {
-            uint8_t components[4] = {0};
+            uint32_t packed;
             unsigned source_x = scale & MDP_SCALE_X_ENABLE ?
                 MIN((uint64_t)x * s->scanout[0x5c / 4] >> MDP_SCALE_PHASE_BITS,
                     source_width - 1) : x;
 
             if (solid) {
-                destination[x] = s->solid_color & 0xffffff;
+                converted[x] = s->solid_color & 0xffffff;
                 continue;
             }
-            for (unsigned component = 0; component < 4; component++) {
-                unsigned selector = (unpack >> (component * 8)) & 0xff;
+            packed = ldl_le_p(row + source_x * 4);
 
-                if (selector > 3) {
-                    return false;
-                }
-                components[selector] = row[source_x * 4 + component];
-            }
             /* MDP component numbers: 0=G, 1=B, 2=R, 3=A. */
-            destination[x] = rgb_to_pixel32(components[2], components[0],
-                                             components[1]);
+            converted[x] = rgb_to_pixel32(
+                (packed >> component_shift[2]) & component_mask[2],
+                (packed >> component_shift[0]) & component_mask[0],
+                (packed >> component_shift[1]) & component_mask[1]);
+        }
+        if (!s->damage_scanout || s->scanout_needs_full_update ||
+            memcmp(destination, converted, width * sizeof(*converted))) {
+            memcpy(destination, converted, width * sizeof(*converted));
+            first_changed = MIN(first_changed, y);
+            last_changed = y + 1;
         }
     }
-    qemu_console_update(s->console, 0, 0, width, height);
+    if (last_changed > first_changed) {
+        qemu_console_update(s->console, 0, first_changed, width,
+                              last_changed - first_changed);
+    }
+    s->scanout_needs_full_update = false;
+    /*
+     * An unchanged image still scanned out successfully. In particular the
+     * display timer must keep completing FLUSH, VSYNC and RDPTR normally.
+     */
     return true;
 }
 
@@ -792,6 +840,7 @@ static QcomProbeCommandResult qcom_probe_execute_packet(
             .gmem_bytes = sizeof(s->gmem),
             .upload_endian_workaround = s->upload_endian_workaround,
             .fast_resolve = s->fast_resolve,
+            .fast_fragments = s->fast_fragments,
             .opaque = s,
             .read_word = qcom_probe_draw_read,
             .write_word = qcom_probe_draw_write,
@@ -1253,6 +1302,7 @@ static void qcom_mdp4_probe_reset(DeviceState *dev)
     memset(s->scanout, 0, sizeof(s->scanout));
     s->scanout_flush = 0;
     s->scanout_identity_csc = false;
+    s->scanout_needs_full_update = true;
     /* Some miniports preserve an output enabled by the platform firmware.
      * Keep this opt-in: a cold, disabled controller is still the default. */
     if (s->boot_lcdc) {
@@ -1319,6 +1369,10 @@ static const VMStateDescription qcom_mdp4_probe_vmstate = {
 static const Property qcom_mdp4_probe_properties[] = {
     DEFINE_PROP_BOOL("draw-cache", QcomMdp4ProbeState, draw_cache_enabled, true),
     DEFINE_PROP_BOOL("fast-resolve", QcomMdp4ProbeState, fast_resolve, true),
+    DEFINE_PROP_BOOL("fast-fragments", QcomMdp4ProbeState,
+                     fast_fragments, true),
+    DEFINE_PROP_BOOL("damage-scanout", QcomMdp4ProbeState,
+                     damage_scanout, true),
     DEFINE_PROP_BOOL("boot-lcdc", QcomMdp4ProbeState, boot_lcdc, false),
     DEFINE_PROP_UINT32("boot-width", QcomMdp4ProbeState, boot_width, 480),
     DEFINE_PROP_UINT32("boot-height", QcomMdp4ProbeState, boot_height, 800),
