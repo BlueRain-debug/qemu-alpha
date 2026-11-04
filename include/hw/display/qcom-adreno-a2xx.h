@@ -13,11 +13,16 @@ typedef struct QcomA2xxDrawContext {
     size_t gmem_bytes;
     /* Opt-in diagnostic for QCDX CPU uploads; not a general endian rule. */
     bool upload_endian_workaround;
+    bool fast_resolve;
     void *opaque;
     bool (*read_word)(void *opaque, uint32_t address, uint32_t *value);
     /* Validate a primitive's destinations before committing its pixels. */
     bool (*writable_word)(void *opaque, uint32_t address);
     bool (*write_word)(void *opaque, uint32_t address, uint32_t value);
+    /* Optional page/range helpers for linear, little-endian resolve rows. */
+    bool (*writable_range)(void *opaque, uint32_t address, size_t length);
+    bool (*write_bytes)(void *opaque, uint32_t address,
+                        const uint8_t *data, size_t length);
     const char *failure;
     unsigned failure_detail;
 } QcomA2xxDrawContext;

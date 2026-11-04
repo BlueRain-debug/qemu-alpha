@@ -20,11 +20,13 @@
 #include "hw/display/qcom-adreno-a2xx.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
+#include "qemu/bswap.h"
 #include "qemu/module.h"
 #include "qemu/host-utils.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 #include "system/address-spaces.h"
+#include "system/memory_cached.h"
 #include "ui/console.h"
 #include "ui/pixel_ops.h"
 #include "trace.h"
@@ -53,6 +55,22 @@ typedef struct QcomProbeCommandStream {
     bool ring;
 } QcomProbeCommandStream;
 
+/* Cache host RAM mappings for one DRAW_INDX only, including page-table RAM.
+ * Descriptors themselves are always reloaded: guest page-table writes must
+ * remain visible without inventing a new, persistent GPU TLB contract. */
+#define QCOM_DRAW_PAGE_SIZE 4096
+#define QCOM_DRAW_CACHE_PAGES 128
+typedef struct QcomProbeRamPage {
+    MemoryRegionCache mapping;
+    hwaddr address;
+    unsigned dirty_start;
+    unsigned dirty_end;
+} QcomProbeRamPage;
+
+typedef struct QcomProbeDrawCache {
+    QcomProbeRamPage pages[QCOM_DRAW_CACHE_PAGES];
+} QcomProbeDrawCache;
+
 struct QcomMdp4ProbeState {
     SysBusDevice parent_obj;
     QcomMdp4ProbeBank banks[QCOM_MDP4_PROBE_BANKS];
@@ -61,6 +79,9 @@ struct QcomMdp4ProbeState {
     uint32_t me_init[18];
     bool me_initialized;
     bool upload_endian_workaround;
+    bool draw_cache_enabled;
+    bool fast_resolve;
+    QcomProbeDrawCache *draw_cache;
     bool boot_lcdc;
     uint32_t boot_width;
     uint32_t boot_height;
@@ -209,6 +230,81 @@ static bool qcom_probe_ram32(hwaddr address, uint32_t *value, bool write)
     return result == MEMTX_OK;
 }
 
+static void qcom_probe_ram_page_clear(QcomProbeRamPage *page)
+{
+    if (page->dirty_end > page->dirty_start) {
+        /* Cached stores require explicit dirty/TB invalidation. Finish it
+         * before dropping or replacing the mapping, and before a fence. */
+        address_space_cache_invalidate(&page->mapping, page->dirty_start,
+                                        page->dirty_end - page->dirty_start);
+    }
+    address_space_cache_destroy(&page->mapping);
+    page->dirty_start = QCOM_DRAW_PAGE_SIZE;
+    page->dirty_end = 0;
+}
+
+static void qcom_probe_draw_cache_clear(QcomProbeDrawCache *cache)
+{
+    for (unsigned index = 0; index < QCOM_DRAW_CACHE_PAGES; index++) {
+        qcom_probe_ram_page_clear(&cache->pages[index]);
+    }
+}
+
+static QcomProbeRamPage *qcom_probe_draw_page(QcomMdp4ProbeState *s,
+                                             hwaddr address, bool write)
+{
+    hwaddr base = address & ~(hwaddr)(QCOM_DRAW_PAGE_SIZE - 1);
+    QcomProbeRamPage *page;
+    unsigned slot;
+    int64_t length;
+
+    if (!s->draw_cache) {
+        return NULL;
+    }
+    /* Mix high address bits so a texture and render target at the same
+     * offset in different GPU allocations do not always evict each other. */
+    slot = ((base >> 12) ^ (base >> 20)) & (QCOM_DRAW_CACHE_PAGES - 1);
+    page = &s->draw_cache->pages[slot];
+    if (page->mapping.mrs.mr && page->address == base &&
+        (!write || page->mapping.is_write)) {
+        return page;
+    }
+    qcom_probe_ram_page_clear(page);
+    length = address_space_cache_init(&page->mapping, &address_space_memory,
+                                      base, QCOM_DRAW_PAGE_SIZE, write);
+    if (length != QCOM_DRAW_PAGE_SIZE || !page->mapping.ptr ||
+        !memory_region_is_ram(page->mapping.mrs.mr) ||
+        (write && memory_region_is_rom(page->mapping.mrs.mr))) {
+        /* Short boundary pages and nondirect mappings use the checked
+         * original accessors. Never execute an MMIO bounce-buffer access. */
+        qcom_probe_ram_page_clear(page);
+        return NULL;
+    }
+    page->address = base;
+    return page;
+}
+
+static bool qcom_probe_draw_ram32(QcomMdp4ProbeState *s, hwaddr address,
+                                  uint32_t *value, bool write)
+{
+    QcomProbeRamPage *page = qcom_probe_draw_page(s, address, write);
+    unsigned offset = address & (QCOM_DRAW_PAGE_SIZE - 1);
+
+    if (!page) {
+        return qcom_probe_ram32(address, value, write);
+    }
+    if (write) {
+        address_space_stl_le_cached(&page->mapping, offset, *value,
+                                    MEMTXATTRS_UNSPECIFIED, NULL);
+        page->dirty_start = MIN(page->dirty_start, offset);
+        page->dirty_end = MAX(page->dirty_end, offset + sizeof(*value));
+    } else {
+        *value = address_space_ldl_le_cached(&page->mapping, offset,
+                                             MEMTXATTRS_UNSPECIFIED, NULL);
+    }
+    return true;
+}
+
 static bool qcom_probe_iommu_address(QcomMdp4ProbeState *s, unsigned bank,
                                      uint32_t address, hwaddr *physical)
 {
@@ -236,7 +332,8 @@ static bool qcom_probe_iommu_address(QcomMdp4ProbeState *s, unsigned bank,
         alignment = 14 - n;
     }
     table &= ~((1U << alignment) - 1);
-    if (!qcom_probe_ram32(table + (address >> 20) * 4, &entry, false)) {
+    if (!qcom_probe_draw_ram32(s, table + (address >> 20) * 4,
+                               &entry, false)) {
         return false;
     }
     switch (entry & 3) {
@@ -247,8 +344,9 @@ static bool qcom_probe_iommu_address(QcomMdp4ProbeState *s, unsigned bank,
         *physical = (entry & 0xfff00000) | (address & 0xfffff);
         return true;
     case 1: /* Coarse second-level table. */
-        if (!qcom_probe_ram32((entry & 0xfffffc00) +
-                              ((address >> 12) & 255) * 4, &entry, false)) {
+        if (!qcom_probe_draw_ram32(s, (entry & 0xfffffc00) +
+                                    ((address >> 12) & 255) * 4,
+                                    &entry, false)) {
             return false;
         }
         if ((entry & 3) == 1) { /* 64 KiB large page. */
@@ -463,7 +561,7 @@ static bool qcom_probe_gpu_read32(QcomMdp4ProbeState *s, uint32_t address,
     hwaddr physical;
 
     return !(address & 3) && qcom_probe_gpu_address(s, address, &physical) &&
-           qcom_probe_ram32(physical, value, false);
+           qcom_probe_draw_ram32(s, physical, value, false);
 }
 
 static bool qcom_probe_gpu_write32(QcomMdp4ProbeState *s, uint32_t address,
@@ -472,7 +570,7 @@ static bool qcom_probe_gpu_write32(QcomMdp4ProbeState *s, uint32_t address,
     hwaddr physical;
 
     return !(address & 3) && qcom_probe_gpu_address(s, address, &physical) &&
-           qcom_probe_ram32(physical, &value, true);
+           qcom_probe_draw_ram32(s, physical, &value, true);
 }
 
 static bool qcom_probe_draw_read(void *opaque, uint32_t address, uint32_t *value)
@@ -494,6 +592,9 @@ static bool qcom_probe_draw_writable(void *opaque, uint32_t address)
     if ((address & 3) || !qcom_probe_gpu_address(opaque, address, &physical)) {
         return false;
     }
+    if (qcom_probe_draw_page(opaque, physical, true)) {
+        return true;
+    }
     section = memory_region_find(get_system_memory(), physical, 4);
     valid = section.mr && memory_region_is_ram(section.mr) &&
             !memory_region_is_rom(section.mr) &&
@@ -502,6 +603,73 @@ static bool qcom_probe_draw_writable(void *opaque, uint32_t address)
         memory_region_unref(section.mr);
     }
     return valid;
+}
+
+static bool qcom_probe_draw_writable_range(void *opaque, uint32_t address,
+                                           size_t length)
+{
+    if ((address & 3) || (length & 3) ||
+        (uint64_t)address + length > (1ULL << 32)) {
+        return false;
+    }
+    while (length) {
+        hwaddr physical;
+        size_t chunk = MIN(length, QCOM_DRAW_PAGE_SIZE -
+                                     (address & (QCOM_DRAW_PAGE_SIZE - 1)));
+
+        if (!qcom_probe_gpu_address(opaque, address, &physical)) {
+            return false;
+        }
+        if (!qcom_probe_draw_page(opaque, physical, true)) {
+            /* Retain exact word-level boundary checks on short RAM pages. */
+            for (size_t offset = 0; offset < chunk; offset += 4) {
+                if (!qcom_probe_draw_writable(opaque, address + offset)) {
+                    return false;
+                }
+            }
+        }
+        address += chunk;
+        length -= chunk;
+    }
+    return true;
+}
+
+static bool qcom_probe_draw_write_bytes(void *opaque, uint32_t address,
+                                        const uint8_t *data, size_t length)
+{
+    if ((address & 3) || (length & 3) ||
+        (uint64_t)address + length > (1ULL << 32)) {
+        return false;
+    }
+    while (length) {
+        hwaddr physical;
+        QcomProbeRamPage *page;
+        unsigned offset = address & (QCOM_DRAW_PAGE_SIZE - 1);
+        size_t chunk = MIN(length, QCOM_DRAW_PAGE_SIZE - offset);
+
+        /* Rewalk descriptors for every committed page, including after
+         * preflight: a guest can change its mappings before the commit. */
+        if (!qcom_probe_gpu_address(opaque, address, &physical)) {
+            return false;
+        }
+        page = qcom_probe_draw_page(opaque, physical, true);
+        if (page) {
+            address_space_write_cached(&page->mapping, offset, data, chunk);
+            page->dirty_start = MIN(page->dirty_start, offset);
+            page->dirty_end = MAX(page->dirty_end, offset + chunk);
+        } else {
+            for (size_t index = 0; index < chunk; index += 4) {
+                if (!qcom_probe_gpu_write32(opaque, address + index,
+                                             ldl_le_p(data + index))) {
+                    return false;
+                }
+            }
+        }
+        address += chunk;
+        data += chunk;
+        length -= chunk;
+    }
+    return true;
 }
 
 static void qcom_probe_update_gpu_irq(QcomMdp4ProbeState *s)
@@ -615,6 +783,7 @@ static QcomProbeCommandResult qcom_probe_execute_packet(
     }
     switch (opcode) {
     case CP_OPCODE_DRAW_INDX: {
+        QcomProbeDrawCache cache = {0};
         QcomA2xxDrawContext context = {
             .registers = regs,
             .shader = {s->shader_instructions[0], s->shader_instructions[1]},
@@ -622,13 +791,17 @@ static QcomProbeCommandResult qcom_probe_execute_packet(
             .gmem = s->gmem,
             .gmem_bytes = sizeof(s->gmem),
             .upload_endian_workaround = s->upload_endian_workaround,
+            .fast_resolve = s->fast_resolve,
             .opaque = s,
             .read_word = qcom_probe_draw_read,
             .write_word = qcom_probe_draw_write,
             .writable_word = qcom_probe_draw_writable,
+            .writable_range = qcom_probe_draw_writable_range,
+            .write_bytes = qcom_probe_draw_write_bytes,
         };
         bool success;
 
+        s->draw_cache = s->draw_cache_enabled ? &cache : NULL;
         /* Auto-indexed RECTLIST, three vertices, no visibility query.
          * Bit 14 enables the driver's pre-draw setup, bit 11 selects index
          * width (irrelevant for auto indexing). Other modes stay pending. */
@@ -649,8 +822,12 @@ static QcomProbeCommandResult qcom_probe_execute_packet(
             success = qcom_a2xx_draw_triangles(&context, payload[3],
                                                 payload[2], payload[4]);
         } else {
+            s->draw_cache = NULL;
+            qcom_probe_draw_cache_clear(&cache);
             return QCOM_CP_UNSUPPORTED;
         }
+        s->draw_cache = NULL;
+        qcom_probe_draw_cache_clear(&cache);
         if (!success) {
             if (s->draw_failure != context.failure ||
                 s->draw_failure_detail != context.failure_detail) {
@@ -1140,6 +1317,8 @@ static const VMStateDescription qcom_mdp4_probe_vmstate = {
 };
 
 static const Property qcom_mdp4_probe_properties[] = {
+    DEFINE_PROP_BOOL("draw-cache", QcomMdp4ProbeState, draw_cache_enabled, true),
+    DEFINE_PROP_BOOL("fast-resolve", QcomMdp4ProbeState, fast_resolve, true),
     DEFINE_PROP_BOOL("boot-lcdc", QcomMdp4ProbeState, boot_lcdc, false),
     DEFINE_PROP_UINT32("boot-width", QcomMdp4ProbeState, boot_width, 480),
     DEFINE_PROP_UINT32("boot-height", QcomMdp4ProbeState, boot_height, 800),

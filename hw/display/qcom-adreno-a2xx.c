@@ -648,6 +648,119 @@ static bool a2xx_top_left(const float start[4], const float end[4])
     return end[1] < start[1] || (end[1] == start[1] && end[0] > start[0]);
 }
 
+static uint64_t a2xx_resolve_address(const uint32_t *regs, unsigned x,
+                                     unsigned y, unsigned pitch, bool linear)
+{
+    unsigned destination_x = x + (regs[A2XX_COPY_DEST_OFFSET] & 8191);
+    unsigned destination_y = y +
+                            ((regs[A2XX_COPY_DEST_OFFSET] >> 13) & 8191);
+    uint64_t offset = linear ?
+        ((uint64_t)destination_y * pitch + destination_x) * 4 :
+        a2xx_tiled_offset(destination_x, destination_y, pitch, 4);
+
+    return (uint64_t)regs[A2XX_COPY_DEST_BASE] + offset;
+}
+
+static bool a2xx_resolve(QcomA2xxDrawContext *context, unsigned pitch,
+                          int left, int top, int right, int bottom)
+{
+    const uint32_t *regs = context->registers;
+    uint32_t color = regs[A2XX_COLOR_INFO];
+    uint32_t copy_info = regs[A2XX_COPY_DEST_INFO];
+    unsigned copy_pitch = regs[A2XX_COPY_DEST_PITCH] * 32;
+    uint32_t source_base = color & 0xfffff000U;
+    unsigned offset_x = regs[A2XX_COPY_DEST_OFFSET] & 8191;
+    unsigned offset_y = (regs[A2XX_COPY_DEST_OFFSET] >> 13) & 8191;
+    unsigned destination_swap = (copy_info >> 8) & 3;
+    bool swap = (((color >> 9) & 3) == 1) != (destination_swap == 1);
+    bool linear = copy_info & 8;
+    size_t row_bytes = (right - left) * 4;
+    g_autofree uint8_t *row = NULL;
+    uint64_t last_source = (uint64_t)source_base +
+                          ((uint64_t)(bottom - 1) * pitch + right) * 4;
+
+    /* A resolve is a bounded on-chip GMEM copy. Geometry and fixed-function
+     * state were already checked by the normal primitive path. Keep exact
+     * byte values rather than unpacking them into floats and packing again. */
+    if (last_source > context->gmem_bytes || right + offset_x > copy_pitch ||
+        bottom + offset_y > A2XX_MAX_DIMENSION) {
+        return a2xx_fail(context, "GMEM resolve bounds", last_source);
+    }
+    if (destination_swap > 1) {
+        return a2xx_fail(context, "color component swap", copy_info);
+    }
+
+    /* Validate every destination before the first store, just like the
+     * general path's pending-pixel pass. Tiled targets retain exact word
+     * validation, so holes outside the rectangle need not be mapped. */
+    for (int y = top; y < bottom; y++) {
+        uint64_t address = a2xx_resolve_address(regs, left, y, copy_pitch,
+                                                linear);
+
+        if (linear && context->writable_range) {
+            if (address + row_bytes > (1ULL << 32) ||
+                !context->writable_range(context->opaque, address, row_bytes)) {
+                return a2xx_fail(context, "render target RAM translation", address);
+            }
+        } else {
+            for (int x = left; x < right; x++) {
+                address = a2xx_resolve_address(regs, x, y, copy_pitch, linear);
+                if (address > UINT32_MAX ||
+                    !context->writable_word(context->opaque, address)) {
+                    return a2xx_fail(context, "render target RAM translation", address);
+                }
+            }
+        }
+    }
+
+    if (linear && context->write_bytes) {
+        row = g_malloc(row_bytes);
+    }
+    for (int y = top; y < bottom; y++) {
+        for (int x = left; x < right; x++) {
+            uint32_t value = context->gmem[source_base / 4 + y * pitch + x];
+
+            if (swap) {
+                value = (value & 0xff00ff00U) |
+                        ((value & 0xff) << 16) | ((value >> 16) & 0xff);
+            }
+            if (row) {
+                stl_le_p(row + (x - left) * 4, value);
+            } else {
+                uint32_t address = a2xx_resolve_address(regs, x, y, copy_pitch,
+                                                       linear);
+
+                if (!context->write_word(context->opaque, address, value)) {
+                    return a2xx_fail(context, "render target write", address);
+                }
+            }
+        }
+        if (row) {
+            uint32_t address = a2xx_resolve_address(regs, left, y, copy_pitch,
+                                                   linear);
+
+            if (!context->write_bytes(context->opaque, address, row, row_bytes)) {
+                return a2xx_fail(context, "render target write", address);
+            }
+        }
+    }
+    {
+        uint32_t first = context->gmem[source_base / 4 + top * pitch + left];
+        uint32_t address = a2xx_resolve_address(regs, left, top, copy_pitch,
+                                               linear);
+
+        if (swap) {
+            first = (first & 0xff00ff00U) |
+                    ((first & 0xff) << 16) | ((first >> 16) & 0xff);
+        }
+        trace_qcom_mdp4_probe_primitive(3, color, pitch,
+            regs[A2XX_RASTER_CONTROL], regs[A2XX_COLOR_CONTROL],
+            regs[A2XX_BLEND_CONTROL], copy_info,
+            (right - left) * (bottom - top), address, first);
+    }
+    return true;
+}
+
 static bool a2xx_primitive(QcomA2xxDrawContext *context,
                             const uint32_t indices[3], bool rectangle)
 {
@@ -810,6 +923,9 @@ static bool a2xx_primitive(QcomA2xxDrawContext *context,
     }
     if (right > pitch || (right - left) * (bottom - top) > A2XX_MAX_PIXELS) {
         return a2xx_fail(context, "rectangle bounds", right);
+    }
+    if (resolve && context->fast_resolve) {
+        return a2xx_resolve(context, pitch, left, top, right, bottom);
     }
     pending = g_new(A2xxPendingPixel, (right - left) * (bottom - top));
     for (int y = top; y < bottom; y++) {
