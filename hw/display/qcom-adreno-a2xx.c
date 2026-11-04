@@ -78,6 +78,14 @@ typedef struct A2xxPendingPixel {
     uint32_t value;
 } A2xxPendingPixel;
 
+typedef struct A2xxCoverageEdge {
+    double x;
+    double y;
+    double constant;
+    bool reverse;
+    bool inclusive;
+} A2xxCoverageEdge;
+
 static bool a2xx_fail(QcomA2xxDrawContext *context, const char *reason,
                       unsigned detail)
 {
@@ -648,6 +656,29 @@ static bool a2xx_top_left(const float start[4], const float end[4])
     return end[1] < start[1] || (end[1] == start[1] && end[0] > start[0]);
 }
 
+static A2xxCoverageEdge a2xx_coverage_edge(const float start[4],
+                                           const float end[4])
+{
+    A2xxCoverageEdge edge = {.inclusive = a2xx_top_left(start, end)};
+
+    /* Use the same endpoint order on both sides of a shared edge. This
+     * makes the evaluated equation identical even if a compiler contracts
+     * its arithmetic. Only the final sign differs between the triangles. */
+    edge.reverse = start[0] > end[0] ||
+                   (start[0] == end[0] && start[1] > end[1]);
+    if (edge.reverse) {
+        const float *temporary = start;
+
+        start = end;
+        end = temporary;
+    }
+    edge.x = (double)start[1] - end[1];
+    edge.y = (double)end[0] - start[0];
+    edge.constant = (double)start[0] * end[1] -
+                    (double)start[1] * end[0];
+    return edge;
+}
+
 static uint64_t a2xx_resolve_address(const uint32_t *regs, unsigned x,
                                      unsigned y, unsigned pitch, bool linear)
 {
@@ -768,6 +799,7 @@ static bool a2xx_primitive(QcomA2xxDrawContext *context,
     uint32_t color = regs[A2XX_COLOR_INFO];
     unsigned pitch = regs[A2XX_SURFACE_INFO] & 0x3fff;
     A2xxInvocation vertex[3] = {0};
+    A2xxCoverageEdge edges[3];
     g_autofree A2xxPendingPixel *pending = NULL;
     unsigned pixel_count = 0;
     int left, top, right, bottom;
@@ -885,6 +917,18 @@ static bool a2xx_primitive(QcomA2xxDrawContext *context,
             (front ? A2XX_CULL_FRONT : A2XX_CULL_BACK)) {
             return true;
         }
+        for (unsigned edge = 0; edge < 3; edge++) {
+            const float *start = vertex[(edge + 1) % 3].exported[A2XX_POSITION_EXPORT];
+            const float *end = vertex[(edge + 2) % 3].exported[A2XX_POSITION_EXPORT];
+
+            if (determinant < 0) {
+                const float *temporary = start;
+
+                start = end;
+                end = temporary;
+            }
+            edges[edge] = a2xx_coverage_edge(start, end);
+        }
     }
     left = ceilf(CLAMP(minimum[0] - sample_offset, 0, A2XX_MAX_DIMENSION));
     right = ceilf(CLAMP(maximum[0] - sample_offset, 0, A2XX_MAX_DIMENSION));
@@ -941,20 +985,20 @@ static bool a2xx_primitive(QcomA2xxDrawContext *context,
             uint32_t packed = 0;
 
             if (!rectangle) {
-                float barycentric[3] = {1 - weights[0] - weights[1],
-                                          weights[0], weights[1]};
                 bool covered = true;
 
+                /* Coverage must not depend on rounded interpolation
+                 * weights. In particular, 1-u-v can become slightly
+                 * negative on an exactly horizontal or shared edge. */
                 for (unsigned edge = 0; edge < 3; edge++) {
-                    unsigned first = (edge + 1) % 3, last = (edge + 2) % 3;
-                    bool inclusive = determinant > 0 ?
-                        a2xx_top_left(vertex[first].exported[A2XX_POSITION_EXPORT],
-                                       vertex[last].exported[A2XX_POSITION_EXPORT]) :
-                        a2xx_top_left(vertex[last].exported[A2XX_POSITION_EXPORT],
-                                       vertex[first].exported[A2XX_POSITION_EXPORT]);
+                    double value = edges[edge].x * (x + (double)sample_offset) +
+                                   edges[edge].y * (y + (double)sample_offset) +
+                                   edges[edge].constant;
 
-                    if (barycentric[edge] < 0 ||
-                        (barycentric[edge] == 0 && !inclusive)) {
+                    if (edges[edge].reverse) {
+                        value = -value;
+                    }
+                    if (value < 0 || (value == 0 && !edges[edge].inclusive)) {
                         covered = false;
                         break;
                     }
