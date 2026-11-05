@@ -87,6 +87,7 @@ struct QcomMdp4ProbeState {
     bool boot_lcdc;
     uint32_t boot_width;
     uint32_t boot_height;
+    uint32_t gpu_chip_id;
     QEMUTimer *command_timer;
     QEMUTimer *display_timer;
     QemuConsole *console;
@@ -1279,12 +1280,16 @@ static void qcom_mdp4_probe_reset(DeviceState *dev)
         s->banks[i].repeated_reads = 0;
     }
     s->banks[0].registers[MDP4_VERSION_REGISTER] = MDP4_VERSION_4_0;
-    /* The original miniport combines these into supported ID 0x02020005:
-     * PERIPHID1[3:0], PERIPHID2[7:4], PATCH[7:0], PATCH[23:16]. This identifies
-     * the initialization target only; it does not implement Adreno execution. */
-    s->banks[ADRENO_BANK].registers[ADRENO_PERIPHID1 / 4] = 2;
-    s->banks[ADRENO_BANK].registers[ADRENO_PERIPHID2 / 4] = 0x20;
-    s->banks[ADRENO_BANK].registers[ADRENO_PATCH_RELEASE / 4] = 0x00050000;
+    /* Miniports assemble core.major.minor.patch from PERIPHID1[3:0],
+     * PERIPHID2[7:4], PATCH[7:0], PATCH[23:16]. Earlier miniports recognize
+     * 2.1.0.0 but reject the default 2.2.0.5 before starting the GPU. This
+     * property selects identification registers, not a complete GPU revision. */
+    s->banks[ADRENO_BANK].registers[ADRENO_PERIPHID1 / 4] =
+        (s->gpu_chip_id >> 24) & 0xf;
+    s->banks[ADRENO_BANK].registers[ADRENO_PERIPHID2 / 4] =
+        ((s->gpu_chip_id >> 16) & 0xf) << 4;
+    s->banks[ADRENO_BANK].registers[ADRENO_PATCH_RELEASE / 4] =
+        ((s->gpu_chip_id >> 8) & 0xff) | ((s->gpu_chip_id & 0xff) << 16);
     memset(s->me_init, 0, sizeof(s->me_init));
     s->me_initialized = false;
     s->protected_mode = false;
@@ -1376,6 +1381,8 @@ static const Property qcom_mdp4_probe_properties[] = {
     DEFINE_PROP_BOOL("boot-lcdc", QcomMdp4ProbeState, boot_lcdc, false),
     DEFINE_PROP_UINT32("boot-width", QcomMdp4ProbeState, boot_width, 480),
     DEFINE_PROP_UINT32("boot-height", QcomMdp4ProbeState, boot_height, 800),
+    DEFINE_PROP_UINT32("gpu-chip-id", QcomMdp4ProbeState,
+                       gpu_chip_id, 0x02020005),
     DEFINE_PROP_BOOL("upload-endian-workaround", QcomMdp4ProbeState,
                      upload_endian_workaround, false),
 };
@@ -1384,6 +1391,12 @@ static void qcom_mdp4_probe_realize(DeviceState *dev, Error **errp)
 {
     QcomMdp4ProbeState *s = QCOM_MDP4_PROBE(dev);
 
+    if ((s->gpu_chip_id >> 24) != 2 ||
+        ((s->gpu_chip_id >> 16) & 0xff) > 0xf) {
+        error_setg(errp, "GPU chip ID must identify an A2xx core with a "
+                   "4-bit major revision");
+        return;
+    }
     if (s->boot_lcdc && (!s->boot_width || !s->boot_height ||
         s->boot_width > MDP_MAX_DIMENSION ||
         s->boot_height > MDP_MAX_DIMENSION)) {
