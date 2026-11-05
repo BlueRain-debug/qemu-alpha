@@ -55,10 +55,12 @@
 #define A2XX_MAX_PARAMETERS 16
 #define A2XX_MAX_DIMENSION 2048
 #define A2XX_MAX_PIXELS (1024 * 1024)
-/* Bound command work, while allowing a scrolling UI's batched glyph quads.
- * Each quad contributes six indices; 3072 allows 512 quads per draw. */
-#define A2XX_MAX_TRIANGLE_INDICES 3072
-#define A2XX_MAX_TRIANGLES (A2XX_MAX_TRIANGLE_INDICES / 3)
+/* Bound interpreter work per draw rather than imposing a hardware limit.
+ * Batched application UI glyphs can exceed 512 quads in a single command.
+ * Allow 2048 quads (4096 triangles), retaining the same primitive budget
+ * for indexed lists, auto-indexed lists and triangle strips. */
+#define A2XX_MAX_TRIANGLES 4096
+#define A2XX_MAX_TRIANGLE_INDICES (A2XX_MAX_TRIANGLES * 3)
 #define A2XX_VERTEX_FETCH_SIGNED (1U << 12)
 #define A2XX_VERTEX_FETCH_INTEGER (1U << 13)
 
