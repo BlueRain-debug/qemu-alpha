@@ -15,6 +15,7 @@
 #include "qemu/bswap.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
+#include "system/system.h"
 #include "ui/input.h"
 #include "trace.h"
 
@@ -24,6 +25,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(QcomNativeInputState, QCOM_NATIVE_INPUT)
 #define GPIO_SIZE       0x4000
 #define QUP_SIZE        0x800
 #define TOUCH_PIN       61
+#define BUTTON_COUNT    3
 #define TOUCH_ADDRESS   0x24
 #define TOUCH_PACKET    32
 #define RX_CAPACITY     512
@@ -78,6 +80,11 @@ struct QcomNativeInputState {
     qemu_irq gpio_irq;
     qemu_irq qup_irq;
     QemuInputHandlerState *input;
+    QemuInputHandlerState *keys;
+    Notifier machine_done;
+    bool buttons;
+    int active_button;
+    uint32_t button_strip_height;
     uint32_t gpio[GPIO_SIZE / 4];
     uint32_t qup[QUP_SIZE / 4];
     uint16_t rx[RX_CAPACITY];
@@ -500,9 +507,24 @@ static void native_input_event(DeviceState *dev, QemuConsole *src,
         s->input_dirty |= s->contact;
     } else if (event->type == INPUT_EVENT_KIND_BTN &&
                event->btn.button == INPUT_BUTTON_LEFT) {
+        if (s->active_button >= 0) {
+            /* One contact: a pointer click cannot steal a held key. */
+            return;
+        }
         s->contact = event->btn.down;
         s->input_dirty = true;
     }
+}
+
+static void native_touch_from_view(QcomNativeInputState *s, unsigned x,
+                                  unsigned y, bool down)
+{
+    x += s->x_offset;
+    y += s->y_offset;
+    if (s->invert_y) {
+        y = s->sensor_y_max - y;
+    }
+    native_touch_enqueue(s, (NativeTouchReport) { x, y, down });
 }
 
 static void native_input_sync(DeviceState *dev)
@@ -516,12 +538,7 @@ static void native_input_sync(DeviceState *dev)
     s->input_dirty = false;
     x = qemu_input_scale_axis(s->x, 0, INPUT_EVENT_ABS_MAX, 0, s->max_x);
     y = qemu_input_scale_axis(s->y, 0, INPUT_EVENT_ABS_MAX, 0, s->max_y);
-    x += s->x_offset;
-    y += s->y_offset;
-    if (s->invert_y) {
-        y = s->sensor_y_max - y;
-    }
-    native_touch_enqueue(s, (NativeTouchReport) { x, y, s->contact });
+    native_touch_from_view(s, x, y, s->contact);
 }
 
 static const QemuInputHandler native_input_handler = {
@@ -530,6 +547,66 @@ static const QemuInputHandler native_input_handler = {
     .event = native_input_event,
     .sync = native_input_sync,
 };
+
+static void native_key_event(DeviceState *dev, QemuConsole *src,
+                            QemuInputEvent *event)
+{
+    QcomNativeInputState *s = QCOM_NATIVE_INPUT(dev);
+    int key = qemu_input_linux_to_qcode(event->key.key);
+    unsigned button;
+    unsigned x, y;
+
+    switch (key) {
+    case Q_KEY_CODE_ESC:
+        button = 0; /* Back */
+        break;
+    case Q_KEY_CODE_F2:
+        button = 1; /* Start */
+        break;
+    case Q_KEY_CODE_F3:
+        button = 2; /* Search */
+        break;
+    default:
+        return;
+    }
+    if (event->key.down) {
+        if (s->contact || s->active_button >= 0) {
+            /* Ignore repeats and chords on this single-contact sensor. */
+            return;
+        }
+        s->active_button = button;
+    } else {
+        if (s->active_button != button) {
+            return;
+        }
+        s->active_button = -1;
+    }
+    /*
+     * This panel's navigation keys are capacitive zones below the visible
+     * display, not GPIO side buttons. Send an ordinary Cypress contact there;
+     * the original TOUCH/BUTTONS configuration supplies the key mapping.
+     * Use three evenly spaced centres within the calibrated button strip.
+     */
+    x = (2 * button + 1) * (uint64_t)s->max_x / (2 * BUTTON_COUNT);
+    y = s->max_y + 1 + s->button_strip_height / 2;
+    trace_qcom_native_button(button, event->key.down);
+    native_touch_from_view(s, x, y, event->key.down);
+}
+
+static const QemuInputHandler native_key_handler = {
+    .name = "MSM8660 Cypress navigation buttons",
+    .mask = INPUT_EVENT_MASK_KEY,
+    .event = native_key_event,
+};
+
+static void native_keys_activate(Notifier *notifier, void *data)
+{
+    QcomNativeInputState *s = container_of(notifier, QcomNativeInputState,
+                                         machine_done);
+
+    /* Select the native backend after command-line USB devices. */
+    qemu_input_handler_activate(s->keys);
+}
 
 static void native_input_reset(DeviceState *dev)
 {
@@ -543,6 +620,7 @@ static void native_input_reset(DeviceState *dev)
     s->host_mode = s->touch_register = s->touch_position = s->slave = 0;
     s->bootloader = false;
     s->contact = s->input_dirty = false;
+    s->active_button = -1;
     s->report_pending = false;
     s->report_head = s->report_count = 0;
     timer_del(s->report_timer);
@@ -563,8 +641,24 @@ static void native_input_realize(DeviceState *dev, Error **errp)
         error_setg(errp, "Native touch coordinate limits must fit 16 bits");
         return;
     }
+    if (s->buttons) {
+        uint64_t button_y = s->max_y + 1 +
+                            (uint64_t)s->button_strip_height / 2 + s->y_offset;
+
+        if (!s->button_strip_height || button_y > UINT16_MAX ||
+            (s->invert_y && button_y > s->sensor_y_max)) {
+            error_setg(errp,
+                       "Native navigation button strip exceeds sensor bounds");
+            return;
+        }
+    }
     s->report_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, native_touch_next, s);
     s->input = qemu_input_handler_register(dev, &native_input_handler);
+    if (s->buttons) {
+        s->keys = qemu_input_handler_register(dev, &native_key_handler);
+        s->machine_done.notify = native_keys_activate;
+        qemu_add_machine_init_done_notifier(&s->machine_done);
+    }
 }
 
 static void native_input_unrealize(DeviceState *dev)
@@ -572,6 +666,10 @@ static void native_input_unrealize(DeviceState *dev)
     QcomNativeInputState *s = QCOM_NATIVE_INPUT(dev);
 
     qemu_input_handler_unregister(s->input);
+    if (s->buttons) {
+        qemu_remove_machine_init_done_notifier(&s->machine_done);
+        qemu_input_handler_unregister(s->keys);
+    }
     timer_free(s->report_timer);
 }
 
@@ -591,6 +689,10 @@ static void native_input_init(Object *obj)
 }
 
 static const Property native_input_properties[] = {
+    DEFINE_PROP_BOOL("buttons", QcomNativeInputState, buttons, false),
+    /* Original calibration: a 135-pixel strip below the 800-pixel view. */
+    DEFINE_PROP_UINT32("button-strip-height", QcomNativeInputState,
+                       button_strip_height, 135),
     DEFINE_PROP_UINT32("max-x", QcomNativeInputState, max_x, 479),
     DEFINE_PROP_UINT32("max-y", QcomNativeInputState, max_y, 799),
     /* MSM8660 reference panel: 540x995 sensor, 480x800 view, inverted Y. */
