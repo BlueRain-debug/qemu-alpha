@@ -2998,6 +2998,17 @@ static void create_winrt_devices(const VirtMachineState *vms)
         sysbus_create_simple("tegra20-apb-dma", 0x6000a000, NULL);
     }
 
+    if (vms->winrt_qcom_cypress_touch) {
+        SysBusDevice *input = SYS_BUS_DEVICE(qdev_new("qcom-msm8660-input"));
+
+        DEVICE(input)->id = g_strdup("native-touch");
+        sysbus_realize_and_unref(input, &error_fatal);
+        sysbus_mmio_map_overlap(input, 0, 0x00800000, 2);
+        sysbus_mmio_map_overlap(input, 1, 0x16280000, 2);
+        sysbus_connect_irq(input, 0, qdev_get_gpio_in(vms->gic, 0x30 - 32));
+        sysbus_connect_irq(input, 1, qdev_get_gpio_in(vms->gic, 0xb7 - 32));
+    }
+
     /* Default USB peripherals use the last-created, firmware-visible bus. */
     sysbus_create_simple(TYPE_PLATFORM_EHCI, vms->memmap[VIRT_EHCI].base,
                          qdev_get_gpio_in(vms->gic, vms->irqmap[VIRT_EHCI]));
@@ -3171,6 +3182,13 @@ static void machvirt_init(MachineState *machine)
         error_report("winrt-qcdx-ssdt requires winrt-qcdx-probe=on");
         exit(1);
     }
+
+    if (vms->winrt_qcom_cypress_touch &&
+        (!vms->winrt_qcdx_probe || vms->gic_version != VIRT_GIC_VERSION_2)) {
+        error_report("winrt-qcom-cypress-touch requires winrt-qcdx-probe=on "
+                     "and gic-version=2 with matching native input ACPI");
+        exit(1);
+    }
     if (vms->winrt_qcdx_probe &&
         (!vms->winrt || !vms->winrt_qcom_timer || vms->winrt_pci ||
          vms->winrt_legacy_ram || vms->gic_version != VIRT_GIC_VERSION_2 ||
@@ -3180,6 +3198,13 @@ static void machvirt_init(MachineState *machine)
                      "winrt-qcom-timer=on, gic-version=2, winrt-pci=off, "
                      "winrt-legacy-ram=off and 64 MiB to 2944 MiB RAM");
         exit(1);
+    }
+
+    if (vms->winrt_qcom_cypress_touch) {
+        /* Native TLMM owns GSIV 48, the first default virtio interrupt. */
+        memcpy(vms->winrt_tegra_irqmap, a15irqmap, sizeof(a15irqmap));
+        vms->winrt_tegra_irqmap[VIRT_MMIO] = 176;
+        vms->irqmap = vms->winrt_tegra_irqmap;
     }
 
     if (vms->winrt_omap_dma && !vms->winrt_omap_timer) {
@@ -3744,6 +3769,16 @@ static bool virt_get_winrt_pci(Object *obj, Error **errp)
 static bool virt_get_winrt_qcdx_probe(Object *obj, Error **errp)
 {
     return VIRT_MACHINE(obj)->winrt_qcdx_probe;
+}
+
+static bool virt_get_winrt_qcom_cypress_touch(Object *obj, Error **errp)
+{
+    return VIRT_MACHINE(obj)->winrt_qcom_cypress_touch;
+}
+
+static void virt_set_winrt_qcom_cypress_touch(Object *obj, bool value, Error **errp)
+{
+    VIRT_MACHINE(obj)->winrt_qcom_cypress_touch = value;
 }
 
 static void virt_set_winrt_qcdx_probe(Object *obj, bool value, Error **errp)
@@ -4815,6 +4850,12 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_str(oc, "winrt-qcdx-ssdt",
                                   virt_get_winrt_qcdx_ssdt,
                                   virt_set_winrt_qcdx_ssdt);
+    object_class_property_add_bool(oc, "winrt-qcom-cypress-touch",
+                                   virt_get_winrt_qcom_cypress_touch,
+                                   virt_set_winrt_qcom_cypress_touch);
+    object_class_property_set_description(oc, "winrt-qcom-cypress-touch",
+        "Expose experimental MSM8660 QUP/TLMM and native Cypress touch; "
+        "requires matching native input ACPI in the QCDX SSDT");
     object_class_property_set_description(oc, "winrt-qcdx-ssdt",
         "Local original-machine SSDT containing the SMMU/GPU resources "
         "and panel data for the QCDX probe");

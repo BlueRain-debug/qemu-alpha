@@ -53,3 +53,10 @@ virtio_input_queue_full(void) "queue full"
 lasips2_reg_read(unsigned int size, int id, uint64_t addr, const char *name, uint64_t val) "%u %d addr 0x%"PRIx64 "%s -> 0x%"PRIx64
 lasips2_reg_write(unsigned int size, int id, uint64_t addr, const char *name, uint64_t val) "%u %d addr 0x%"PRIx64 "%s <- 0x%"PRIx64
 lasips2_intr(unsigned int val) "%d"
+
+# qcom-msm8660-input.c
+qcom_native_input_mmio(bool qup, bool write, uint64_t offset, uint32_t value) "qup=%d write=%d offset=0x%"PRIx64 " value=0x%x"
+qcom_native_qup_tag(uint16_t word) "word=0x%04x"
+qcom_native_touch_command(unsigned int offset, uint8_t value) "offset=0x%x value=0x%x"
+qcom_native_touch_read(unsigned int offset, unsigned int count, uint8_t mode) "offset=0x%x count=%u mode=0x%x"
+qcom_native_touch_report(unsigned int x, unsigned int y, bool down) "x=%u y=%u down=%d"
