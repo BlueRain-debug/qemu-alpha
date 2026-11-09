@@ -1,9 +1,10 @@
 /*
- * Experimental MSM8660 QUP/TLMM/Cypress TTSP input path.
+ * Experimental MSM8660 QUP/TLMM input with Cypress TTSP or Synaptics RMI4.
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * Register/tag definitions follow the public Linux i2c-qup, msm8660 pinctrl
- * and cyttsp Gen3 interfaces. This is a bounded PIO/single-contact subset,
+ * cyttsp Gen3 and Synaptics RMI4 interfaces. This is a bounded
+ * PIO/single-contact subset,
  * intended for local bring-up with the original Windows Phone drivers.
  */
 #include "qemu/osdep.h"
@@ -30,6 +31,25 @@ OBJECT_DECLARE_SIMPLE_TYPE(QcomNativeInputState, QCOM_NATIVE_INPUT)
 #define TOUCH_PACKET    32
 #define RX_CAPACITY     512
 #define REPORT_CAPACITY 64
+
+/* RMI4 page zero: independent query, command, control and data banks. */
+#define RMI_TOUCH_ADDRESS 0x4b
+#define RMI_TOUCH_PIN     11
+#define RMI_PAGE_SELECT   0xff
+#define RMI_PDT_START     0xe9
+#define RMI_PDT_ENTRY     6
+#define RMI_F01_QUERY     0x10
+#define RMI_F01_COMMAND   0x28
+#define RMI_F01_CONTROL   0x30
+#define RMI_F01_DATA      0x38
+#define RMI_F34_QUERY     0x40
+#define RMI_F11_QUERY     0x60
+#define RMI_F11_CONTROL   0x80
+#define RMI_F11_DATA      0xb0
+#define RMI_F11_PACKET    8
+#define RMI_COORD_MAX     0xfff /* F11 absolute coordinates are 12-bit. */
+/* F01 and F34 precede F11, each consuming one interrupt-source bit. */
+#define RMI_F11_INTERRUPT (1 << 2)
 
 typedef struct NativeTouchReport {
     uint16_t x;
@@ -83,6 +103,8 @@ struct QcomNativeInputState {
     QemuInputHandlerState *keys;
     Notifier machine_done;
     bool buttons;
+    bool synaptics;
+    uint8_t rmi_page;
     int active_button;
     uint32_t button_strip_height;
     uint32_t gpio[GPIO_SIZE / 4];
@@ -118,18 +140,20 @@ struct QcomNativeInputState {
 
 static void native_gpio_irq(QcomNativeInputState *s)
 {
-    uint32_t enabled = s->gpio[GPIO_REGISTER(TOUCH_PIN, 8) / 4];
-    uint32_t pending = s->gpio[GPIO_REGISTER(TOUCH_PIN, 12) / 4];
+    unsigned pin = s->synaptics ? RMI_TOUCH_PIN : TOUCH_PIN;
+    uint32_t enabled = s->gpio[GPIO_REGISTER(pin, 8) / 4];
+    uint32_t pending = s->gpio[GPIO_REGISTER(pin, 12) / 4];
 
     qemu_set_irq(s->gpio_irq, (enabled & pending & 1) != 0);
 }
 
 static void native_touch_ready(QcomNativeInputState *s, bool ready)
 {
-    uint32_t *level = &s->gpio[GPIO_REGISTER(TOUCH_PIN, 4) / 4];
+    unsigned pin = s->synaptics ? RMI_TOUCH_PIN : TOUCH_PIN;
+    uint32_t *level = &s->gpio[GPIO_REGISTER(pin, 4) / 4];
 
     if (ready && (*level & 1)) {
-        s->gpio[GPIO_REGISTER(TOUCH_PIN, 12) / 4] |= 1;
+        s->gpio[GPIO_REGISTER(pin, 12) / 4] |= 1;
     }
     *level = (*level & ~1U) | !ready;
     native_gpio_irq(s);
@@ -138,6 +162,23 @@ static void native_touch_ready(QcomNativeInputState *s, bool ready)
 static void native_touch_publish(QcomNativeInputState *s,
                                  NativeTouchReport report)
 {
+    if (s->synaptics) {
+        uint8_t *data = &s->touch_data[RMI_F11_DATA];
+
+        /* Ten-finger F11 layout: three state bytes, then five bytes/contact. */
+        memset(data, 0, RMI_F11_PACKET);
+        data[0] = report.down ? 1 : 0;
+        data[3] = report.x >> 4;
+        data[4] = report.y >> 4;
+        data[5] = ((report.y & 15) << 4) | (report.x & 15);
+        data[6] = report.down ? 0x55 : 0;
+        data[7] = report.down ? 128 : 0;
+        s->touch_data[RMI_F01_DATA + 1] |= RMI_F11_INTERRUPT;
+        s->report_pending = true;
+        trace_qcom_native_touch_report(report.x, report.y, report.down);
+        native_touch_ready(s, true);
+        return;
+    }
     memset(s->touch_data, 0, TOUCH_PACKET);
     s->touch_data[2] = report.down ? 1 : 0;
     stw_be_p(&s->touch_data[3], report.x);
@@ -165,6 +206,9 @@ static void native_touch_next(void *opaque)
 static void native_touch_ack(QcomNativeInputState *s)
 {
     s->report_pending = false;
+    if (s->synaptics) {
+        s->touch_data[RMI_F01_DATA + 1] &= ~RMI_F11_INTERRUPT;
+    }
     native_touch_ready(s, false);
     if (s->report_count) {
         /* Give the GPIO consumer a distinct inactive interval between frames. */
@@ -240,7 +284,9 @@ static void native_qup_reset(QcomNativeInputState *s)
 {
     memset(s->qup, 0, sizeof(s->qup));
     s->qup[QUP_STATE / 4] = QUP_STATE_VALID | QUP_MASTER_GEN;
-    s->qup[QUP_IO_MODE / 4] = QUP_IO_CAPS;
+    /* The RMI controller's 38-byte configuration fits a 128-byte TX FIFO. */
+    s->qup[QUP_IO_MODE / 4] = (QUP_IO_CAPS & ~(7U << 2)) |
+                             ((s->synaptics ? 2U : 1U) << 2);
     s->qup[QUP_HW_VERSION / 4] = 0x10010000;
     s->rx_head = s->rx_count = s->output_seen = 0;
     s->rx_block_remaining = 0;
@@ -248,10 +294,52 @@ static void native_qup_reset(QcomNativeInputState *s)
     native_qup_irq(s);
 }
 
+static void native_rmi_reset(QcomNativeInputState *s)
+{
+    static const uint8_t descriptors[][RMI_PDT_ENTRY] = {
+        { RMI_F01_QUERY, RMI_F01_COMMAND, RMI_F01_CONTROL, RMI_F01_DATA,
+          1, 0x01 },
+        { RMI_F34_QUERY, 0x48, 0x50, 0x58, 1, 0x34 },
+        { RMI_F11_QUERY, 0x70, RMI_F11_CONTROL, RMI_F11_DATA, 1, 0x11 },
+    };
+
+    memset(s->touch_data, 0, sizeof(s->touch_data));
+    s->rmi_page = 0;
+    for (unsigned i = 0; i < ARRAY_SIZE(descriptors); i++) {
+        memcpy(&s->touch_data[RMI_PDT_START - i * RMI_PDT_ENTRY],
+               descriptors[i], RMI_PDT_ENTRY);
+    }
+    s->touch_data[RMI_F01_QUERY] = 1; /* Synaptics manufacturer ID. */
+    memcpy(&s->touch_data[RMI_F01_QUERY + 11], "QEMU-RMI4 ", 10);
+    /* Ten-finger F11 packet layout, with absolute coordinates. */
+    s->touch_data[RMI_F11_QUERY + 1] = 5 | (1 << 4);
+    s->touch_data[RMI_F01_CONTROL + 1] = 0x07;
+    stw_le_p(&s->touch_data[RMI_F11_CONTROL + 6], 816);
+    stw_le_p(&s->touch_data[RMI_F11_CONTROL + 8], 1394);
+}
+
 static uint8_t native_touch_read(QcomNativeInputState *s)
 {
     unsigned offset = s->touch_position++;
 
+    if (s->synaptics) {
+        offset &= 0xff;
+        if (offset == RMI_PAGE_SELECT) {
+            return s->rmi_page;
+        }
+        if (s->rmi_page) {
+            return 0; /* No functions on the other RMI pages. */
+        }
+        if (offset == RMI_F01_DATA + 1) {
+            /* Reading F01 status clears attention, not the unread F11 frame. */
+            uint8_t value = s->touch_data[offset];
+
+            s->touch_data[offset] = 0;
+            native_touch_ready(s, false);
+            return value;
+        }
+        return s->touch_data[offset];
+    }
     if (s->bootloader) {
         static const uint8_t boot_info[] = {
             0, 0x11, 0, 1, 0, 1, 0, 3, 0, 0x20, 0, 1, 0, 0, 0, 1,
@@ -275,6 +363,22 @@ static void native_touch_write(QcomNativeInputState *s, uint8_t value)
     unsigned offset = s->touch_position++;
 
     trace_qcom_native_touch_command(offset, value);
+    if (s->synaptics) {
+        offset &= 0xff;
+        if (offset == RMI_PAGE_SELECT) {
+            s->rmi_page = value;
+        } else if (!s->rmi_page && offset == RMI_F01_COMMAND && (value & 1)) {
+            native_rmi_reset(s);
+            s->report_head = s->report_count = 0;
+            timer_del(s->report_timer);
+            native_touch_ack(s);
+        } else if (!s->rmi_page &&
+                   ((offset >= RMI_F01_CONTROL && offset < RMI_F01_DATA) ||
+                    (offset >= RMI_F11_CONTROL && offset < RMI_F11_DATA))) {
+            s->touch_data[offset] = value;
+        }
+        return;
+    }
     if (offset == 0) {
         if (value & 1) {
             s->bootloader = true;
@@ -301,9 +405,12 @@ static void native_touch_write(QcomNativeInputState *s, uint8_t value)
 static void native_qup_tag(QcomNativeInputState *s, uint16_t word)
 {
     unsigned tag = (word >> 8) & 7;
+    unsigned total = MAX(s->qup[QUP_MX_OUTPUT_CNT / 4],
+                         s->qup[QUP_MX_WRITE_CNT / 4]);
     uint8_t value = word;
 
-    if (!tag) {
+    if (!tag || (total && s->output_seen >= total)) {
+        /* FIFO block padding is outside the programmed transfer. */
         return;
     }
     trace_qcom_native_qup_tag(word);
@@ -311,25 +418,25 @@ static void native_qup_tag(QcomNativeInputState *s, uint16_t word)
     switch (tag) {
     case 1:                         /* START: address plus R/W bit. */
         s->slave = value >> 1;
-        /* This Cypress firmware uses a persistent, 16-bit LE register selector. */
-        s->address_bytes = (value & 1) ? 0 : 2;
+        /* Cypress uses a 16-bit LE selector; RMI4 uses an 8-bit page offset. */
+        s->address_bytes = (value & 1) ? 0 : (s->synaptics ? 1 : 2);
         if (value & 1) {
             s->touch_position = s->touch_register;
         } else {
             s->touch_register = 0;
         }
-        if (s->slave != TOUCH_ADDRESS) {
+        if (s->slave != (s->synaptics ? RMI_TOUCH_ADDRESS : TOUCH_ADDRESS)) {
             s->qup[QUP_I2C_STATUS / 4] |= 1 << 3;
         }
         break;
     case 2:                         /* Data byte, possibly last before STOP. */
     case 3:
-        if (s->slave == TOUCH_ADDRESS) {
+        if (s->slave == (s->synaptics ? RMI_TOUCH_ADDRESS : TOUCH_ADDRESS)) {
             if (s->address_bytes == 2) {
                 s->touch_register = value;
                 s->address_bytes--;
             } else if (s->address_bytes == 1) {
-                s->touch_register |= value << 8;
+                s->touch_register |= s->synaptics ? value : value << 8;
                 s->touch_position = s->touch_register;
                 s->address_bytes--;
             } else {
@@ -349,13 +456,18 @@ static void native_qup_tag(QcomNativeInputState *s, uint16_t word)
                 s->qup[QUP_ERROR_FLAGS / 4] |= 1;
                 break;
             }
-            byte = s->slave == TOUCH_ADDRESS ? native_touch_read(s) : 0xff;
+            byte = s->slave == (s->synaptics ? RMI_TOUCH_ADDRESS :
+                               TOUCH_ADDRESS) ? native_touch_read(s) : 0xff;
             tail = (s->rx_head + s->rx_count++) % RX_CAPACITY;
             s->rx[tail] = byte | ((i + 1 == count ? 6 : 5) << 8);
         }
         trace_qcom_native_touch_read(start, count, s->host_mode);
-        if (!start && count >= TOUCH_PACKET && s->report_pending &&
-            !s->bootloader && !(s->host_mode & 0x70)) {
+        if (s->synaptics && !s->rmi_page && start == RMI_F11_DATA &&
+            count >= RMI_F11_PACKET && s->report_pending) {
+            native_touch_ack(s);
+        } else if (!s->synaptics && !start && count >= TOUCH_PACKET &&
+                   s->report_pending && !s->bootloader &&
+                   !(s->host_mode & 0x70)) {
             /* The original native driver acknowledges frames by reading them. */
             native_touch_ack(s);
         }
@@ -367,8 +479,7 @@ static void native_qup_tag(QcomNativeInputState *s, uint16_t word)
         s->qup[QUP_ERROR_FLAGS / 4] |= 1;
         break;
     }
-    if (s->output_seen >= MAX(s->qup[QUP_MX_OUTPUT_CNT / 4],
-                              s->qup[QUP_MX_WRITE_CNT / 4])) {
+    if (s->output_seen >= total) {
         s->qup[QUP_OPERATIONAL / 4] |= QUP_OUTPUT_DONE | QUP_OUT_SERVICE;
         s->qup[QUP_OPERATIONAL / 4] &= ~QUP_OUT_BLOCK_REQ;
     } else if ((s->qup[QUP_IO_MODE / 4] & QUP_OUT_BLOCK_MODE) &&
@@ -462,7 +573,9 @@ static void native_qup_write(void *opaque, hwaddr offset, uint64_t value,
         }
         break;
     case QUP_IO_MODE:
-        s->qup[offset / 4] = (value & ~0x3ffU) | QUP_IO_CAPS;
+        s->qup[offset / 4] = (value & ~0x3ffU) |
+                            (QUP_IO_CAPS & ~(7U << 2)) |
+                            ((s->synaptics ? 2U : 1U) << 2);
         break;
     case QUP_MX_OUTPUT_CNT:
     case QUP_MX_WRITE_CNT:
@@ -542,7 +655,7 @@ static void native_input_sync(DeviceState *dev)
 }
 
 static const QemuInputHandler native_input_handler = {
-    .name = "MSM8660 Cypress TrueTouch",
+    .name = "MSM8660 native touch",
     .mask = INPUT_EVENT_MASK_ABS | INPUT_EVENT_MASK_BTN,
     .event = native_input_event,
     .sync = native_input_sync,
@@ -617,6 +730,9 @@ static void native_input_reset(DeviceState *dev)
         s->gpio[GPIO_REGISTER(pin, 4) / 4] = 1;
     }
     memset(s->touch_data, 0, sizeof(s->touch_data));
+    if (s->synaptics) {
+        native_rmi_reset(s);
+    }
     s->host_mode = s->touch_register = s->touch_position = s->slave = 0;
     s->bootloader = false;
     s->contact = s->input_dirty = false;
@@ -632,6 +748,13 @@ static void native_input_realize(DeviceState *dev, Error **errp)
 {
     QcomNativeInputState *s = QCOM_NATIVE_INPUT(dev);
 
+    if (s->synaptics &&
+        ((uint64_t)s->max_x + s->x_offset > RMI_COORD_MAX ||
+         (uint64_t)s->max_y + s->y_offset > RMI_COORD_MAX ||
+         (s->invert_y && s->sensor_y_max > RMI_COORD_MAX))) {
+        error_setg(errp, "Synaptics F11 coordinates must fit 12 bits");
+        return;
+    }
     if (!s->max_x || s->max_x > UINT16_MAX ||
         !s->max_y || s->max_y > UINT16_MAX ||
         s->x_offset > UINT16_MAX - s->max_x ||
@@ -690,6 +813,7 @@ static void native_input_init(Object *obj)
 
 static const Property native_input_properties[] = {
     DEFINE_PROP_BOOL("buttons", QcomNativeInputState, buttons, false),
+    DEFINE_PROP_BOOL("synaptics", QcomNativeInputState, synaptics, false),
     /* Original calibration: a 135-pixel strip below the 800-pixel view. */
     DEFINE_PROP_UINT32("button-strip-height", QcomNativeInputState,
                        button_strip_height, 135),
@@ -716,7 +840,7 @@ static void native_input_class_init(ObjectClass *klass, const void *data)
     device_class_set_legacy_reset(dc, native_input_reset);
     dc->vmsd = &native_input_vmstate;
     device_class_set_props(dc, native_input_properties);
-    dc->desc = "Experimental MSM8660 native Cypress input path";
+    dc->desc = "Experimental MSM8660 native Cypress or Synaptics input path";
 }
 
 static const TypeInfo native_input_type = {

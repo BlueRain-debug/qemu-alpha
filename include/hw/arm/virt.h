@@ -183,6 +183,7 @@ struct VirtMachineState {
     bool winrt_qfprom_probe;
     bool winrt_qcdx_probe;
     bool winrt_qcom_cypress_touch;
+    bool winrt_qcom_synaptics_touch;
     char *winrt_qcdx_ssdt_file;
     GBytes *winrt_qcdx_ssdt;
     bool winrt_pci;
