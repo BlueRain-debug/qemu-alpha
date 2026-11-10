@@ -46,6 +46,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(QcomNativeInputState, QCOM_NATIVE_INPUT)
 #define RMI_F11_QUERY     0x60
 #define RMI_F11_CONTROL   0x80
 #define RMI_F11_DATA      0xb0
+#define RMI_F11_STATE_BYTES 3
 #define RMI_F11_PACKET    8
 #define RMI_COORD_MAX     0xfff /* F11 absolute coordinates are 12-bit. */
 /* F01 and F34 precede F11, each consuming one interrupt-source bit. */
@@ -105,6 +106,7 @@ struct QcomNativeInputState {
     bool buttons;
     bool synaptics;
     uint8_t rmi_page;
+    uint8_t rmi_read_mask;
     int active_button;
     uint32_t button_strip_height;
     uint32_t gpio[GPIO_SIZE / 4];
@@ -167,6 +169,7 @@ static void native_touch_publish(QcomNativeInputState *s,
 
         /* Ten-finger F11 layout: three state bytes, then five bytes/contact. */
         memset(data, 0, RMI_F11_PACKET);
+        s->rmi_read_mask = 0;
         data[0] = report.down ? 1 : 0;
         data[3] = report.x >> 4;
         data[4] = report.y >> 4;
@@ -207,6 +210,7 @@ static void native_touch_ack(QcomNativeInputState *s)
 {
     s->report_pending = false;
     if (s->synaptics) {
+        s->rmi_read_mask = 0;
         s->touch_data[RMI_F01_DATA + 1] &= ~RMI_F11_INTERRUPT;
     }
     native_touch_ready(s, false);
@@ -305,6 +309,7 @@ static void native_rmi_reset(QcomNativeInputState *s)
 
     memset(s->touch_data, 0, sizeof(s->touch_data));
     s->rmi_page = 0;
+    s->rmi_read_mask = 0;
     for (unsigned i = 0; i < ARRAY_SIZE(descriptors); i++) {
         memcpy(&s->touch_data[RMI_PDT_START - i * RMI_PDT_ENTRY],
                descriptors[i], RMI_PDT_ENTRY);
@@ -337,6 +342,10 @@ static uint8_t native_touch_read(QcomNativeInputState *s)
             s->touch_data[offset] = 0;
             native_touch_ready(s, false);
             return value;
+        }
+        if (s->report_pending && offset >= RMI_F11_DATA &&
+            offset < RMI_F11_DATA + RMI_F11_PACKET) {
+            s->rmi_read_mask |= 1U << (offset - RMI_F11_DATA);
         }
         return s->touch_data[offset];
     }
@@ -462,9 +471,18 @@ static void native_qup_tag(QcomNativeInputState *s, uint16_t word)
             s->rx[tail] = byte | ((i + 1 == count ? 6 : 5) << 8);
         }
         trace_qcom_native_touch_read(start, count, s->host_mode);
-        if (s->synaptics && !s->rmi_page && start == RMI_F11_DATA &&
-            count >= RMI_F11_PACKET && s->report_pending) {
-            native_touch_ack(s);
+        if (s->synaptics && !s->rmi_page && s->report_pending) {
+            unsigned bytes = (s->touch_data[RMI_F11_DATA] & 3) ?
+                             RMI_F11_PACKET : RMI_F11_STATE_BYTES;
+            uint8_t required = (1U << bytes) - 1;
+
+            /*
+             * Drivers may read states and coordinates separately. A release
+             * has no coordinates, so consuming its state bytes is enough.
+             */
+            if ((s->rmi_read_mask & required) == required) {
+                native_touch_ack(s);
+            }
         } else if (!s->synaptics && !start && count >= TOUCH_PACKET &&
                    s->report_pending && !s->bootloader &&
                    !(s->host_mode & 0x70)) {
