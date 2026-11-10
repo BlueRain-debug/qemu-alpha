@@ -1249,21 +1249,93 @@ static void gen_neon_narrow_u32(TCGv_i64 dest, TCGv_ptr env, TCGv_i64 src)
 
 static void gen_neon_narrow_u16(TCGv_i64 dest, TCGv_ptr env, TCGv_i64 src)
 {
-    gen_helper_neon_narrow_u16(dest, src);
+    TCGv_i64 upper = tcg_temp_new_i64();
+
+    /* Pack the low half of each 32-bit lane into the low 32 bits. */
+    tcg_gen_shri_i64(upper, src, 32);
+    tcg_gen_deposit_i64(dest, src, upper, 16, 16);
 }
 
 static void gen_neon_narrow_u8(TCGv_i64 dest, TCGv_ptr env, TCGv_i64 src)
 {
-    gen_helper_neon_narrow_u8(dest, src);
+    TCGv_i64 upper = tcg_temp_new_i64();
+
+    /* First join byte pairs, then join the two 16-bit results. */
+    tcg_gen_andi_i64(dest, src, 0x00ff00ff00ff00ffull);
+    tcg_gen_shri_i64(upper, dest, 8);
+    tcg_gen_or_i64(dest, dest, upper);
+    tcg_gen_shri_i64(upper, dest, 32);
+    tcg_gen_deposit_i64(dest, dest, upper, 16, 16);
 }
+
+static bool do_vrshrn(DisasContext *s, arg_2reg_shift *a)
+{
+    TCGv_i64 input[2], rounded, round_bit;
+    int lane_bits = 8 << a->size;
+
+    if (!arm_dc_feature(s, ARM_FEATURE_NEON) ||
+        !neon_dregs_ok(s, a->vd | a->vm) || (a->vm & 1)) {
+        return false;
+    }
+    if (!neon_access_check(s)) {
+        return true;
+    }
+
+    /* Read the complete Q source before writing an overlapping D register. */
+    for (int i = 0; i < 2; i++) {
+        input[i] = tcg_temp_new_i64();
+        read_neon_element64(input[i], a->vm, i, MO_64);
+    }
+    rounded = tcg_temp_new_i64();
+    round_bit = tcg_temp_new_i64();
+    for (int i = 0; i < 2; i++) {
+        /*
+         * The immediate shift is 1..lane_bits/2. Shift before adding the
+         * rounding bit, so a maximum-valued lane cannot lose its carry.
+         * Clearing bits imported from the next lane also prevents an add
+         * from carrying across lane boundaries. The rounded value fits in
+         * the original lane, including when narrowing later wraps to zero.
+         */
+        tcg_gen_shri_i64(round_bit, input[i], a->shift - 1);
+        tcg_gen_andi_i64(round_bit, round_bit, dup_const(a->size, 1));
+        tcg_gen_shri_i64(rounded, input[i], a->shift);
+        tcg_gen_andi_i64(rounded, rounded,
+                        dup_const(a->size,
+                                  MAKE_64BIT_MASK(0, lane_bits - a->shift)));
+        tcg_gen_add_i64(rounded, rounded, round_bit);
+        switch (a->size) {
+        case MO_16:
+            gen_neon_narrow_u8(rounded, tcg_env, rounded);
+            break;
+        case MO_32:
+            gen_neon_narrow_u16(rounded, tcg_env, rounded);
+            break;
+        case MO_64:
+            gen_neon_narrow_u32(rounded, tcg_env, rounded);
+            break;
+        default:
+            g_assert_not_reached();
+        }
+        write_neon_element64(rounded, a->vd, i, MO_32);
+    }
+    return true;
+}
+
+#define DO_VRSHRN(SIZE)                                               \
+    static bool trans_VRSHRN_##SIZE##_2sh(DisasContext *s,              \
+                                         arg_2reg_shift *a)           \
+    {                                                                \
+        return do_vrshrn(s, a);                                       \
+    }
 
 DO_2SN_64(VSHRN_64, gen_ushl_i64, gen_neon_narrow_u32)
 DO_2SN_32(VSHRN_32, gen_ushl_i32, gen_neon_narrow_u16)
 DO_2SN_32(VSHRN_16, gen_helper_neon_shl_u16, gen_neon_narrow_u8)
 
-DO_2SN_64(VRSHRN_64, gen_helper_neon_rshl_u64, gen_neon_narrow_u32)
-DO_2SN_32(VRSHRN_32, gen_helper_neon_rshl_u32, gen_neon_narrow_u16)
-DO_2SN_32(VRSHRN_16, gen_helper_neon_rshl_u16, gen_neon_narrow_u8)
+DO_VRSHRN(64)
+DO_VRSHRN(32)
+DO_VRSHRN(16)
+#undef DO_VRSHRN
 
 DO_2SN_64(VQSHRUN_64, gen_sshl_i64, gen_helper_neon_unarrow_sat32)
 DO_2SN_32(VQSHRUN_32, gen_sshl_i32, gen_helper_neon_unarrow_sat16)
