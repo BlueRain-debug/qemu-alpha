@@ -1268,6 +1268,79 @@ static void gen_neon_narrow_u8(TCGv_i64 dest, TCGv_ptr env, TCGv_i64 src)
     tcg_gen_deposit_i64(dest, dest, upper, 16, 16);
 }
 
+static void gen_neon_unarrow_sat(TCGv_i64 dest, TCGv_ptr env, TCGv_i64 src,
+                                 MemOp size)
+{
+    TCGv_i64 clamped = tcg_temp_new_i64();
+    TCGv_i64 changed = tcg_temp_new_i64();
+    TCGv_i64 qc = tcg_temp_new_i64();
+
+    if (size == MO_64) {
+        tcg_gen_smax_i64(clamped, src, tcg_constant_i64(0));
+        tcg_gen_umin_i64(clamped, clamped, tcg_constant_i64(UINT32_MAX));
+    } else {
+        int bits = 8 << size;
+        uint64_t lane_mask = MAKE_64BIT_MASK(0, bits);
+        uint64_t result_mask = MAKE_64BIT_MASK(0, bits / 2);
+        TCGv_i64 negative = tcg_temp_new_i64();
+        TCGv_i64 overflow = tcg_temp_new_i64();
+
+        /* Replicate each lane's sign bit, then replace negative lanes by 0. */
+        tcg_gen_shri_i64(negative, src, bits - 1);
+        tcg_gen_andi_i64(negative, negative, dup_const(size, 1));
+        tcg_gen_muli_i64(negative, negative, lane_mask);
+        tcg_gen_andc_i64(clamped, src, negative);
+
+        /*
+         * A nonnegative lane exceeds the unsigned result range exactly when
+         * adding (sign_bit - result_range) sets its sign bit. Neither this
+         * addition nor the following mask replication can cross a lane.
+         */
+        tcg_gen_addi_i64(overflow, clamped,
+                        dup_const(size, (lane_mask >> 1) - result_mask));
+        tcg_gen_shri_i64(overflow, overflow, bits - 1);
+        tcg_gen_andi_i64(overflow, overflow, dup_const(size, 1));
+        tcg_gen_muli_i64(overflow, overflow, result_mask);
+        tcg_gen_or_i64(clamped, clamped, overflow);
+        tcg_gen_andi_i64(clamped, clamped, dup_const(size, result_mask));
+    }
+
+    /*
+     * QC is sticky. Its internal representation permits arbitrary nonzero
+     * bits, as in the gvec saturating arithmetic generators. Accumulate the
+     * difference before packing, while preserving all existing QC lanes.
+     */
+    tcg_gen_xor_i64(changed, src, clamped);
+    tcg_gen_ld_i64(qc, env, offsetof(CPUARMState, vfp.qc));
+    tcg_gen_or_i64(qc, qc, changed);
+    tcg_gen_st_i64(qc, env, offsetof(CPUARMState, vfp.qc));
+    switch (size) {
+    case MO_16:
+        gen_neon_narrow_u8(dest, env, clamped);
+        break;
+    case MO_32:
+        gen_neon_narrow_u16(dest, env, clamped);
+        break;
+    case MO_64:
+        gen_neon_narrow_u32(dest, env, clamped);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+}
+
+#define DO_UNARROW_SAT(SUFFIX, SIZE)                                  \
+    static void gen_neon_unarrow_sat##SUFFIX(TCGv_i64 dest,            \
+                                             TCGv_ptr env,           \
+                                             TCGv_i64 src)           \
+    {                                                               \
+        gen_neon_unarrow_sat(dest, env, src, SIZE);                   \
+    }
+DO_UNARROW_SAT(8, MO_16)
+DO_UNARROW_SAT(16, MO_32)
+DO_UNARROW_SAT(32, MO_64)
+#undef DO_UNARROW_SAT
+
 static bool do_vrshrn(DisasContext *s, arg_2reg_shift *a)
 {
     TCGv_i64 input[2], rounded, round_bit;
@@ -1337,13 +1410,54 @@ DO_VRSHRN(32)
 DO_VRSHRN(16)
 #undef DO_VRSHRN
 
-DO_2SN_64(VQSHRUN_64, gen_sshl_i64, gen_helper_neon_unarrow_sat32)
-DO_2SN_32(VQSHRUN_32, gen_sshl_i32, gen_helper_neon_unarrow_sat16)
-DO_2SN_32(VQSHRUN_16, gen_helper_neon_shl_s16, gen_helper_neon_unarrow_sat8)
+static bool do_vqshrun_16(DisasContext *s, arg_2reg_shift *a,
+                         bool rounding)
+{
+    TCGv_i64 input[2], shifted, round_bit;
 
-DO_2SN_64(VQRSHRUN_64, gen_helper_neon_rshl_s64, gen_helper_neon_unarrow_sat32)
+    if (!arm_dc_feature(s, ARM_FEATURE_NEON) ||
+        !neon_dregs_ok(s, a->vd | a->vm) || (a->vm & 1)) {
+        return false;
+    }
+    if (!neon_access_check(s)) {
+        return true;
+    }
+    for (int i = 0; i < 2; i++) {
+        input[i] = tcg_temp_new_i64();
+        read_neon_element64(input[i], a->vm, i, MO_64);
+    }
+    shifted = tcg_temp_new_i64();
+    round_bit = tcg_temp_new_i64();
+    for (int i = 0; i < 2; i++) {
+        tcg_gen_vec_sar16i_i64(shifted, input[i], a->shift);
+        if (rounding) {
+            tcg_gen_shri_i64(round_bit, input[i], a->shift - 1);
+            tcg_gen_andi_i64(round_bit, round_bit, dup_const(MO_16, 1));
+            /* Rounding -1 to 0 must not carry into the following lane. */
+            tcg_gen_vec_add16_i64(shifted, shifted, round_bit);
+        }
+        gen_neon_unarrow_sat8(shifted, tcg_env, shifted);
+        write_neon_element64(shifted, a->vd, i, MO_32);
+    }
+    return true;
+}
+
+static bool trans_VQSHRUN_16_2sh(DisasContext *s, arg_2reg_shift *a)
+{
+    return do_vqshrun_16(s, a, false);
+}
+
+static bool trans_VQRSHRUN_16_2sh(DisasContext *s, arg_2reg_shift *a)
+{
+    return do_vqshrun_16(s, a, true);
+}
+
+DO_2SN_64(VQSHRUN_64, gen_sshl_i64, gen_neon_unarrow_sat32)
+DO_2SN_32(VQSHRUN_32, gen_sshl_i32, gen_neon_unarrow_sat16)
+
+DO_2SN_64(VQRSHRUN_64, gen_helper_neon_rshl_s64, gen_neon_unarrow_sat32)
+/* Keep this helper combination: inlining its narrow step did not help. */
 DO_2SN_32(VQRSHRUN_32, gen_helper_neon_rshl_s32, gen_helper_neon_unarrow_sat16)
-DO_2SN_32(VQRSHRUN_16, gen_helper_neon_rshl_s16, gen_helper_neon_unarrow_sat8)
 DO_2SN_64(VQSHRN_S64, gen_sshl_i64, gen_helper_neon_narrow_sat_s32)
 DO_2SN_32(VQSHRN_S32, gen_sshl_i32, gen_helper_neon_narrow_sat_s16)
 DO_2SN_32(VQSHRN_S16, gen_helper_neon_shl_s16, gen_helper_neon_narrow_sat_s8)
@@ -1359,6 +1473,37 @@ DO_2SN_32(VQSHRN_U16, gen_helper_neon_shl_u16, gen_helper_neon_narrow_sat_u8)
 DO_2SN_64(VQRSHRN_U64, gen_helper_neon_rshl_u64, gen_helper_neon_narrow_sat_u32)
 DO_2SN_32(VQRSHRN_U32, gen_helper_neon_rshl_u32, gen_helper_neon_narrow_sat_u16)
 DO_2SN_32(VQRSHRN_U16, gen_helper_neon_rshl_u16, gen_helper_neon_narrow_sat_u8)
+
+static void gen_neon_widen_u8(TCGv_i64 dest, TCGv_i32 src)
+{
+    TCGv_i64 upper = tcg_temp_new_i64();
+
+    /* Insert an empty halfword, then an empty byte between source bytes. */
+    tcg_gen_extu_i32_i64(dest, src);
+    tcg_gen_shli_i64(upper, dest, 16);
+    tcg_gen_or_i64(dest, dest, upper);
+    tcg_gen_andi_i64(dest, dest, 0x0000ffff0000ffffull);
+    tcg_gen_shli_i64(upper, dest, 8);
+    tcg_gen_or_i64(dest, dest, upper);
+    tcg_gen_andi_i64(dest, dest, 0x00ff00ff00ff00ffull);
+}
+
+static void gen_neon_widen_u16(TCGv_i64 dest, TCGv_i32 src)
+{
+    TCGv_i64 upper = tcg_temp_new_i64();
+
+    /* Insert an empty halfword between the two source halfwords. */
+    tcg_gen_extu_i32_i64(dest, src);
+    tcg_gen_shli_i64(upper, dest, 16);
+    tcg_gen_or_i64(dest, dest, upper);
+    tcg_gen_andi_i64(dest, dest, 0x0000ffff0000ffffull);
+}
+
+static NeonGenWidenFn * const neon_widen_fns[2][4] = {
+    { gen_neon_widen_u8, gen_neon_widen_u16, tcg_gen_extu_i32_i64, NULL },
+    { gen_helper_neon_widen_s8, gen_helper_neon_widen_s16,
+      tcg_gen_ext_i32_i64, NULL },
+};
 
 static bool do_vshll_2sh(DisasContext *s, arg_2reg_shift *a,
                          NeonGenWidenFn *widenfn, bool u)
@@ -1423,22 +1568,12 @@ static bool do_vshll_2sh(DisasContext *s, arg_2reg_shift *a,
 
 static bool trans_VSHLL_S_2sh(DisasContext *s, arg_2reg_shift *a)
 {
-    static NeonGenWidenFn * const widenfn[] = {
-        gen_helper_neon_widen_s8,
-        gen_helper_neon_widen_s16,
-        tcg_gen_ext_i32_i64,
-    };
-    return do_vshll_2sh(s, a, widenfn[a->size], false);
+    return do_vshll_2sh(s, a, neon_widen_fns[1][a->size], false);
 }
 
 static bool trans_VSHLL_U_2sh(DisasContext *s, arg_2reg_shift *a)
 {
-    static NeonGenWidenFn * const widenfn[] = {
-        gen_helper_neon_widen_u8,
-        gen_helper_neon_widen_u16,
-        tcg_gen_extu_i32_i64,
-    };
-    return do_vshll_2sh(s, a, widenfn[a->size], true);
+    return do_vshll_2sh(s, a, neon_widen_fns[0][a->size], true);
 }
 
 static bool do_fp_2sh(DisasContext *s, arg_2reg_shift *a,
@@ -1627,14 +1762,9 @@ static bool do_prewiden_3d(DisasContext *s, arg_3diff *a,
     return true;
 }
 
-#define DO_PREWIDEN(INSN, S, OP, SRC1WIDE, SIGN)                        \
+#define DO_PREWIDEN(INSN, OP, SRC1WIDE, SIGN)                           \
     static bool trans_##INSN##_3d(DisasContext *s, arg_3diff *a)        \
     {                                                                   \
-        static NeonGenWidenFn * const widenfn[] = {                     \
-            gen_helper_neon_widen_##S##8,                               \
-            gen_helper_neon_widen_##S##16,                              \
-            NULL, NULL,                                                 \
-        };                                                              \
         static NeonGenTwo64OpFn * const addfn[] = {                     \
             tcg_gen_vec_##OP##16_i64,                                   \
             tcg_gen_vec_##OP##32_i64,                                   \
@@ -1642,19 +1772,20 @@ static bool do_prewiden_3d(DisasContext *s, arg_3diff *a,
             NULL,                                                       \
         };                                                              \
         int narrow_mop = a->size == MO_32 ? MO_32 | SIGN : -1;          \
-        return do_prewiden_3d(s, a, widenfn[a->size], addfn[a->size],   \
+        return do_prewiden_3d(s, a, neon_widen_fns[!!SIGN][a->size],    \
+                              addfn[a->size],                          \
                               SRC1WIDE ? MO_UQ : narrow_mop,             \
                               narrow_mop);                              \
     }
 
-DO_PREWIDEN(VADDL_S, s, add, false, MO_SIGN)
-DO_PREWIDEN(VADDL_U, u, add, false, 0)
-DO_PREWIDEN(VSUBL_S, s, sub, false, MO_SIGN)
-DO_PREWIDEN(VSUBL_U, u, sub, false, 0)
-DO_PREWIDEN(VADDW_S, s, add, true, MO_SIGN)
-DO_PREWIDEN(VADDW_U, u, add, true, 0)
-DO_PREWIDEN(VSUBW_S, s, sub, true, MO_SIGN)
-DO_PREWIDEN(VSUBW_U, u, sub, true, 0)
+DO_PREWIDEN(VADDL_S, add, false, MO_SIGN)
+DO_PREWIDEN(VADDL_U, add, false, 0)
+DO_PREWIDEN(VSUBL_S, sub, false, MO_SIGN)
+DO_PREWIDEN(VSUBL_U, sub, false, 0)
+DO_PREWIDEN(VADDW_S, add, true, MO_SIGN)
+DO_PREWIDEN(VADDW_U, add, true, 0)
+DO_PREWIDEN(VSUBW_S, sub, true, MO_SIGN)
+DO_PREWIDEN(VSUBW_U, sub, true, 0)
 
 static bool do_narrow_3d(DisasContext *s, arg_3diff *a,
                          NeonGenTwo64OpFn *opfn, NeonGenNarrowFn *narrowfn)
@@ -2754,7 +2885,7 @@ static bool do_vmovn(DisasContext *s, arg_2misc *a,
     }
 
 DO_VMOVN(VMOVN, gen_neon_narrow_u)
-DO_VMOVN(VQMOVUN, gen_helper_neon_unarrow_sat)
+DO_VMOVN(VQMOVUN, gen_neon_unarrow_sat)
 DO_VMOVN(VQMOVN_S, gen_helper_neon_narrow_sat_s)
 DO_VMOVN(VQMOVN_U, gen_helper_neon_narrow_sat_u)
 
@@ -2762,13 +2893,7 @@ static bool trans_VSHLL(DisasContext *s, arg_2misc *a)
 {
     TCGv_i32 rm0, rm1;
     TCGv_i64 rd;
-    static NeonGenWidenFn * const widenfns[] = {
-        gen_helper_neon_widen_u8,
-        gen_helper_neon_widen_u16,
-        tcg_gen_extu_i32_i64,
-        NULL,
-    };
-    NeonGenWidenFn *widenfn = widenfns[a->size];
+    NeonGenWidenFn *widenfn = neon_widen_fns[0][a->size];
 
     if (!arm_dc_feature(s, ARM_FEATURE_NEON)) {
         return false;

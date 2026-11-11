@@ -39,6 +39,9 @@ tests += {
   },
   'pcalign-a32.c': {'cflags': ['-marm']},
   'issue4448.c': {},
+  'neon-widen-saturate.c': {
+    'cflags': ['-march=armv7-a', '-mfpu=neon', '-fno-tree-vectorize'],
+  },
 }
 
 # Vector SHA1
