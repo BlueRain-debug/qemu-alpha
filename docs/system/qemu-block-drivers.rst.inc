@@ -370,6 +370,24 @@ This section describes each format and the options that are supported for it.
 
       Log size; min 1 MB.
 
+    .. option:: logical_sector_size
+
+      Logical sector size in bytes: ``512`` (default) or ``4096``. The
+      virtual disk size must be a multiple of this value. Use ``4096``
+      for a native 4Kn image. This does not rewrite an existing disk's
+      partition table or filesystem for a different sector size.
+
+    .. option:: physical_sector_size
+
+      Physical sector size in bytes: ``512`` or ``4096``, defaulting to
+      the logical sector size. It must not be smaller than the logical
+      sector size. Set logical size to ``512`` and physical size to
+      ``4096`` for a 512e image.
+
+  QEMU uses these sector sizes as backend defaults for devices that can
+  expose them, such as SCSI and virtio block disks. A device with fixed
+  512-byte sectors, such as an SD card, cannot present a native 4Kn disk.
+
 Read-only formats
 ~~~~~~~~~~~~~~~~~
 

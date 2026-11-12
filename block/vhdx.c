@@ -38,6 +38,8 @@
 #define VHDX_BLOCK_OPT_LOG_SIZE   "log_size"
 #define VHDX_BLOCK_OPT_BLOCK_SIZE "block_size"
 #define VHDX_BLOCK_OPT_ZERO "block_state_zero"
+#define VHDX_BLOCK_OPT_LOGICAL_SECTOR_SIZE "logical_sector_size"
+#define VHDX_BLOCK_OPT_PHYSICAL_SECTOR_SIZE "physical_sector_size"
 
 typedef enum VHDXImageType {
     VHDX_TYPE_DYNAMIC = 0,
@@ -132,7 +134,7 @@ static const MSGUID parent_vhdx_guid __attribute__((unused))
 
 typedef struct VHDXSectorInfo {
     uint32_t bat_idx;       /* BAT entry index */
-    uint32_t sectors_avail; /* sectors available in payload block */
+    uint32_t sectors_avail; /* QEMU 512-byte sectors left in payload block */
     uint32_t bytes_left;    /* bytes left in the block after data to r/w */
     uint32_t bytes_avail;   /* bytes available in payload block */
     uint64_t file_offset;   /* absolute offset in bytes, in file */
@@ -276,7 +278,6 @@ static void vhdx_region_unregister_all(BDRVVHDXState *s)
 
 static void vhdx_set_shift_bits(BDRVVHDXState *s)
 {
-    s->logical_sector_size_bits = ctz32(s->logical_sector_size);
     s->sectors_per_block_bits =   ctz32(s->sectors_per_block);
     s->chunk_ratio_bits =         ctz64(s->chunk_ratio);
     s->block_size_bits =          ctz32(s->block_size);
@@ -630,7 +631,7 @@ fail:
  *      - Virtual Disk Size (size, in bytes, of the virtual drive)
  *      - Page 83 Data (scsi page 83 guid)
  *      - Logical Sector Size (logical sector size in bytes, either 512 or
- *                             4096.  We only support 512 currently)
+ *                             4096)
  *      - Physical Sector Size (512 or 4096)
  *
  * Also, if the File Parameters indicate this is a differencing file,
@@ -824,15 +825,22 @@ vhdx_parse_metadata(BlockDriverState *bs, BDRVVHDXState *s)
         goto exit;
     }
 
-    /* Currently we only support 512 */
-    if (s->logical_sector_size != 512) {
+    if ((s->logical_sector_size != 512 && s->logical_sector_size != 4096) ||
+        (s->physical_sector_size != 512 && s->physical_sector_size != 4096)) {
         ret = -ENOTSUP;
         goto exit;
     }
+    if (s->physical_sector_size < s->logical_sector_size ||
+        !QEMU_IS_ALIGNED(s->virtual_disk_size, s->logical_sector_size)) {
+        ret = -EINVAL;
+        goto exit;
+    }
 
-    /* Both block_size and sector_size are guaranteed powers of 2, below.
-       Due to range checks above, s->sectors_per_block can never be < 256 */
-    s->sectors_per_block = s->params.block_size / s->logical_sector_size;
+    /*
+     * Legacy block callbacks always count 512-byte QEMU sectors. Only the
+     * VHDX bitmap/chunk geometry uses the image's logical sector size.
+     */
+    s->sectors_per_block = s->params.block_size / BDRV_SECTOR_SIZE;
     s->chunk_ratio = (VHDX_MAX_SECTORS_PER_BLOCK) *
                      (uint64_t)s->logical_sector_size /
                      (uint64_t)s->params.block_size;
@@ -1058,9 +1066,8 @@ static int vhdx_open(BlockDriverState *bs, QDict *options, int flags,
 
     s->block_size = s->params.block_size;
 
-    /* the VHDX spec dictates that virtual_disk_size is always a multiple of
-     * logical_sector_size */
-    bs->total_sectors = s->virtual_disk_size >> s->logical_sector_size_bits;
+    /* BlockDriverState capacity is in 512-byte units, including for 4Kn. */
+    bs->total_sectors = s->virtual_disk_size >> BDRV_SECTOR_BITS;
 
     vhdx_calc_bat_entries(s);
 
@@ -1122,7 +1129,8 @@ static int vhdx_reopen_prepare(BDRVReopenState *state,
 
 /*
  * Perform sector to block offset translations, to get various
- * sector and file offsets into the image.  See VHDXSectorInfo
+ * sector and file offsets into the image. All sector counts here are in
+ * BDRV_SECTOR_SIZE units, independently of the VHDX logical sector size.
  */
 static void vhdx_block_translate(BDRVVHDXState *s, int64_t sector_num,
                                  int nb_sectors, VHDXSectorInfo *sinfo)
@@ -1141,24 +1149,25 @@ static void vhdx_block_translate(BDRVVHDXState *s, int64_t sector_num,
     /* the number of sectors we can read/write in this cycle */
     sinfo->sectors_avail = s->sectors_per_block - block_offset;
 
-    sinfo->bytes_left = sinfo->sectors_avail << s->logical_sector_size_bits;
+    sinfo->bytes_left = sinfo->sectors_avail << BDRV_SECTOR_BITS;
 
     if (sinfo->sectors_avail > nb_sectors) {
         sinfo->sectors_avail = nb_sectors;
     }
 
-    sinfo->bytes_avail = sinfo->sectors_avail << s->logical_sector_size_bits;
+    sinfo->bytes_avail = sinfo->sectors_avail << BDRV_SECTOR_BITS;
 
     sinfo->file_offset = s->bat[sinfo->bat_idx] & VHDX_BAT_FILE_OFF_MASK;
 
-    sinfo->block_offset = block_offset << s->logical_sector_size_bits;
+    sinfo->block_offset = block_offset << BDRV_SECTOR_BITS;
 
     /* The file offset must be past the header section, so must be > 0 */
     if (sinfo->file_offset == 0) {
         return;
     }
 
-    /* block offset is the offset in vhdx logical sectors, in
+    /*
+     * block offset is the offset in QEMU's 512-byte sectors, in
      * the payload data block. Convert that to a byte offset
      * in the block, and add in the payload data block offset
      * in the file, in bytes, to get the final read address */
@@ -1174,6 +1183,16 @@ vhdx_co_get_info(BlockDriverState *bs, BlockDriverInfo *bdi)
 
     bdi->cluster_size = s->block_size;
 
+    return 0;
+}
+
+static int GRAPH_RDLOCK
+vhdx_probe_blocksizes(BlockDriverState *bs, BlockSizes *bsz)
+{
+    BDRVVHDXState *s = bs->opaque;
+
+    bsz->log = s->logical_sector_size;
+    bsz->phys = s->physical_sector_size;
     return 0;
 }
 
@@ -1581,7 +1600,8 @@ exit:
  */
 static int coroutine_fn
 vhdx_create_new_metadata(BlockBackend *blk, uint64_t image_size,
-                         uint32_t block_size, uint32_t sector_size,
+                         uint32_t block_size, uint32_t logical_sector_size,
+                         uint32_t physical_sector_size,
                          uint64_t metadata_offset, VHDXImageType type)
 {
     int ret = 0;
@@ -1619,8 +1639,9 @@ vhdx_create_new_metadata(BlockBackend *blk, uint64_t image_size,
     vhdx_guid_generate(&mt_page83->page_83_data);
     cpu_to_leguids(&mt_page83->page_83_data);
     mt_virtual_size->virtual_disk_size        = cpu_to_le64(image_size);
-    mt_log_sector_size->logical_sector_size   = cpu_to_le32(sector_size);
-    mt_phys_sector_size->physical_sector_size = cpu_to_le32(sector_size);
+    mt_log_sector_size->logical_sector_size = cpu_to_le32(logical_sector_size);
+    mt_phys_sector_size->physical_sector_size =
+        cpu_to_le32(physical_sector_size);
 
     buffer = g_malloc0(VHDX_HEADER_BLOCK_SIZE);
     md_table = buffer;
@@ -1720,7 +1741,7 @@ vhdx_create_bat(BlockBackend *blk, BDRVVHDXState *s,
      * past any metadata entries (with a 4 MB buffer for future
      * expansion */
     data_file_offset = file_offset + length + 5 * MiB;
-    total_sectors = image_size >> s->logical_sector_size_bits;
+    total_sectors = image_size >> BDRV_SECTOR_BITS;
 
     if (type == VHDX_TYPE_DYNAMIC) {
         /* All zeroes, so we can just extend the file - the end of the BAT
@@ -1763,7 +1784,7 @@ vhdx_create_bat(BlockBackend *blk, BDRVVHDXState *s,
         while (sector_num < total_sectors) {
             vhdx_block_translate(s, sector_num, s->sectors_per_block, &sinfo);
             sinfo.file_offset = data_file_offset +
-                                (sector_num << s->logical_sector_size_bits);
+                                (sector_num << BDRV_SECTOR_BITS);
             sinfo.file_offset = ROUND_UP(sinfo.file_offset, MiB);
             vhdx_update_bat_table_entry(blk_bs(blk), s, &sinfo, &unused, &unused,
                                         block_state);
@@ -1817,7 +1838,7 @@ vhdx_create_new_region_table(BlockBackend *blk, uint64_t image_size,
     s->chunk_ratio = (VHDX_MAX_SECTORS_PER_BLOCK) *
                      (uint64_t) sector_size / (uint64_t) block_size;
 
-    s->sectors_per_block = block_size / sector_size;
+    s->sectors_per_block = block_size / BDRV_SECTOR_SIZE;
     s->virtual_disk_size = image_size;
     s->block_size = block_size;
     s->logical_sector_size = sector_size;
@@ -1919,6 +1940,8 @@ vhdx_co_create(BlockdevCreateOptions *opts, Error **errp)
     uint64_t image_size;
     uint32_t log_size;
     uint32_t block_size;
+    uint32_t logical_sector_size;
+    uint32_t physical_sector_size;
     uint64_t signature;
     uint64_t metadata_offset;
     bool use_zero_blocks = false;
@@ -1931,7 +1954,34 @@ vhdx_co_create(BlockdevCreateOptions *opts, Error **errp)
     vhdx_opts = &opts->u.vhdx;
 
     /* Validate options and set default values */
+    if (vhdx_opts->has_logical_sector_size &&
+        vhdx_opts->logical_sector_size != 512 &&
+        vhdx_opts->logical_sector_size != 4096) {
+        error_setg(errp, "Logical sector size must be 512 or 4096 bytes");
+        return -EINVAL;
+    }
+    logical_sector_size = vhdx_opts->has_logical_sector_size ?
+                          vhdx_opts->logical_sector_size : 512;
+    if (vhdx_opts->has_physical_sector_size &&
+        vhdx_opts->physical_sector_size != 512 &&
+        vhdx_opts->physical_sector_size != 4096) {
+        error_setg(errp, "Physical sector size must be 512 or 4096 bytes");
+        return -EINVAL;
+    }
+    physical_sector_size = vhdx_opts->has_physical_sector_size ?
+                           vhdx_opts->physical_sector_size :
+                           logical_sector_size;
+    if (physical_sector_size < logical_sector_size) {
+        error_setg(errp, "Physical sector size must not be smaller than "
+                   "logical sector size");
+        return -EINVAL;
+    }
     image_size = vhdx_opts->size;
+    if (!QEMU_IS_ALIGNED(image_size, logical_sector_size)) {
+        error_setg(errp, "Image size must be a multiple of the logical sector "
+                   "size (%u bytes)", logical_sector_size);
+        return -EINVAL;
+    }
     if (image_size > VHDX_MAX_IMAGE_SIZE) {
         error_setg(errp, "Image size too large; max of 64TB");
         return -EINVAL;
@@ -2047,7 +2097,8 @@ vhdx_co_create(BlockdevCreateOptions *opts, Error **errp)
     }
 
     /* Creates (D),(E),(G) explicitly. (F) created as by-product */
-    ret = vhdx_create_new_region_table(blk, image_size, block_size, 512,
+    ret = vhdx_create_new_region_table(blk, image_size, block_size,
+                                       logical_sector_size,
                                        log_size, use_zero_blocks, image_type,
                                        &metadata_offset, errp);
     if (ret < 0) {
@@ -2055,7 +2106,8 @@ vhdx_co_create(BlockdevCreateOptions *opts, Error **errp)
     }
 
     /* Creates (H) */
-    ret = vhdx_create_new_metadata(blk, image_size, block_size, 512,
+    ret = vhdx_create_new_metadata(blk, image_size, block_size,
+                                   logical_sector_size, physical_sector_size,
                                    metadata_offset, image_type);
     if (ret < 0) {
         error_setg_errno(errp, -ret, "Failed to initialize metadata");
@@ -2084,6 +2136,8 @@ vhdx_co_create_opts(BlockDriver *drv, const char *filename,
         { VHDX_BLOCK_OPT_LOG_SIZE,      "log-size" },
         { VHDX_BLOCK_OPT_BLOCK_SIZE,    "block-size" },
         { VHDX_BLOCK_OPT_ZERO,          "block-state-zero" },
+        { VHDX_BLOCK_OPT_LOGICAL_SECTOR_SIZE, "logical-sector-size" },
+        { VHDX_BLOCK_OPT_PHYSICAL_SECTOR_SIZE, "physical-sector-size" },
         { NULL, NULL },
     };
 
@@ -2229,6 +2283,17 @@ static QemuOptsList vhdx_create_opts = {
                    "0 means auto-calculate based on image size."
        },
        {
+           .name = VHDX_BLOCK_OPT_LOGICAL_SECTOR_SIZE,
+           .type = QEMU_OPT_SIZE,
+           .help = "Logical sector size: 512 (default) or 4096 bytes."
+       },
+       {
+           .name = VHDX_BLOCK_OPT_PHYSICAL_SECTOR_SIZE,
+           .type = QEMU_OPT_SIZE,
+           .help = "Physical sector size: 512 or 4096 bytes; "
+                   "defaults to the logical sector size."
+       },
+       {
            .name = BLOCK_OPT_SUBFMT,
            .type = QEMU_OPT_STRING,
            .help = "VHDX format type, can be either 'dynamic' or 'fixed'. "
@@ -2258,6 +2323,7 @@ static BlockDriver bdrv_vhdx = {
     .bdrv_co_create         = vhdx_co_create,
     .bdrv_co_create_opts    = vhdx_co_create_opts,
     .bdrv_co_get_info       = vhdx_co_get_info,
+    .bdrv_probe_blocksizes  = vhdx_probe_blocksizes,
     .bdrv_co_check          = vhdx_co_check,
     .bdrv_has_zero_init     = vhdx_has_zero_init,
 

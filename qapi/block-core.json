@@ -5391,6 +5391,14 @@
 #     Non-standard, but default.  Do not set to 'off' when using
 #     'qemu-img convert' with subformat=dynamic.
 #
+# @logical-sector-size: Logical sector size in bytes, either 512 or
+#     4096 (default: 512).  @size must be a multiple of this value.
+#     (since 11.2)
+#
+# @physical-sector-size: Physical sector size in bytes, either 512 or
+#     4096, and at least @logical-sector-size (default: the logical
+#     sector size).  (since 11.2)
+#
 # Since: 2.12
 ##
 { 'struct': 'BlockdevCreateOptionsVhdx',
@@ -5399,7 +5407,9 @@
             '*log-size':            'size',
             '*block-size':          'size',
             '*subformat':           'BlockdevVhdxSubformat',
-            '*block-state-zero':    'bool' } }
+            '*block-state-zero':    'bool',
+            '*logical-sector-size': 'size',
+            '*physical-sector-size': 'size' } }
 
 ##
 # @BlockdevVpcSubformat:

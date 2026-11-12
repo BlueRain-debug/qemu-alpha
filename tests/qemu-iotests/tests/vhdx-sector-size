@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+# group: rw auto quick
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""VHDX sector geometry, including independent BAT/payload verification.
+
+Large virtual images stay small on the host: only a few payload blocks are
+written around the 4 GiB/32 GiB bitmap-chunk boundaries. No guest OS is needed.
+"""
+
+from pathlib import Path
+import struct
+import tempfile
+import unittest
+import uuid
+
+import iotests
+from iotests import qemu_img, qemu_img_json, qemu_io
+
+
+KIB = 1024
+MIB = 1024 * KIB
+REGION_TABLE_OFFSET = 192 * KIB
+REGION_HEADER_BYTES = 16
+REGION_ENTRY_BYTES = 32
+METADATA_HEADER_BYTES = 32
+METADATA_ENTRY_BYTES = 32
+BITMAP_SECTORS = 1 << 23  # One 1 MiB bitmap, one bit per VHDX logical sector.
+FILE_OFFSET_MASK = 0xFFFFFFFFFFF00000  # BAT byte offset, aligned to 1 MiB.
+PAYLOAD_FULLY_PRESENT = 6
+ZERO_STATES = (0, 1, 2, 3, 5)
+METADATA_GUID = uuid.UUID('8b7ca206-4790-4b9a-b8fe-575f050f886e')
+BAT_GUID = uuid.UUID('2dc27766-f623-4200-9d64-115e9bfd4a08')
+BLOCK_SIZE_GUID = uuid.UUID('caa16737-fa36-4d43-b3b6-33f0aa44e76b')
+SIZE_GUID = uuid.UUID('2fa54224-cd1b-4876-b211-5dbed83bf4b8')
+LOGICAL_GUID = uuid.UUID('8141bf1d-a96f-4709-ba47-f233a8faab5f')
+PHYSICAL_GUID = uuid.UUID('cda348c7-445d-4471-9cc9-e9885251c556')
+
+
+def layout(path):
+    """Read documented on-disk fields without using QEMU's image parser."""
+    with path.open('rb') as image:
+        image.seek(REGION_TABLE_OFFSET)
+        header = image.read(REGION_HEADER_BYTES)
+        assert header[:4] == b'regi'
+        count = struct.unpack_from('<I', header, 8)[0]
+        assert count <= 2047
+        regions = {}
+        for _ in range(count):
+            entry = image.read(REGION_ENTRY_BYTES)
+            regions[uuid.UUID(bytes_le=entry[:16])] = struct.unpack_from(
+                '<QI', entry, 16)
+        metadata, _ = regions[METADATA_GUID]
+        image.seek(metadata)
+        header = image.read(METADATA_HEADER_BYTES)
+        assert header[:8] == b'metadata'
+        count = struct.unpack_from('<H', header, 10)[0]
+        assert count <= 2047
+        items = {}
+        for _ in range(count):
+            entry = image.read(METADATA_ENTRY_BYTES)
+            offset, length = struct.unpack_from('<II', entry, 16)
+            items[uuid.UUID(bytes_le=entry[:16])] = (metadata + offset, length)
+
+        def scalar(guid, encoding):
+            offset, length = items[guid]
+            assert length >= struct.calcsize(encoding)
+            image.seek(offset)
+            return struct.unpack(encoding, image.read(struct.calcsize(encoding)))[0]
+
+        return dict(items=items, bat=regions[BAT_GUID][0],
+                    block=scalar(BLOCK_SIZE_GUID, '<I'),
+                    size=scalar(SIZE_GUID, '<Q'),
+                    logical=scalar(LOGICAL_GUID, '<I'),
+                    physical=scalar(PHYSICAL_GUID, '<I'))
+
+
+def payload(path, offset, length):
+    """Resolve native VHDX LBAs to physical payload bytes, independently.
+
+    This checks the actual BAT entry and bytes on disk, so a read/write
+    addressing bug shared by qemu-img and qemu-io cannot make the test pass.
+    """
+    info = layout(path)
+    chunk_blocks = BITMAP_SECTORS * info['logical'] // info['block']
+    result = bytearray()
+    with path.open('rb') as image:
+        while length:
+            block, within = divmod(offset, info['block'])
+            index = block + block // chunk_blocks
+            image.seek(info['bat'] + index * 8)
+            entry = struct.unpack('<Q', image.read(8))[0]
+            count = min(length, info['block'] - within)
+            state = entry & 7
+            if state in ZERO_STATES:
+                result.extend(bytes(count))
+            else:
+                assert state == PAYLOAD_FULLY_PRESENT
+                image.seek((entry & FILE_OFFSET_MASK) + within)
+                data = image.read(count)
+                assert len(data) == count
+                result.extend(data)
+            offset += count
+            length -= count
+    return bytes(result)
+
+
+def set_metadata(path, guid, encoding, value):
+    # Metadata item payloads have no checksum. Region/header CRCs are unchanged.
+    offset, length = layout(path)['items'][guid]
+    assert struct.calcsize(encoding) <= length
+    with path.open('r+b') as image:
+        image.seek(offset)
+        image.write(struct.pack(encoding, value))
+
+
+class TestVhdxSectorSize(unittest.TestCase):
+    def setUp(self):
+        self.scratch = tempfile.TemporaryDirectory(
+            prefix='vhdx-sector-', dir=iotests.test_dir)
+        self.directory = Path(self.scratch.name).resolve()
+        self.addCleanup(self.cleanup)
+
+    def cleanup(self):
+        assert self.directory.parent == Path(iotests.test_dir).resolve()
+        assert self.directory.name.startswith('vhdx-sector-')
+        self.scratch.cleanup()
+
+    def create(self, name, size, logical=512, physical=None,
+               subformat='dynamic', zero=True):
+        image = self.directory / name
+        options = [f'logical_sector_size={logical}', 'block_size=1048576',
+                   f'subformat={subformat}',
+                   'block_state_zero=' + ('on' if zero else 'off')]
+        if physical is not None:
+            options.append(f'physical_sector_size={physical}')
+        qemu_img('create', '-f', 'vhdx', '-o', ','.join(options),
+                 str(image), str(size))
+        return image
+
+    def io(self, image, *commands):
+        arguments = ['-f', 'vhdx']
+        for command in commands:
+            arguments.extend(['-c', command])
+        return qemu_io(*arguments, str(image))
+
+    def test_sector_geometry_and_roundtrip(self):
+        for logical, physical in ((512, 512), (512, 4096), (4096, 4096)):
+            for subformat in ('dynamic', 'fixed'):
+                with self.subTest(logical=logical, physical=physical,
+                                  subformat=subformat):
+                    size = 5 * MIB + logical  # A partially used last block.
+                    image = self.create(f'{logical}-{physical}-{subformat}',
+                                        size, logical, physical, subformat,
+                                        zero=subformat == 'dynamic')
+                    info = layout(image)
+                    self.assertEqual((info['size'], info['logical'], info['physical']),
+                                     (size, logical, physical))
+                    self.assertEqual(qemu_img_json('info', '--output=json',
+                                                  str(image))['virtual-size'], size)
+                    expected = bytearray(size)
+                    writes = [(0, 4096, 0x11),
+                              (MIB - 4096, 8192, 0x23),
+                              (2 * MIB + 512, 512, 0x37),
+                              (size - logical, logical, 0x49)]
+                    commands = []
+                    for offset, length, pattern in writes:
+                        commands.append(f'write -P {pattern} {offset} {length}')
+                        expected[offset:offset + length] = bytes([pattern]) * length
+                    commands.append('flush')
+                    self.io(image, *commands)
+                    # Reopen, verify with QEMU, then verify the entire small disk
+                    # through both an independent BAT reader and raw conversion.
+                    self.io(image, 'read -P 0 3145728 4096')
+                    self.assertEqual(payload(image, 0, size), expected)
+                    raw = image.with_suffix('.raw')
+                    qemu_img('convert', '-f', 'vhdx', '-O', 'raw', str(image), str(raw))
+                    self.assertEqual(raw.read_bytes(), expected)
+                    qemu_img('check', '-f', 'vhdx', str(image))
+                    native = image.with_suffix('.native')
+                    qemu_img('convert', '-f', 'raw', '-O', 'vhdx', '-o',
+                             f'logical_sector_size={logical},physical_sector_size={physical}',
+                             str(raw), str(native))
+                    self.assertEqual(payload(native, 0, size), expected)
+
+    def test_chunk_boundaries(self):
+        for logical in (512, 4096):
+            with self.subTest(logical=logical):
+                chunk = BITMAP_SECTORS * logical  # 4 GiB / 32 GiB virtual.
+                size = chunk + 2 * MIB
+                image = self.create(f'chunk-{logical}', size, logical)
+                self.io(image, f'write -P 90 {chunk - 4096} 8192',
+                        f'write -P 107 {chunk + MIB} 4096',
+                        f'write -P 124 {size - logical} {logical}', 'flush')
+                self.io(image, f'read -P 90 {chunk - 4096} 8192',
+                        f'read -P 107 {chunk + MIB} 4096')
+                self.assertEqual(payload(image, chunk - 4096, 8192), b'\x5a' * 8192)
+                self.assertEqual(payload(image, chunk + MIB, 4096), b'\x6b' * 4096)
+                self.assertEqual(payload(image, size - logical, logical), b'\x7c' * logical)
+                self.assertEqual(qemu_img_json('info', '--output=json', str(image))['virtual-size'], size)
+                self.assertLess(image.stat().st_size, 32 * MIB)
+                qemu_img('check', '-f', 'vhdx', str(image))
+
+    def test_open_existing_4kn_metadata(self):
+        # Start with a blank 512-byte-sector container, independently change the
+        # documented metadata fields, then test 4Kn reading and new allocation.
+        # This does not rely on the new creation option producing correct fields.
+        image = self.create('external-geometry', 4 * MIB)
+        set_metadata(image, LOGICAL_GUID, '<I', 4096)
+        set_metadata(image, PHYSICAL_GUID, '<I', 4096)
+        self.assertEqual(qemu_img_json('info', '--output=json', str(image))['virtual-size'], 4 * MIB)
+        self.io(image, 'read -P 0 0 4096', 'write -P 165 1048064 8192', 'flush')
+        self.assertEqual(payload(image, MIB - 512, 8192), b'\xa5' * 8192)
+
+    def test_invalid_geometry(self):
+        cases = [('logical_sector_size=1024', 4 * MIB),
+                 ('physical_sector_size=8192', 4 * MIB),
+                 ('logical_sector_size=4096,physical_sector_size=512', 4 * MIB),
+                 ('logical_sector_size=4096', 4 * MIB + 512)]
+        for index, (options, size) in enumerate(cases):
+            with self.subTest(options=options, size=size):
+                result = qemu_img('create', '-f', 'vhdx', '-o', options,
+                                  str(self.directory / f'invalid-{index}'),
+                                  str(size), check=False)
+                self.assertNotEqual(result.returncode, 0)
+        for index, (guid, encoding, value) in enumerate(
+                ((LOGICAL_GUID, '<I', 1024), (PHYSICAL_GUID, '<I', 8192),
+                 (SIZE_GUID, '<Q', 4 * MIB + 512))):
+            image = self.create(f'invalid-metadata-{index}', 4 * MIB, 4096)
+            set_metadata(image, guid, encoding, value)
+            result = qemu_img('info', '-f', 'vhdx', str(image), check=False)
+            self.assertNotEqual(result.returncode, 0)
+
+
+if __name__ == '__main__':
+    iotests.main(supported_fmts=['vhdx'], supported_protocols=['file'])

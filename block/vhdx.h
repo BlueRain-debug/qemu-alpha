@@ -369,6 +369,7 @@ typedef struct BDRVVHDXState {
     VHDXFileParameters params;
     uint32_t block_size;
     uint32_t block_size_bits;
+    /* QEMU 512-byte sectors, independently of the VHDX logical sector size. */
     uint32_t sectors_per_block;
     uint32_t sectors_per_block_bits;
 
@@ -378,7 +379,6 @@ typedef struct BDRVVHDXState {
 
     uint64_t chunk_ratio;
     uint32_t chunk_ratio_bits;
-    uint32_t logical_sector_size_bits;
 
     uint32_t bat_entries;
     VHDXBatEntry *bat;
