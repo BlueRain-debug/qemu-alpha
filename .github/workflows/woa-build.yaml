@@ -44,6 +44,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             bison \
+            bzip2 \
             build-essential \
             file \
             flex \
@@ -79,7 +80,7 @@ jobs:
               --datadir=share \
               -Dqemu_suffix=qemu \
               --python=/usr/bin/python3 \
-              --target-list=arm-softmmu \
+              --target-list=arm-softmmu,aarch64-softmmu \
               --enable-system \
               --enable-tcg \
               --enable-pixman \
@@ -94,7 +95,9 @@ jobs:
               --disable-werror
           )
 
-          ninja -C "$build_dir" -j"$(nproc)" qemu-system-arm qemu-img
+          ninja -C "$build_dir" -j"$(nproc)" \
+            qemu-system-arm qemu-system-aarch64 qemu-img \
+            pc-bios/edk2-aarch64-code.fd pc-bios/edk2-aarch64-vars.fd
 
       - name: Stage and archive the Linux distribution
         run: |
@@ -106,9 +109,10 @@ jobs:
           dist="$dist_root/${{ matrix.dist_stem }}-$version"
           mkdir -p "$dist/share/qemu"
 
-          install -m 0755 "$build_dir/qemu-system-arm" "$build_dir/qemu-img" "$dist/"
+          install -m 0755 "$build_dir"/qemu-system-{arm,aarch64} "$build_dir/qemu-img" "$dist/"
           install -m 0644 COPYING COPYING.LIB LICENSE README.rst "$dist/"
           cp -aL pc-bios/. "$dist/share/qemu/"
+          install -m 0644 "$build_dir"/pc-bios/edk2-aarch64-{code,vars}.fd "$dist/share/qemu/"
 
           # Keep the default VGA and virtio NIC option ROMs in every artifact.
           for rom in efi-virtio.rom vgabios-stdvga.bin; do
@@ -120,7 +124,7 @@ jobs:
 
           # Record the shared-library requirements as in the Alpha workflow.
           : > "$dist/linux-library-dependencies.txt"
-          for executable in "$dist/qemu-system-arm" "$dist/qemu-img"; do
+          for executable in "$dist"/qemu-system-{arm,aarch64} "$dist/qemu-img"; do
             file "$executable" | tee -a "$dist/linux-library-dependencies.txt"
             ldd "$executable" | tee -a "$dist/linux-library-dependencies.txt"
           done
@@ -210,6 +214,7 @@ jobs:
           install: >-
             bison
             binutils
+            bzip2
             diffutils
             findutils
             flex
@@ -257,7 +262,7 @@ jobs:
               --datadir=share \
               -Dqemu_suffix=qemu \
               --python="$QEMU_MSYS_PREFIX/bin/python" \
-              --target-list=arm-softmmu \
+              --target-list=arm-softmmu,aarch64-softmmu \
               --enable-system \
               --enable-tcg \
               --enable-pixman \
@@ -275,7 +280,11 @@ jobs:
           ninja -C "$build_dir" -j"$(nproc)" \
             qemu-system-arm.exe \
             qemu-system-armw.exe \
-            qemu-img.exe
+            qemu-system-aarch64.exe \
+            qemu-system-aarch64w.exe \
+            qemu-img.exe \
+            pc-bios/edk2-aarch64-code.fd \
+            pc-bios/edk2-aarch64-vars.fd
 
       - name: Stage the Windows distribution
         run: |
@@ -285,6 +294,13 @@ jobs:
           version="$(tr -d '\r\n' < VERSION)"
           dist_root="$PWD/dist"
           dist="$dist_root/${{ matrix.dist_stem }}-$version"
+          executables=(
+            qemu-system-arm.exe
+            qemu-system-armw.exe
+            qemu-system-aarch64.exe
+            qemu-system-aarch64w.exe
+            qemu-img.exe
+          )
 
           imported_dlls() {
             if [[ "${{ matrix.arch }}" == aarch64 ]]; then
@@ -309,13 +325,13 @@ jobs:
 
           # Keep the archive layout consistent with --bindir=.
           # Match the PE machine type to the host architecture being built.
-          "$QEMU_MSYS_PREFIX/bin/python" - "$build_dir" "${{ matrix.arch }}" <<'PY'
+          "$QEMU_MSYS_PREFIX/bin/python" - "$build_dir" "${{ matrix.arch }}" "${executables[@]}" <<'PY'
           import struct
           import sys
           from pathlib import Path
 
           expected = {"x86_64": 0x8664, "aarch64": 0xAA64}[sys.argv[2]]
-          for name in ("qemu-system-arm.exe", "qemu-system-armw.exe", "qemu-img.exe"):
+          for name in sys.argv[3:]:
               path = Path(sys.argv[1]) / name
               data = path.read_bytes()
               pe = struct.unpack_from("<I", data, 0x3C)[0]
@@ -331,11 +347,9 @@ jobs:
             "$dist/lib" \
             "$dist/share/icons"
 
-          install -m 0755 \
-            "$build_dir/qemu-system-arm.exe" \
-            "$build_dir/qemu-system-armw.exe" \
-            "$build_dir/qemu-img.exe" \
-            "$dist/"
+          for executable in "${executables[@]}"; do
+            install -m 0755 "$build_dir/$executable" "$dist/"
+          done
 
           # GLib locates these helpers by name at runtime; they do not appear
           # in the executable's PE import table.
@@ -353,6 +367,7 @@ jobs:
 
           mkdir -p "$dist/share/qemu"
           cp -aL pc-bios/. "$dist/share/qemu/"
+          install -m 0644 "$build_dir"/pc-bios/edk2-aarch64-{code,vars}.fd "$dist/share/qemu/"
 
           # Keep the default VGA and virtio NIC option ROMs in every artifact.
           for rom in efi-virtio.rom vgabios-stdvga.bin; do
@@ -400,12 +415,12 @@ jobs:
           # Copy MinGW runtime DLLs and their transitive dependencies.
           declare -A seen=()
           queue=(
-            "$dist/qemu-system-arm.exe"
-            "$dist/qemu-system-armw.exe"
-            "$dist/qemu-img.exe"
             "$dist/gspawn-win64-helper.exe"
             "$dist/gspawn-win64-helper-console.exe"
           )
+          for executable in "${executables[@]}"; do
+            queue+=("$dist/$executable")
+          done
           while IFS= read -r module; do
             queue+=("$module")
           done < <(find "$dist/lib" -type f -iname '*.dll' -print)
