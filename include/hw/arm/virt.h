@@ -182,6 +182,7 @@ struct VirtMachineState {
     bool winrt_omap_dma;
     bool winrt_qfprom_probe;
     bool winrt_qcdx_probe;
+    bool qcom8998_display;
     bool winrt_qcom_cypress_touch;
     bool winrt_qcom_synaptics_touch;
     char *winrt_qcdx_ssdt_file;

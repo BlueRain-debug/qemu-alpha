@@ -52,6 +52,7 @@
 #include "hw/pci/pci_bus.h"
 #include "hw/pci-host/gpex.h"
 #include "hw/arm/virt.h"
+#include "hw/display/qcom-8998-display.h"
 #include "hw/intc/arm_gicv3_its_common.h"
 #include "hw/mem/nvdimm.h"
 #include "hw/core/platform-bus.h"
@@ -105,11 +106,13 @@ static void acpi_dsdt_add_uart(Aml *scope, const MemMapEntry *uart_memmap,
     aml_append(scope, dev);
 }
 
-static void acpi_dsdt_add_flash(Aml *scope, const MemMapEntry *flash_memmap)
+static void acpi_dsdt_add_flash(Aml *scope, const VirtMachineState *vms)
 {
+    const MemMapEntry *flash_memmap = &vms->memmap[VIRT_FLASH];
     Aml *dev, *crs;
     hwaddr base = flash_memmap->base;
     hwaddr size = flash_memmap->size / 2;
+    hwaddr varsize = vms->qcom8998_display ? QCOM8998_VAR_FLASH_SIZE : size;
 
     dev = aml_device("FLS0");
     aml_append(dev, aml_name_decl("_HID", aml_string("LNRO0015")));
@@ -124,7 +127,7 @@ static void acpi_dsdt_add_flash(Aml *scope, const MemMapEntry *flash_memmap)
     aml_append(dev, aml_name_decl("_HID", aml_string("LNRO0015")));
     aml_append(dev, aml_name_decl("_UID", aml_int(1)));
     crs = aml_resource_template();
-    aml_append(crs, aml_memory32_fixed(base + size, size, AML_READ_WRITE));
+    aml_append(crs, aml_memory32_fixed(base + size, varsize, AML_READ_WRITE));
     aml_append(dev, aml_name_decl("_CRS", crs));
     aml_append(scope, dev);
 }
@@ -1451,7 +1454,7 @@ build_dsdt(GArray *table_data, BIOSLinker *linker, VirtMachineState *vms)
                            (irqmap[VIRT_UART1] + ARM_SPI_BASE), 1);
     }
     if (vmc->acpi_expose_flash && !vms->winrt_qcdx_probe) {
-        acpi_dsdt_add_flash(scope, &memmap[VIRT_FLASH]);
+        acpi_dsdt_add_flash(scope, vms);
     }
     fw_cfg_acpi_dsdt_add(scope, &memmap[VIRT_FW_CFG]);
     virtio_acpi_dsdt_add(scope, memmap[VIRT_MMIO].base, memmap[VIRT_MMIO].size,
@@ -1459,6 +1462,9 @@ build_dsdt(GArray *table_data, BIOSLinker *linker, VirtMachineState *vms)
                          0, vms->virtio_transports);
     if (vms->winrt) {
         acpi_dsdt_add_winrt(scope, vms);
+    }
+    if (vms->qcom8998_display) {
+        qcom8998_display_acpi(scope);
     }
     if (!vms->winrt || vms->winrt_pci) {
         acpi_dsdt_add_pci(scope, memmap, irqmap[VIRT_PCIE] + ARM_SPI_BASE, vms);
@@ -1599,7 +1605,8 @@ void virt_acpi_build(VirtMachineState *vms, AcpiBuildTables *tables)
     acpi_add_table(table_offsets, tables_blob);
     build_madt(tables_blob, tables->linker, vms);
 
-    if (vms->winrt_qcdx_probe && vms->winrt_qcdx_ssdt) {
+    if ((vms->winrt_qcdx_probe || vms->qcom8998_display) &&
+        vms->winrt_qcdx_ssdt) {
         size_t length;
         const void *data = g_bytes_get_data(vms->winrt_qcdx_ssdt, &length);
 

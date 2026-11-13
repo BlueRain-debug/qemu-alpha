@@ -40,6 +40,7 @@
 #include "hw/block/flash.h"
 #include "hw/display/ramfb.h"
 #include "hw/display/qcom-mdp4-probe.h"
+#include "hw/display/qcom-8998-display.h"
 #include "net/net.h"
 #include "system/device_tree.h"
 #include "system/numa.h"
@@ -1282,6 +1283,11 @@ static bool gicv3_nmi_present(VirtMachineState *vms)
            (vms->gic_version != VIRT_GIC_VERSION_2);
 }
 
+static unsigned int virt_gic_spi_count(const VirtMachineState *vms)
+{
+    return vms->qcom8998_display ? QCOM8998_GIC_IRQS - GIC_INTERNAL : NUM_IRQS;
+}
+
 static void gic_connect_ppis(VirtMachineState *vms)
 {
     /*
@@ -1296,7 +1302,7 @@ static void gic_connect_ppis(VirtMachineState *vms)
 
     for (int i = 0; i < smp_cpus; i++) {
         DeviceState *cpudev = DEVICE(qemu_get_cpu(i));
-        int intidbase = NUM_IRQS + i * GIC_INTERNAL;
+        int intidbase = virt_gic_spi_count(vms) + i * GIC_INTERNAL;
         /*
          * Mapping from the output timer irq lines from the CPU to the
          * GIC PPI inputs we use for the virt board.
@@ -1368,7 +1374,8 @@ static void create_gicv2(VirtMachineState *vms, MemoryRegion *mem)
      * Note that the num-irq property counts both internal and external
      * interrupts; there are always 32 of the former (mandated by GIC spec).
      */
-    qdev_prop_set_uint32(vms->gic, "num-irq", NUM_IRQS + 32);
+    qdev_prop_set_uint32(vms->gic, "num-irq",
+                        virt_gic_spi_count(vms) + GIC_INTERNAL);
     if (!kvm_irqchip_in_kernel()) {
         qdev_prop_set_bit(vms->gic, "has-security-extensions", vms->secure);
         qdev_prop_set_bit(vms->gic, "has-virtualization-extensions", vms->virt);
@@ -1867,11 +1874,12 @@ static void virt_flash_map(VirtMachineState *vms,
      */
     hwaddr flashsize = vms->memmap[VIRT_FLASH].size / 2;
     hwaddr flashbase = vms->memmap[VIRT_FLASH].base;
+    hwaddr varsize = vms->qcom8998_display ? QCOM8998_VAR_FLASH_SIZE : flashsize;
 
     virt_flash_map1(vms->flash[0], flashbase, flashsize,
                     secure_sysmem);
     virt_flash_map1(vms->flash[1], vms->winrt_qcdx_probe ? QCOM_MDP4_NVRAM_BASE :
-                    flashbase + flashsize, flashsize,
+                    flashbase + flashsize, varsize,
                     sysmem);
 }
 
@@ -1883,6 +1891,7 @@ static void virt_flash_fdt(VirtMachineState *vms,
     hwaddr flashbase = vms->memmap[VIRT_FLASH].base;
     hwaddr variable_base = vms->winrt_qcdx_probe ? QCOM_MDP4_NVRAM_BASE :
                           flashbase + flashsize;
+    hwaddr varsize = vms->qcom8998_display ? QCOM8998_VAR_FLASH_SIZE : flashsize;
     MachineState *ms = MACHINE(vms);
     char *nodename;
 
@@ -1893,7 +1902,7 @@ static void virt_flash_fdt(VirtMachineState *vms,
         qemu_fdt_setprop_string(ms->fdt, nodename, "compatible", "cfi-flash");
         qemu_fdt_setprop_sized_cells(ms->fdt, nodename, "reg",
                                      2, flashbase, 2, flashsize,
-                                     2, variable_base, 2, flashsize);
+                                     2, variable_base, 2, varsize);
         qemu_fdt_setprop_cell(ms->fdt, nodename, "bank-width", 4);
         g_free(nodename);
     } else {
@@ -1915,7 +1924,7 @@ static void virt_flash_fdt(VirtMachineState *vms,
         qemu_fdt_add_subnode(ms->fdt, nodename);
         qemu_fdt_setprop_string(ms->fdt, nodename, "compatible", "cfi-flash");
         qemu_fdt_setprop_sized_cells(ms->fdt, nodename, "reg",
-                                     2, variable_base, 2, flashsize);
+                                     2, variable_base, 2, varsize);
         qemu_fdt_setprop_cell(ms->fdt, nodename, "bank-width", 4);
         g_free(nodename);
     }
@@ -3188,8 +3197,19 @@ static void machvirt_init(MachineState *machine)
         exit(1);
     }
 
-    if (vms->winrt_qcdx_ssdt && !vms->winrt_qcdx_probe) {
-        error_report("winrt-qcdx-ssdt requires winrt-qcdx-probe=on");
+    if (vms->winrt_qcdx_ssdt && !vms->winrt_qcdx_probe &&
+        !vms->qcom8998_display) {
+        error_report("winrt-qcdx-ssdt requires winrt-qcdx-probe=on or "
+                     "qcom8998-display=on");
+        exit(1);
+    }
+
+    if (vms->qcom8998_display &&
+        (!target_aarch64() || (!tcg_enabled() && !qtest_enabled()) ||
+         vms->gic_version != VIRT_GIC_VERSION_2 || vms->winrt ||
+         !virt_is_acpi_enabled(vms))) {
+        error_report("qcom8998-display requires an AArch64 virt guest with "
+                     "TCG, gic-version=2, acpi=on and winrt=off");
         exit(1);
     }
 
@@ -3660,6 +3680,10 @@ static void machvirt_init(MachineState *machine)
 
     create_platform_bus(vms);
 
+    if (vms->qcom8998_display) {
+        qcom8998_display_create(vms->gic);
+    }
+
     if (machine->nvdimms_state->is_enabled) {
         const struct AcpiGenericAddress arm_virt_nvdimm_acpi_dsmio = {
             .space_id = AML_AS_SYSTEM_MEMORY,
@@ -3783,6 +3807,16 @@ static bool virt_get_winrt_pci(Object *obj, Error **errp)
 static bool virt_get_winrt_qcdx_probe(Object *obj, Error **errp)
 {
     return VIRT_MACHINE(obj)->winrt_qcdx_probe;
+}
+
+static bool virt_get_qcom8998_display(Object *obj, Error **errp)
+{
+    return VIRT_MACHINE(obj)->qcom8998_display;
+}
+
+static void virt_set_qcom8998_display(Object *obj, bool value, Error **errp)
+{
+    VIRT_MACHINE(obj)->qcom8998_display = value;
 }
 
 static bool virt_get_winrt_qcom_cypress_touch(Object *obj, Error **errp)
@@ -4872,6 +4906,11 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
         "Expose native MSM8x60 graphics MMIO for local driver bring-up; "
         "requires matching reserved-memory firmware and an external SSDT; "
         "bounded experimental drawing and MDP scanout, not a complete GPU");
+    object_class_property_add_bool(oc, "qcom8998-display",
+                                   virt_get_qcom8998_display,
+                                   virt_set_qcom8998_display);
+    object_class_property_set_description(oc, "qcom8998-display",
+        "Expose experimental MSM8998 QCDX MMIO and ACPI devices");
     object_class_property_add_str(oc, "winrt-qcdx-ssdt",
                                   virt_get_winrt_qcdx_ssdt,
                                   virt_set_winrt_qcdx_ssdt);

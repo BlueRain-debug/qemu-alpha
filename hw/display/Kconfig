@@ -86,6 +86,9 @@ config TCX
 config QCOM_MDP4_PROBE
     bool
 
+config QCOM_8998_DISPLAY
+    bool
+
 config CG3
     bool
 

@@ -15,6 +15,10 @@ qcom_mdp4_probe_command(unsigned depth, uint32_t address, uint32_t header, uint3
 qcom_mdp4_probe_cond(uint32_t enable, uint32_t timestamp, uint32_t reference, uint32_t skip) "enable=0x%x timestamp=0x%x ref=0x%x skip=%u"
 qcom_mdp4_probe_irq(uint32_t status, uint32_t mask, bool level) "status=0x%x mask=0x%x level=%d"
 
+# qcom-8998-display.c
+qcom8998_mmio_read(const char *bank, uint64_t offset, uint32_t value, uint64_t pc) "%s+0x%"PRIx64" read 0x%08x pc=0x%"PRIx64
+qcom8998_mmio_write(const char *bank, uint64_t offset, uint32_t value, uint64_t pc) "%s+0x%"PRIx64" write 0x%08x pc=0x%"PRIx64
+
 # jazz_led.c
 jazz_led_read(uint64_t addr, uint8_t val) "read addr=0x%"PRIx64": 0x%x"
 jazz_led_write(uint64_t addr, uint8_t new) "write addr=0x%"PRIx64": 0x%x"
