@@ -37,6 +37,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/virt.h"
+#include "hw/arm/qcom8998-scm.h"
 #include "hw/block/flash.h"
 #include "hw/display/ramfb.h"
 #include "hw/display/qcom-mdp4-probe.h"
@@ -3380,7 +3381,11 @@ static void machvirt_init(MachineState *machine)
     if (vms->winrt || (vms->secure && firmware_loaded)) {
         /* WinRT firmware parks secondary CPUs instead of using PSCI. */
         vms->psci_conduit = QEMU_PSCI_CONDUIT_DISABLED;
-    } else if (vms->virt) {
+    } else if (vms->virt || vms->qcom8998_display) {
+        /*
+         * SCM and PSCI share the synthetic monitor on the MSM8998 probe.
+         * This also makes SMC valid without a guest EL3 firmware image.
+         */
         vms->psci_conduit = QEMU_PSCI_CONDUIT_SMC;
     } else {
         vms->psci_conduit = QEMU_PSCI_CONDUIT_HVC;
@@ -3488,6 +3493,10 @@ static void machvirt_init(MachineState *machine)
             }
         } else if (!vms->secure) {
             object_property_set_bool(cpuobj, "has_el3", false, NULL);
+        }
+
+        if (vms->qcom8998_display) {
+            ARM_CPU(cpuobj)->firmware_smc = qcom8998_smc;
         }
 
         if (!vms->virt && object_property_find(cpuobj, "has_el2")) {

@@ -11,6 +11,13 @@ omap1_lpg_led(const char *onoff) "omap1 LPG: LED is %s"
 virt_acpi_setup(void) "No fw cfg or ACPI disabled. Bailing out."
 virt_acpi_dsdt_tegra241_cmdqv(int smmu_id, uint64_t base, uint32_t irq) "DSDT: add cmdqv node for (id=%d), base=0x%" PRIx64 ", irq=%d"
 
+# qcom8998-scm.c
+qcom8998_scm_call(uint64_t function, uint64_t arginfo, uint64_t arg0, uint64_t arg1, uint64_t arg2, int32_t status, uint64_t result0, uint64_t result1, uint64_t result2) "fn=0x%" PRIx64 " arginfo=0x%" PRIx64 " args=[0x%" PRIx64 ",0x%" PRIx64 ",0x%" PRIx64 "] status=%" PRId32 " results=[0x%" PRIx64 ",0x%" PRIx64 ",0x%" PRIx64 "]"
+qcom8998_qsee_app_lookup(const char *name, uint32_t app_id) "name=%s app-id=%u"
+qcom8998_qsee_message(uint32_t app_id, uint64_t request, uint64_t request_size, uint64_t response, uint64_t response_size) "app=%u request=0x%" PRIx64 " size=0x%" PRIx64 " response=0x%" PRIx64 " size=0x%" PRIx64
+qcom8998_qsee_request_word(uint32_t app_id, uint32_t offset, uint32_t value) "app=%u offset=0x%x value=0x%08x"
+qcom8998_uefi_reply(uint32_t command, uint32_t status, uint32_t bytes) "command=0x%x status=0x%08x bytes=%u"
+
 # smmu-common.c
 smmu_add_mr(const char *name) "%s"
 smmu_ptw_level(int stage, int level, uint64_t iova, size_t subpage_size, uint64_t baseaddr, uint32_t offset, uint64_t pte) "stage=%d level=%d iova=0x%"PRIx64" subpage_sz=0x%zx baseaddr=0x%"PRIx64" offset=%d => pte=0x%"PRIx64

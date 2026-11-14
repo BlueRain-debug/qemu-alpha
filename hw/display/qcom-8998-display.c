@@ -57,6 +57,7 @@ static const struct {
     [BANK_SOC_VERSION] = { "soc-version", 0x01fc8000, 4 },
 };
 
+#define MDSS_HW_VERSION 0x0
 #define MDSS_MDP_HW_VERSION 0x1000
 #define MSM8998_MDP_REV_301 0x30000001
 #define APQ8098_JTAG_ID 0x000620e1
@@ -156,6 +157,7 @@ static void qcom8998_reset(DeviceState *dev)
         memset(s->bank[i].regs, 0, banks[i].size);
         s->bank[i].last_read_offset = HWADDR_MAX;
     }
+    s->bank[BANK_MDSS].regs[MDSS_HW_VERSION / 4] = MSM8998_MDP_REV_301;
     s->bank[BANK_MDSS].regs[MDSS_MDP_HW_VERSION / 4] = MSM8998_MDP_REV_301;
     s->bank[BANK_SOC_JTAG_ID].regs[0] = APQ8098_JTAG_ID;
     s->bank[BANK_SOC_VERSION].regs[0] = APQ8098_SOC_HW_VERSION_2_0;
@@ -307,7 +309,8 @@ void qcom8998_display_acpi(Aml *scope)
         const char *name;
         uint32_t value;
     } adapter_settings[] = {
-        { "DisableTzMDSSRestore", 1 },
+        /* The synthetic SCM restores the probe's non-secure MDSS state. */
+        { "DisableTzMDSSRestore", 0 },
         { "UseLowPTForGfxPerProcess", 1 },
         { "GPU64bAddrEnabled", 1 },
         { "MaxPreemptionOffsets", 0x80 },
@@ -377,5 +380,11 @@ void qcom8998_display_acpi(Aml *scope)
                      ARRAY_SIZE(mdss_smmu_irqs));
     qcom8998_acpi_smmu(scope, "QSM3", 3, BANK_ADRENO_SMMU, adreno_smmu_irqs,
                      ARRAY_SIZE(adreno_smmu_irqs));
+    /*
+     * The native SCM interfaces are published only after TrEE starts.
+     * Like the OEMSK DSDT, these enumerators have no MMIO resources.
+     */
+    aml_append(scope, qcom8998_acpi_device("SCM0", "QCOM0013", 0));
+    aml_append(scope, qcom8998_acpi_device("TREE", "QCOM00BF", 0));
     aml_append(scope, dev);
 }
