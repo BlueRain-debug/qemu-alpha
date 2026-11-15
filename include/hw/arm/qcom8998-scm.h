@@ -5,5 +5,6 @@
 #include "target/arm/cpu-qom.h"
 
 bool qcom8998_smc(ARMCPU *cpu);
+void qcom8998_scm_create(void);
 
 #endif

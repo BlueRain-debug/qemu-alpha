@@ -38,6 +38,8 @@
 #include "hw/arm/boot.h"
 #include "hw/arm/virt.h"
 #include "hw/arm/qcom8998-scm.h"
+#include "hw/arm/qcom8998-rpm.h"
+#include "hw/arm/qcom8998-spmi.h"
 #include "hw/block/flash.h"
 #include "hw/display/ramfb.h"
 #include "hw/display/qcom-mdp4-probe.h"
@@ -284,6 +286,32 @@ static const int a15irqmap[] = {
     [VIRT_GIC_V2M] = 48, /* ...to 48 + NUM_GICV2M_SPIS - 1 */
     [VIRT_SMMU] = 74,    /* ...to 74 + NUM_SMMU_IRQS - 1 */
     [VIRT_PLATFORM_BUS] = 112, /* ...to 112 + PLATFORM_BUS_NUM_IRQS -1 */
+};
+
+/*
+ * Native MSM8998 resources overlap virtio and the default MSI pool. Preserve
+ * the SoC's INTIDs and put synthetic devices above them. Entries are SPI
+ * indices, whereas the ACPI/GIC INTID includes GIC_INTERNAL interrupts.
+ */
+enum {
+    QCOM8998_VIRT_SPI_BASE = QCOM8998_VIRT_IRQ_BASE - GIC_INTERNAL,
+};
+
+static const int qcom8998_irqmap[] = {
+    [VIRT_UART0] = QCOM8998_VIRT_SPI_BASE + 1,
+    [VIRT_RTC] = QCOM8998_VIRT_SPI_BASE + 2,
+    [VIRT_PCIE] = QCOM8998_VIRT_SPI_BASE + 3, /* Four legacy PCI interrupts. */
+    [VIRT_GPIO] = QCOM8998_VIRT_SPI_BASE + 7,
+    [VIRT_UART1] = QCOM8998_VIRT_SPI_BASE + 8,
+    [VIRT_ACPI_GED] = QCOM8998_VIRT_SPI_BASE + 9,
+    [VIRT_GWDT_WS0] = QCOM8998_VIRT_SPI_BASE + 10,
+    [VIRT_EHCI] = QCOM8998_VIRT_SPI_BASE + 11,
+    [VIRT_SDHCI] = QCOM8998_VIRT_SPI_BASE + 12,
+    [VIRT_WINRT_TIMER] = QCOM8998_VIRT_SPI_BASE + 13,
+    [VIRT_MMIO] = QCOM8998_VIRT_SPI_BASE + 16, /* 32 virtio transports. */
+    [VIRT_GIC_V2M] = QCOM8998_VIRT_SPI_BASE + 48, /* 64 MSI interrupts. */
+    [VIRT_SMMU] = QCOM8998_VIRT_SPI_BASE + 112, /* Four SMMUv3 interrupts. */
+    [VIRT_PLATFORM_BUS] = QCOM8998_VIRT_SPI_BASE + 128, /* 64 interrupts. */
 };
 
 static void create_randomness(MachineState *ms, const char *node)
@@ -2579,6 +2607,21 @@ static void virt_set_memmap(VirtMachineState *vms, int pa_bits)
         vms->memmap[i] = base_memmap[i];
     }
 
+    if (vms->qcom8998_display) {
+        /* The native SPMI resource occupies the GICv2 and low virt MMIO. */
+        for (i = VIRT_CPUPERIPHS; i <= VIRT_GIC_VCPU; i++) {
+            vms->memmap[i].base += 0x03000000;
+        }
+        for (i = 0; i < ARRAY_SIZE(base_memmap); i++) {
+            hwaddr address = base_memmap[i].base;
+
+            if (address >= 0x09000000 && address < 0x0a000000) {
+                vms->memmap[i].base = 0x0b100000 + (address - 0x09000000);
+            }
+        }
+        vms->memmap[VIRT_MMIO].base = 0x0b300000;
+    }
+
     if (vms->winrt_legacy_ram) {
         vms->memmap[VIRT_MEM].base = 2 * GiB;
     }
@@ -3214,6 +3257,10 @@ static void machvirt_init(MachineState *machine)
         exit(1);
     }
 
+    if (vms->qcom8998_display) {
+        vms->irqmap = qcom8998_irqmap;
+    }
+
     if (vms->winrt_qcom_cypress_touch && vms->winrt_qcom_synaptics_touch) {
         error_report("Select only one native Qualcomm touch panel");
         exit(1);
@@ -3691,6 +3738,9 @@ static void machvirt_init(MachineState *machine)
 
     if (vms->qcom8998_display) {
         qcom8998_display_create(vms->gic);
+        qcom8998_rpm_create(vms->gic);
+        qcom8998_spmi_create();
+        qcom8998_scm_create();
     }
 
     if (machine->nvdimms_state->is_enabled) {
@@ -4470,8 +4520,8 @@ static void virt_machine_device_pre_plug_cb(const HotplugHandler *hotplug_dev,
             break;
         case VIRT_MSI_CTRL_GICV2M:
             /* MSI_SETSPI_NS page */
-            db_start = base_memmap[VIRT_GIC_V2M].base;
-            db_end = db_start + base_memmap[VIRT_GIC_V2M].size - 1;
+            db_start = vms->memmap[VIRT_GIC_V2M].base;
+            db_end = db_start + vms->memmap[VIRT_GIC_V2M].size - 1;
             break;
         case VIRT_MSI_CTRL_AUTO:
         case VIRT_MSI_LEGACY_OPT_ITS_OFF:

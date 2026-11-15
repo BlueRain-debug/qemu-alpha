@@ -11,6 +11,9 @@ omap1_lpg_led(const char *onoff) "omap1 LPG: LED is %s"
 virt_acpi_setup(void) "No fw cfg or ACPI disabled. Bailing out."
 virt_acpi_dsdt_tegra241_cmdqv(int smmu_id, uint64_t base, uint32_t irq) "DSDT: add cmdqv node for (id=%d), base=0x%" PRIx64 ", irq=%d"
 
+# qcom8998-rpm.c
+qcom8998_glink_command(bool guest_to_rpm, uint16_t command, uint16_t parameter, uint32_t value) "guest-to-rpm=%d command=%u param=%u value=0x%x"
+qcom8998_rpm_payload(uint16_t channel, uint32_t bytes, uint32_t remaining) "channel=%u bytes=%u remaining=%u"
 # qcom8998-scm.c
 qcom8998_scm_call(uint64_t function, uint64_t arginfo, uint64_t arg0, uint64_t arg1, uint64_t arg2, int32_t status, uint64_t result0, uint64_t result1, uint64_t result2) "fn=0x%" PRIx64 " arginfo=0x%" PRIx64 " args=[0x%" PRIx64 ",0x%" PRIx64 ",0x%" PRIx64 "] status=%" PRId32 " results=[0x%" PRIx64 ",0x%" PRIx64 ",0x%" PRIx64 "]"
 qcom8998_qsee_app_lookup(const char *name, uint32_t app_id) "name=%s app-id=%u"
@@ -89,6 +92,9 @@ tegra241_cmdqv_read_vcmdq_page0(int index, const char *aperture, const char *bac
 tegra241_cmdqv_read_vcmdq_page1(int index, const char *aperture, uint64_t offset0, uint64_t val) "vcmdq[%d] %s offset0: 0x%"PRIx64" val: 0x%"PRIx64
 tegra241_cmdqv_write_vcmdq_page0(int index, const char *aperture, const char *backing, uint64_t offset0, uint64_t val) "vcmdq[%d] %s (%s) offset0: 0x%"PRIx64" val: 0x%"PRIx64
 tegra241_cmdqv_write_vcmdq_page1(int index, const char *aperture, uint64_t offset0, uint64_t val) "vcmdq[%d] %s offset0: 0x%"PRIx64" val: 0x%"PRIx64
+
+# qcom8998-scm.c
+qcom8998_pas_state(uint32_t function, int32_t status, unsigned segments, uint64_t base, uint64_t bytes, bool running) "fn=0x%x status=%d segments=%u base=0x%"PRIx64" bytes=0x%"PRIx64" running=%d"
 
 # strongarm.c
 strongarm_uart_update_parameters(const char *label, int speed, char parity, int data_bits, int stop_bits) "%s speed=%d parity=%c data=%d stop=%d"

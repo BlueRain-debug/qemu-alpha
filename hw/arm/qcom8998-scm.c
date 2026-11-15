@@ -11,8 +11,14 @@
 #include "qemu/bswap.h"
 #include "qemu/main-loop.h"
 #include "qemu/units.h"
+#include "crypto/hash.h"
+#include "elf.h"
+#include "qapi/error.h"
 #include "hw/core/cpu.h"
+#include "hw/core/sysbus.h"
 #include "hw/arm/qcom8998-scm.h"
+#include "migration/vmstate.h"
+#include "qemu/module.h"
 #include "system/memory.h"
 #include "cpu.h"
 #include "trace.h"
@@ -23,6 +29,14 @@
 #define QCOM_SCM_OWNER_QSEE_OS 50
 #define QCOM_SCM_INFO_IS_CALL_AVAIL 0x02000601
 #define QCOM_SCM_INFO_GET_FEATURE_VERSION 0x02000603
+#define QCOM_SCM_PIL_GET_LOAD_REGION 0x02000209
+#define QCOM_SCM_PAS_INIT_IMAGE 0x02000201
+#define QCOM_SCM_PAS_MEM_SETUP 0x02000202
+#define QCOM_SCM_PAS_AUTH_AND_RESET 0x02000205
+#define QCOM_SCM_PAS_SHUTDOWN 0x02000206
+#define QCOM_SCM_PAS_IS_SUPPORTED 0x02000207
+#define QCOM_SCM_PAS_ADRENO 13
+#define QCOM_SCM_ARGS_PAS_INIT 0x82 /* Subsystem ID and metadata RAM buffer. */
 #define QCOM_SCM_QSEE_REGISTER_LOG_BUFFER 0x32000106
 #define QCOM_SCM_QSEE_APP_LOOKUP 0x32000103
 #define QCOM_SCM_QSEE_APP_SEND 0x30000001
@@ -33,6 +47,7 @@
 #define QCOM_SCM_CALL_64BIT BIT(30)
 #define QCOM_SCM_ARGS_ONE_VALUE 1
 #define QCOM_SCM_ARGS_TWO_VALUES 2
+#define QCOM_SCM_ARGS_THREE_VALUES 3
 #define QCOM_SCM_ARGS_RW_BUFFER_LENGTH 0x22 /* Two args; first is read/write. */
 #define QCOM_SCM_ARGS_APP_SEND 0x885 /* app, request, size, response, size */
 #define QCOM_SCM_MAX_ARGS 10
@@ -56,6 +71,42 @@
 #define QCOM_EFI_UNSUPPORTED 0x80000003U
 #define QCOM_EFI_WRITE_PROTECTED 0x80000008U
 #define QCOM_EFI_NOT_FOUND 0x8000000eU
+
+#define TYPE_QCOM8998_SCM "qcom8998-scm"
+OBJECT_DECLARE_SIMPLE_TYPE(Qcom8998Scm, QCOM8998_SCM)
+
+/* Bounded ELF32/MBNv5 subset used by the native Adreno secure-mode image. */
+#define PAS_MAX_SEGMENTS 16
+#define PAS_MAX_METADATA (64 * KiB)
+#define PAS_MAX_REGION (16 * MiB)
+#define PAS_PAGE_SIZE 4096
+#define PAS_MDT_TYPE_MASK (7U << 24)
+#define PAS_MDT_TYPE_HASH (2U << 24)
+#define PAS_MDT_RELOCATABLE BIT(27)
+#define PAS_MBN_V5_HEADER_BYTES 40
+#define PAS_SHA256_BYTES QCRYPTO_HASH_DIGEST_LEN_SHA256
+
+typedef struct QcomPasSegment {
+    uint32_t address;
+    uint32_t file_bytes;
+    uint32_t memory_bytes;
+    uint8_t hash[PAS_SHA256_BYTES];
+} QcomPasSegment;
+
+typedef struct QcomPasImage {
+    unsigned count;
+    uint64_t minimum;
+    uint64_t bytes;
+    hwaddr base;
+    bool bound;
+    bool running;
+    QcomPasSegment segments[PAS_MAX_SEGMENTS];
+} QcomPasImage;
+
+struct Qcom8998Scm {
+    SysBusDevice parent_obj;
+    QcomPasImage image;
+};
 
 /*
  * Little-endian UEFI secure-app wire layout, shared by Get/SetVariable.
@@ -98,6 +149,199 @@ static bool qcom8998_scm_ram_buffer(ARMCPU *cpu, hwaddr address,
                                  MEMTXATTRS_UNSPECIFIED);
     return memory_region_is_ram(mr) &&
            (!write || !memory_region_is_rom(mr)) && length == size;
+}
+
+static bool qcom8998_pas_read(ARMCPU *cpu, hwaddr address, void *data,
+                              size_t bytes)
+{
+    return qcom8998_scm_ram_buffer(cpu, address, bytes, false) &&
+        address_space_read(cpu_get_address_space(CPU(cpu), 0), address,
+                           MEMTXATTRS_UNSPECIFIED, data, bytes) == MEMTX_OK;
+}
+
+static bool qcom8998_pas_hash(const void *data, size_t bytes,
+                              const uint8_t *expected)
+{
+    uint8_t digest[PAS_SHA256_BYTES];
+    uint8_t *output = digest;
+    size_t output_bytes = sizeof(digest);
+
+    return qcrypto_hash_bytes(QCRYPTO_HASH_ALGO_SHA256, data, bytes,
+                              &output, &output_bytes, NULL) == 0 &&
+           !memcmp(digest, expected, sizeof(digest));
+}
+
+static int32_t qcom8998_pas_init(ARMCPU *cpu, Qcom8998Scm *s, hwaddr address)
+{
+    g_autofree uint8_t *metadata = NULL;
+    QcomPasImage next = { .minimum = UINT64_MAX };
+    Elf32_Ehdr header;
+    Elf32_Phdr table[PAS_MAX_SEGMENTS];
+    unsigned count, hash_index = 0;
+    uint32_t table_offset, header_bytes, hash_bytes, hash_table_bytes;
+    uint64_t end = 0;
+    const uint8_t *hash_header, *hashes;
+
+    /* A rejected new image must not leave old staged metadata usable. */
+    memset(&s->image, 0, sizeof(s->image));
+    if (address > UINT64_MAX - PAS_MAX_METADATA ||
+        !qcom8998_pas_read(cpu, address, &header, sizeof(header)) ||
+        memcmp(header.e_ident, ELFMAG, SELFMAG) ||
+        header.e_ident[EI_CLASS] != ELFCLASS32 ||
+        header.e_ident[EI_DATA] != ELFDATA2LSB ||
+        le16_to_cpu(header.e_phentsize) != sizeof(Elf32_Phdr)) {
+        return QCOM_SCM_EINVAL;
+    }
+    count = le16_to_cpu(header.e_phnum);
+    table_offset = le32_to_cpu(header.e_phoff);
+    if (count < 3 || count > PAS_MAX_SEGMENTS ||
+        table_offset < sizeof(header) || table_offset > PAS_PAGE_SIZE ||
+        !qcom8998_pas_read(cpu, address + table_offset, table,
+                           count * sizeof(table[0]))) {
+        return QCOM_SCM_EINVAL;
+    }
+    header_bytes = le32_to_cpu(table[0].p_filesz);
+    if (header_bytes > PAS_PAGE_SIZE ||
+        header_bytes < table_offset + count * sizeof(table[0]) ||
+        le32_to_cpu(table[0].p_type) == PT_LOAD) {
+        return QCOM_SCM_EINVAL;
+    }
+    for (unsigned i = 1; i < count; i++) {
+        if ((le32_to_cpu(table[i].p_flags) & PAS_MDT_TYPE_MASK) ==
+            PAS_MDT_TYPE_HASH) {
+            if (hash_index) {
+                return QCOM_SCM_EINVAL;
+            }
+            hash_index = i;
+        }
+    }
+    if (!hash_index) {
+        return QCOM_SCM_EINVAL;
+    }
+    hash_bytes = le32_to_cpu(table[hash_index].p_filesz);
+    hash_table_bytes = count * PAS_SHA256_BYTES;
+    if (hash_bytes < PAS_MBN_V5_HEADER_BYTES + hash_table_bytes ||
+        hash_bytes > PAS_MAX_METADATA - header_bytes) {
+        return QCOM_SCM_EINVAL;
+    }
+    /* MDT wire metadata packs the hash segment directly after ELF headers. */
+    metadata = g_malloc(header_bytes + hash_bytes);
+    if (!qcom8998_pas_read(cpu, address, metadata, header_bytes + hash_bytes)) {
+        return QCOM_SCM_EINVAL;
+    }
+    hash_header = metadata + header_bytes;
+    hashes = hash_header + PAS_MBN_V5_HEADER_BYTES;
+    if (ldl_le_p(hash_header + 4) != 5 ||
+        ldl_le_p(hash_header + 20) != hash_table_bytes ||
+        (uint64_t)hash_table_bytes + ldl_le_p(hash_header + 8) +
+        ldl_le_p(hash_header + 12) + ldl_le_p(hash_header + 28) +
+        ldl_le_p(hash_header + 36) > hash_bytes - PAS_MBN_V5_HEADER_BYTES ||
+        !qcom8998_pas_hash(metadata, header_bytes, hashes)) {
+        return QCOM_SCM_EINVAL;
+    }
+    for (unsigned i = 1; i < count; i++) {
+        QcomPasSegment *segment;
+        uint32_t flags = le32_to_cpu(table[i].p_flags);
+        uint32_t memory_bytes = le32_to_cpu(table[i].p_memsz);
+
+        if (i == hash_index || le32_to_cpu(table[i].p_type) != PT_LOAD ||
+            !memory_bytes) {
+            continue;
+        }
+        if (!(flags & PAS_MDT_RELOCATABLE)) {
+            return QCOM_SCM_EINVAL;
+        }
+        segment = &next.segments[next.count++];
+        segment->address = le32_to_cpu(table[i].p_paddr);
+        segment->file_bytes = le32_to_cpu(table[i].p_filesz);
+        segment->memory_bytes = memory_bytes;
+        if (!segment->file_bytes || segment->file_bytes > memory_bytes ||
+            memory_bytes > PAS_MAX_REGION) {
+            return QCOM_SCM_EINVAL;
+        }
+        memcpy(segment->hash, hashes + i * PAS_SHA256_BYTES, PAS_SHA256_BYTES);
+        next.minimum = MIN(next.minimum, segment->address);
+        end = MAX(end, (uint64_t)segment->address + memory_bytes);
+    }
+    if (!next.count || (next.minimum & (PAS_PAGE_SIZE - 1))) {
+        return QCOM_SCM_EINVAL;
+    }
+    next.bytes = ROUND_UP(end, PAS_PAGE_SIZE) - next.minimum;
+    if (next.bytes > PAS_MAX_REGION) {
+        return QCOM_SCM_EINVAL;
+    }
+    s->image = next;
+    return 0;
+}
+
+static int32_t qcom8998_pas_start(ARMCPU *cpu, QcomPasImage *image)
+{
+    if (!image->count || !image->bound) {
+        return QCOM_SCM_EINVAL;
+    }
+    image->running = false;
+    for (unsigned i = 0; i < image->count; i++) {
+        QcomPasSegment *segment = &image->segments[i];
+        g_autofree uint8_t *data = g_malloc(segment->file_bytes);
+        hwaddr address = image->base + segment->address - image->minimum;
+
+        if (!qcom8998_pas_read(cpu, address, data, segment->file_bytes) ||
+            !qcom8998_pas_hash(data, segment->file_bytes, segment->hash)) {
+            return QCOM_SCM_EINVAL;
+        }
+    }
+    /*
+     * The probe models the GPU's non-secure firmware lifecycle only. These
+     * content hashes establish consistent loaded segments. No OEM fuse root
+     * or secure GPU instruction execution is provided by this virtual board.
+     */
+    image->running = true;
+    return 0;
+}
+
+static int32_t qcom8998_pas_call(ARMCPU *cpu, uint32_t function,
+                                uint64_t arginfo, const uint64_t *args)
+{
+    Qcom8998Scm *s = QCOM8998_SCM(
+        object_resolve_path_type("", TYPE_QCOM8998_SCM, NULL));
+    QcomPasImage *image = &s->image;
+    int32_t status = QCOM_SCM_EINVAL;
+
+    if (args[0] != QCOM_SCM_PAS_ADRENO) {
+        return QCOM_SCM_EOPNOTSUPP;
+    }
+    switch (function) {
+    case QCOM_SCM_PAS_INIT_IMAGE:
+        if (arginfo == QCOM_SCM_ARGS_PAS_INIT) {
+            status = qcom8998_pas_init(cpu, s, args[1]);
+        }
+        break;
+    case QCOM_SCM_PAS_MEM_SETUP:
+        if (arginfo == QCOM_SCM_ARGS_THREE_VALUES && image->count &&
+            args[2] >= image->bytes &&
+            args[2] <= PAS_MAX_REGION && !(args[1] & (PAS_PAGE_SIZE - 1)) &&
+            qcom8998_scm_ram_buffer(cpu, args[1], args[2], true)) {
+            image->base = args[1];
+            image->bound = true;
+            image->running = false;
+            status = 0;
+        }
+        break;
+    case QCOM_SCM_PAS_AUTH_AND_RESET:
+        if (arginfo == QCOM_SCM_ARGS_ONE_VALUE) {
+            status = qcom8998_pas_start(cpu, image);
+        }
+        break;
+    case QCOM_SCM_PAS_SHUTDOWN:
+        if (arginfo == QCOM_SCM_ARGS_ONE_VALUE) {
+            memset(image, 0, sizeof(*image));
+            status = 0;
+        }
+        break;
+    }
+    trace_qcom8998_pas_state(function, status, image->count, image->base,
+                             image->bytes, image->running);
+    return status;
 }
 
 static bool qcom8998_scm_arguments(ARMCPU *cpu, uint64_t *arguments)
@@ -280,6 +524,12 @@ bool qcom8998_smc(ARMCPU *cpu)
         argument &= QCOM_SCM_FNID_MASK;
         result[0] = argument == QCOM_SCM_INFO_IS_CALL_AVAIL ||
                     argument == QCOM_SCM_INFO_GET_FEATURE_VERSION ||
+                    argument == QCOM_SCM_PIL_GET_LOAD_REGION ||
+                    argument == QCOM_SCM_PAS_INIT_IMAGE ||
+                    argument == QCOM_SCM_PAS_MEM_SETUP ||
+                    argument == QCOM_SCM_PAS_AUTH_AND_RESET ||
+                    argument == QCOM_SCM_PAS_SHUTDOWN ||
+                    argument == QCOM_SCM_PAS_IS_SUPPORTED ||
                     argument == QCOM_SCM_RESTORE_SEC_CFG ||
                     argument == QCOM_SCM_QSEE_REGISTER_LOG_BUFFER ||
                     argument == QCOM_SCM_QSEE_APP_LOOKUP ||
@@ -295,6 +545,33 @@ bool qcom8998_smc(ARMCPU *cpu)
          * must not advertise the capabilities of a real QSEE environment.
          */
         status = 0;
+        break;
+    case QCOM_SCM_PIL_GET_LOAD_REGION:
+        /*
+         * The OEMSK monitor returns an inclusive base and exclusive end
+         * from its PIL load-region configuration. virt reserves no PIL
+         * carveout, so both bounds are zero, as in the unconfigured monitor.
+         */
+        status = arginfo == QCOM_SCM_ARGS_ONE_VALUE && !argument ?
+                 0 : QCOM_SCM_EINVAL;
+        break;
+    case QCOM_SCM_PAS_IS_SUPPORTED:
+        if (arginfo == QCOM_SCM_ARGS_ONE_VALUE) {
+            status = 0;
+            result[0] = argument == QCOM_SCM_PAS_ADRENO;
+        }
+        break;
+    case QCOM_SCM_PAS_INIT_IMAGE:
+    case QCOM_SCM_PAS_MEM_SETUP:
+    case QCOM_SCM_PAS_AUTH_AND_RESET:
+    case QCOM_SCM_PAS_SHUTDOWN:
+        {
+            uint64_t args[QCOM_SCM_MAX_ARGS] = { 0 };
+
+            status = qcom8998_scm_arguments(cpu, args) ?
+                     qcom8998_pas_call(cpu, function, arginfo, args) :
+                     QCOM_SCM_EINVAL;
+        }
         break;
     case QCOM_SCM_RESTORE_SEC_CFG:
         /*
@@ -403,4 +680,45 @@ bool qcom8998_smc(ARMCPU *cpu)
     env->xregs[3] = result[2];
     env->xregs[6] = 0; /* No interrupted-call continuation context. */
     return true;
+}
+
+static void qcom8998_scm_reset(DeviceState *dev)
+{
+    Qcom8998Scm *s = QCOM8998_SCM(dev);
+
+    memset(&s->image, 0, sizeof(s->image));
+}
+
+static const VMStateDescription qcom8998_scm_vmstate = {
+    .name = TYPE_QCOM8998_SCM,
+    .unmigratable = true,
+};
+
+static void qcom8998_scm_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    dc->desc = "Experimental MSM8998 software monitor";
+    dc->user_creatable = false;
+    dc->vmsd = &qcom8998_scm_vmstate;
+    device_class_set_legacy_reset(dc, qcom8998_scm_reset);
+}
+
+static const TypeInfo qcom8998_scm_type = {
+    .name = TYPE_QCOM8998_SCM,
+    .parent = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(Qcom8998Scm),
+    .class_init = qcom8998_scm_class_init,
+};
+
+static void qcom8998_scm_register_types(void)
+{
+    type_register_static(&qcom8998_scm_type);
+}
+type_init(qcom8998_scm_register_types)
+
+void qcom8998_scm_create(void)
+{
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(qdev_new(TYPE_QCOM8998_SCM)),
+                             &error_fatal);
 }

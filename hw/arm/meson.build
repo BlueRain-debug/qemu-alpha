@@ -1,5 +1,6 @@
 arm_common_ss = ss.source_set()
-arm_common_ss.add(when: 'CONFIG_ARM_VIRT', if_true: files('virt.c', 'qcom8998-scm.c'))
+arm_common_ss.add(when: 'CONFIG_ARM_VIRT', if_true: files(
+  'virt.c', 'qcom8998-scm.c', 'qcom8998-rpm.c', 'qcom8998-spmi.c'))
 arm_common_ss.add(when: 'CONFIG_ACPI', if_true: files('virt-acpi-build.c'))
 arm_common_ss.add(when: 'CONFIG_DIGIC', if_true: files('digic_boards.c'))
 arm_common_ss.add(when: 'CONFIG_EMCRAFT_SF2', if_true: files('msf2-som.c'))
