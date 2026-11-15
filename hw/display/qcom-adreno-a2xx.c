@@ -905,6 +905,7 @@ static bool a2xx_primitive(QcomA2xxDrawContext *context,
     float minimum[2] = {FLT_MAX, FLT_MAX}, maximum[2] = {-FLT_MAX, -FLT_MAX};
     bool resolve = regs[A2XX_MODE_CONTROL] == 6;
     bool gmem = !resolve && (color & 0xfffff000U) < context->gmem_bytes;
+    bool binning_pass = context->software_binning && gmem && !pitch;
     bool blending = !resolve && !(regs[A2XX_COLOR_CONTROL] & 0x20);
     unsigned viewport = regs[A2XX_VIEWPORT_CONTROL];
     uint32_t blend = regs[A2XX_BLEND_CONTROL];
@@ -920,8 +921,9 @@ static bool a2xx_primitive(QcomA2xxDrawContext *context,
                           0.5f : 0.0f;
 
     if ((color & 15) != 5 || (color & 0x980) ||
-        (regs[A2XX_SURFACE_INFO] & ~0x3fffU) || !pitch ||
-        pitch > A2XX_MAX_DIMENSION || (pitch & 31) ||
+        (regs[A2XX_SURFACE_INFO] & ~0x3fffU) ||
+        (!binning_pass && (!pitch || pitch > A2XX_MAX_DIMENSION ||
+                           (pitch & 31))) ||
         (!resolve && regs[A2XX_MODE_CONTROL] != 4) ||
         (regs[A2XX_DEPTH_CONTROL] & 7) ||
         (regs[A2XX_COLOR_CONTROL] & 0x1ffd8) != 0xc00 ||
@@ -1063,7 +1065,8 @@ static bool a2xx_primitive(QcomA2xxDrawContext *context,
     if (right <= left || bottom <= top) {
         return true; /* Fully clipped draw has no memory effects. */
     }
-    if (right > pitch || (right - left) * (bottom - top) > A2XX_MAX_PIXELS) {
+    if ((!binning_pass && right > pitch) ||
+        (right - left) * (bottom - top) > A2XX_MAX_PIXELS) {
         return a2xx_fail(context, "rectangle bounds", right);
     }
     if (resolve && context->fast_resolve) {
@@ -1077,7 +1080,9 @@ static bool a2xx_primitive(QcomA2xxDrawContext *context,
         }
     }
     parameter_inputs = context->fast_fragments ? parameters : UINT16_MAX;
-    pending = g_new(A2xxPendingPixel, (right - left) * (bottom - top));
+    if (!binning_pass) {
+        pending = g_new(A2xxPendingPixel, (right - left) * (bottom - top));
+    }
     for (int y = top; y < bottom; y++) {
         for (int x = left; x < right; x++) {
             uint16_t remaining_parameters = resolve ? 0 : parameter_inputs;
@@ -1177,6 +1182,13 @@ static bool a2xx_primitive(QcomA2xxDrawContext *context,
             } else {
                 if (!a2xx_shader(context, 1, &pixel)) {
                     return false;
+                }
+                /*
+                 * The zero-pitch prepass has no color target. The tile
+                 * replays will rerun these draws with valid GMEM targets.
+                 */
+                if (binning_pass) {
+                    continue;
                 }
                 address += gmem || (color & 0x40) ? (y * pitch + x) * 4 :
                            a2xx_tiled_offset(x, y, pitch, 4);

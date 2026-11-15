@@ -80,6 +80,7 @@ struct QcomMdp4ProbeState {
     bool me_initialized;
     bool upload_endian_workaround;
     bool draw_cache_enabled;
+    bool software_binning;
     bool fast_resolve;
     bool fast_fragments;
     bool damage_scanout;
@@ -101,6 +102,8 @@ struct QcomMdp4ProbeState {
     unsigned stream_count;
     bool protected_mode;
     uint32_t draw_init_flags;
+    uint32_t bin_data_base;
+    bool have_bin_data;
     uint32_t shader_bases;
     uint32_t shader_instructions[3][4096];
     uint32_t shader_words[3];
@@ -142,6 +145,7 @@ struct QcomMdp4ProbeState {
 #define CP_OPCODE_WAIT_IDLE 0x26
 #define CP_OPCODE_IM_LOAD_IMMEDIATE 0x2b
 #define CP_OPCODE_SET_CONSTANT 0x2d
+#define CP_OPCODE_SET_BIN_DATA 0x2f
 #define CP_OPCODE_IB_PFD 0x37
 #define CP_OPCODE_INVALIDATE_STATE 0x3b
 #define CP_OPCODE_WAIT_REG_MEM 0x3c
@@ -159,6 +163,8 @@ struct QcomMdp4ProbeState {
 #define CP_EVENT_CACHE_FLUSH_TS 4
 #define CP_EVENT_CACHE_FLUSH 6
 #define CP_EVENT_CACHE_FLUSH_INVALIDATE 22
+#define CP_DRAW_VIS_CULL_MASK (3U << 9)
+#define CP_DRAW_PRE_DRAW_ENABLE (1U << 14)
 #define CP_MAX_PACKET_WORDS 16384
 #define CP_CALLBACK_PACKET_BUDGET 256
 #define CP_DISPATCH_DELAY_NS 1000 /* Decouple doorbells from command execution. */
@@ -192,6 +198,7 @@ struct QcomMdp4ProbeState {
 #define MDP_OVERLAY0_FLUSH (1U << 0)
 #define MDP_RGB1_MIXER0_BASE (1U << 8)
 #define MDP_VIG1_MIXER0_BASE 1U
+#define MDP_SRC_FORMAT_ALPHA_ENABLE (1U << 8)
 #define MDP_SCALE_X_ENABLE (1U << 0)
 #define MDP_SCALE_Y_ENABLE (1U << 1)
 #define MDP_CSC_ENABLE (1U << 11)
@@ -470,8 +477,12 @@ static bool qcom_probe_display_update(void *opaque)
         (!(scale & MDP_SCALE_Y_ENABLE) && height != source_height) ||
         ((scale & MDP_SCALE_X_ENABLE) && !s->scanout[0x5c / 4]) ||
         ((scale & MDP_SCALE_Y_ENABLE) && !s->scanout[0x60 / 4]) ||
-        /* Only tightly packed, interleaved 8-bit RGBA is implemented. */
-        (format & 0x7e0a67ff) != 0x000267ff ||
+        /*
+         * The base layer uses only RGB. Disabling source alpha leaves the
+         * same four-byte layout, with the alpha byte unused.
+         */
+        ((format ^ 0x000267ff) &
+         (0x7e0a67ff & ~MDP_SRC_FORMAT_ALPHA_ENABLE)) ||
         (!solid && (stride < source_width * 4 ||
           (uint64_t)s->scanout[4] +
           (uint64_t)stride * source_height > UINT32_MAX))) {
@@ -840,6 +851,7 @@ static QcomProbeCommandResult qcom_probe_execute_packet(
             .gmem = s->gmem,
             .gmem_bytes = sizeof(s->gmem),
             .upload_endian_workaround = s->upload_endian_workaround,
+            .software_binning = s->software_binning,
             .fast_resolve = s->fast_resolve,
             .fast_fragments = s->fast_fragments,
             .opaque = s,
@@ -850,25 +862,37 @@ static QcomProbeCommandResult qcom_probe_execute_packet(
             .write_bytes = qcom_probe_draw_write_bytes,
         };
         bool success;
+        uint32_t initiator = count > 1 ? payload[1] : 0;
+
+        /* The tile scissor clips the replay to the current tile. */
+        if (s->have_bin_data) {
+            initiator &= ~CP_DRAW_VIS_CULL_MASK;
+            /* The pre-draw for this visibility buffer has no geometry. */
+            if (count == 5 && !payload[0] &&
+                initiator == CP_DRAW_PRE_DRAW_ENABLE && !payload[2] &&
+                payload[3] == s->bin_data_base && !payload[4]) {
+                return QCOM_CP_DONE;
+            }
+        }
 
         s->draw_cache = s->draw_cache_enabled ? &cache : NULL;
         /* Auto-indexed RECTLIST, three vertices, no visibility query.
          * Bit 14 enables the driver's pre-draw setup, bit 11 selects index
          * width (irrelevant for auto indexing). Other modes stay pending. */
         if (count == 3 && !payload[0] && payload[2] == 3 &&
-            (payload[1] & ~0x4800U) == 0x88) {
+            (initiator & ~0x4800U) == 0x88) {
             success = qcom_a2xx_draw_rect(&context);
         } else if (count == 3 && !payload[0] &&
-                   (payload[1] & ~0x4800U) == 0x86) {
+                   (initiator & ~0x4800U) == 0x86) {
             /* DI_PT_TRISTRIP with AUTO_INDEX: the phone soft keyboard uses
              * this for its key popup. Index width has no effect in this mode. */
             success = qcom_a2xx_draw_triangle_strip(&context, payload[2]);
         } else if (count == 3 && !payload[0] &&
-                   (payload[1] & ~0x4800U) == 0x84) {
+                   (initiator & ~0x4800U) == 0x84) {
             /* DI_PT_TRILIST with AUTO_INDEX, used by the message editor. */
             success = qcom_a2xx_draw_auto_triangles(&context, payload[2]);
         } else if (count == 5 && !payload[0] &&
-                   (payload[1] & ~0x4000U) == 4) {
+                   (initiator & ~CP_DRAW_PRE_DRAW_ENABLE) == 4) {
             success = qcom_a2xx_draw_triangles(&context, payload[3],
                                                 payload[2], payload[4]);
         } else {
@@ -987,6 +1011,22 @@ static QcomProbeCommandResult qcom_probe_execute_packet(
         s->shader_words[stage] = MAX(s->shader_words[stage], start + words);
         return QCOM_CP_DONE;
     }
+    case CP_OPCODE_SET_BIN_DATA:
+        if (!s->software_binning || count != 2 ||
+            (payload[0] & 3) || (payload[1] & 3)) {
+            return QCOM_CP_UNSUPPORTED;
+        }
+        if (!qcom_probe_gpu_read32(s, payload[0], &value) ||
+            !qcom_probe_gpu_read32(s, payload[1], &reference)) {
+            return QCOM_CP_FAULT;
+        }
+        /*
+         * The software rasterizer replays the geometry for every tile
+         * without building or reading the hardware visibility stream.
+         */
+        s->bin_data_base = payload[0];
+        s->have_bin_data = true;
+        return QCOM_CP_DONE;
     case CP_OPCODE_SET_CONSTANT: {
         /* A2xx constant selectors name ALU, fetch, boolean, loop, and
          * ordinary graphics registers, respectively (DWORD addresses). */
@@ -1294,6 +1334,8 @@ static void qcom_mdp4_probe_reset(DeviceState *dev)
     s->me_initialized = false;
     s->protected_mode = false;
     s->draw_init_flags = 0;
+    s->bin_data_base = 0;
+    s->have_bin_data = false;
     s->shader_bases = 0;
     memset(s->shader_words, 0, sizeof(s->shader_words));
     memset(s->shader_instructions, 0, sizeof(s->shader_instructions));
@@ -1373,6 +1415,8 @@ static const VMStateDescription qcom_mdp4_probe_vmstate = {
 
 static const Property qcom_mdp4_probe_properties[] = {
     DEFINE_PROP_BOOL("draw-cache", QcomMdp4ProbeState, draw_cache_enabled, true),
+    DEFINE_PROP_BOOL("software-binning", QcomMdp4ProbeState,
+                     software_binning, false),
     DEFINE_PROP_BOOL("fast-resolve", QcomMdp4ProbeState, fast_resolve, true),
     DEFINE_PROP_BOOL("fast-fragments", QcomMdp4ProbeState,
                      fast_fragments, true),

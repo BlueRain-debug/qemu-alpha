@@ -13,6 +13,7 @@ typedef struct QcomA2xxDrawContext {
     size_t gmem_bytes;
     /* Opt-in diagnostic for QCDX CPU uploads; not a general endian rule. */
     bool upload_endian_workaround;
+    bool software_binning;
     bool fast_resolve;
     bool fast_fragments;
     void *opaque;
