@@ -15,7 +15,9 @@
 #include "qemu/bswap.h"
 #include "qemu/host-utils.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
 #include "system/address-spaces.h"
+#include "ui/console.h"
 #include "trace.h"
 
 #define TYPE_QCOM8998_DISPLAY "qcom-8998-display"
@@ -91,15 +93,46 @@ static const struct {
 #define MDSS_CTL_STRIDE 0x200
 #define MDSS_CTL_COUNT 5
 #define MDSS_CTL_REG_SIZE 0x94
+#define MDSS_CTL_TOP 0x14
+#define MDSS_CTL_TOP_INTF_SHIFT 4
+#define MDSS_CTL_TOP_CMD_MODE BIT(17)
+#define MDSS_CTL_FLUSH 0x18
+#define MDSS_CTL_START 0x1c
+#define MDSS_CTL_START_REQUEST BIT(0)
 #define MDSS_CTL_SW_RESET 0x30
 #define MDSS_CTL_SW_RESET_REQUEST BIT(0)
+#define MDSS_CTL_LAYER_EXT 0x40
+#define MDSS_CTL_LAYER_EXT2 0x70
+#define MDSS_CTL_BORDER_OUT BIT(24)
+#define MDSS_CTL_FLUSH_MIXER(index) BIT(6 + (index))
 #define MDSS_HW_INTR_STATUS 0x10
+#define MDSS_MDP_INTR BIT(0)
 #define MDSS_DSI0_INTR BIT(4)
 #define MDSS_DSI1_INTR BIT(5)
+#define MDP_INTR_EN 0x1010
+#define MDP_INTR_STATUS 0x1014
+#define MDP_INTR_CLEAR 0x1018
+#define MDP_PP_DONE_IRQ(index) BIT(8 + (index))
+#define MDP_PP_RD_PTR_IRQ(index) BIT(12 + (index))
+#define MDP_PP_BASE 0x71000
+#define MDP_PP_STRIDE 0x800
+#define MDP_PP_SYNC_CONFIG 0x004
+#define MDP_PP_SYNC_HEIGHT 0x008
+#define MDP_PP_COUNTER_EN BIT(19)
+#define MDP_LM_BASE 0x45000
+#define MDP_LM_STRIDE 0x1000
+#define MDP_LM_OUT_SIZE 0x004
+#define MDP_LM_BORDER_COLOR_0 0x008
+#define MDP_LM_BORDER_COLOR_1 0x010
+#define MDP_MAX_OUTPUT_SIZE 4096
+/* The two OEMSK command-mode panels refresh at 60 Hz. */
+#define MDP_PANEL_REFRESH_HZ 60
 
 /* DSI 6G has a version word before the common DSI registers. */
 #define MDSS_DSI0_BASE 0x94000
 #define MDSS_DSI1_BASE 0x96000
+#define MDSS_DSI_COUNT 2
+#define MDP_INTF_DSI0 2
 #define MDSS_DSI_MMIO_SIZE 0x400
 #define DSI_CTRL 0x004
 #define DSI_CTRL_ENABLE BIT(0)
@@ -260,10 +293,21 @@ typedef struct Qcom8998Bank {
     uint32_t last_read_value;
 } Qcom8998Bank;
 
+typedef struct Qcom8998MdpTransfer {
+    unsigned panel;
+    unsigned width;
+    unsigned height;
+    uint32_t color;
+    uint32_t flush;
+} Qcom8998MdpTransfer;
+
 struct Qcom8998Display {
     SysBusDevice parent_obj;
     Qcom8998Bank bank[BANK_COUNT];
     qemu_irq irq[3];
+    QEMUTimer mdss_vsync;
+    QemuConsole *panel[MDSS_DSI_COUNT];
+    Qcom8998MdpTransfer transfer[MDSS_CTL_COUNT];
     bool me_initialized;
     unsigned gpmu_image_dwords;
 };
@@ -274,6 +318,9 @@ static void qcom8998_mdss_update_irq(Qcom8998Bank *bank)
     uint32_t dsi1 = bank->regs[(MDSS_DSI1_BASE + DSI_INTR_CTRL) / 4];
     uint32_t pending = 0;
 
+    if (bank->regs[MDP_INTR_STATUS / 4] & bank->regs[MDP_INTR_EN / 4]) {
+        pending |= MDSS_MDP_INTR;
+    }
     if (dsi0 & (dsi0 >> 1) & DSI_IRQ_STATUS) {
         pending |= MDSS_DSI0_INTR;
     }
@@ -282,6 +329,219 @@ static void qcom8998_mdss_update_irq(Qcom8998Bank *bank)
     }
     bank->regs[MDSS_HW_INTR_STATUS / 4] = pending;
     qemu_set_irq(bank->display->irq[0], pending != 0);
+}
+
+static int qcom8998_mdss_ctl_panel(uint32_t top)
+{
+    unsigned intf = extract32(top, MDSS_CTL_TOP_INTF_SHIFT, 4);
+
+    if (!(top & MDSS_CTL_TOP_CMD_MODE) || intf < MDP_INTF_DSI0 ||
+        intf >= MDP_INTF_DSI0 + MDSS_DSI_COUNT) {
+        return -1;
+    }
+    return intf - MDP_INTF_DSI0;
+}
+
+static uint32_t qcom8998_mdss_active_panels(Qcom8998Bank *bank)
+{
+    static const hwaddr dsi_bases[] = { MDSS_DSI0_BASE, MDSS_DSI1_BASE };
+    const uint32_t *regs = bank->regs;
+    const uint32_t dsi_cmd_enable = DSI_CTRL_ENABLE | DSI_CTRL_CMD_MODE_EN;
+    uint32_t active = 0;
+
+    for (unsigned ctl = 0; ctl < MDSS_CTL_COUNT; ctl++) {
+        hwaddr base = MDSS_CTL_BASE + ctl * MDSS_CTL_STRIDE;
+        int panel = qcom8998_mdss_ctl_panel(regs[(base + MDSS_CTL_TOP) / 4]);
+        hwaddr pp;
+
+        if (panel < 0) {
+            continue;
+        }
+        pp = MDP_PP_BASE + panel * MDP_PP_STRIDE;
+        if ((regs[(dsi_bases[panel] + DSI_CTRL) / 4] & dsi_cmd_enable) ==
+            dsi_cmd_enable &&
+            (regs[(pp + MDP_PP_SYNC_CONFIG) / 4] & MDP_PP_COUNTER_EN) &&
+            (regs[(pp + MDP_PP_SYNC_HEIGHT) / 4] & 0xffff)) {
+            active |= MDP_PP_RD_PTR_IRQ(panel);
+        }
+    }
+    return active;
+}
+
+static void qcom8998_mdss_vsync_arm(Qcom8998Display *s)
+{
+    timer_mod_ns(&s->mdss_vsync, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                 NANOSECONDS_PER_SECOND / MDP_PANEL_REFRESH_HZ);
+}
+
+static void qcom8998_mdss_vsync_update(Qcom8998Bank *bank)
+{
+    Qcom8998Display *s = bank->display;
+
+    if (!qcom8998_mdss_active_panels(bank)) {
+        timer_del(&s->mdss_vsync);
+    } else if (!timer_pending(&s->mdss_vsync)) {
+        qcom8998_mdss_vsync_arm(s);
+    }
+}
+
+static const GraphicHwOps qcom8998_panel_ops = {
+    /* Command-mode updates are driven by CTL_START and the panel timer. */
+};
+
+static void qcom8998_mdss_queue_transfer(Qcom8998Bank *bank, unsigned ctl)
+{
+    Qcom8998MdpTransfer *transfer = &bank->display->transfer[ctl];
+    const uint32_t *control =
+        &bank->regs[(MDSS_CTL_BASE + ctl * MDSS_CTL_STRIDE) / 4];
+    int panel = qcom8998_mdss_ctl_panel(control[MDSS_CTL_TOP / 4]);
+    const uint32_t *mixer;
+    uint32_t size, color_0, color_1;
+    unsigned width, height;
+
+    if (panel < 0 || transfer->flush ||
+        !(control[MDSS_CTL_FLUSH / 4] & MDSS_CTL_FLUSH_MIXER(panel))) {
+        return;
+    }
+    /* OEMSK routes LM0 and LM1 to DSI0 and DSI1, respectively. */
+    if (control[panel] != MDSS_CTL_BORDER_OUT ||
+        control[MDSS_CTL_LAYER_EXT / 4 + panel] ||
+        control[MDSS_CTL_LAYER_EXT2 / 4 + panel]) {
+        /* A source pipe is staged. The current model cannot fetch it. */
+        return;
+    }
+    mixer = &bank->regs[(MDP_LM_BASE + panel * MDP_LM_STRIDE) / 4];
+    size = mixer[MDP_LM_OUT_SIZE / 4];
+    width = extract32(size, 0, 16);
+    height = extract32(size, 16, 16);
+    if (!width || !height ||
+        width > MDP_MAX_OUTPUT_SIZE || height > MDP_MAX_OUTPUT_SIZE) {
+        return;
+    }
+
+    /* Two 12-bit components per word: green, blue, red, alpha. */
+    color_0 = mixer[MDP_LM_BORDER_COLOR_0 / 4];
+    color_1 = mixer[MDP_LM_BORDER_COLOR_1 / 4];
+    *transfer = (Qcom8998MdpTransfer) {
+        .panel = panel,
+        .width = width,
+        .height = height,
+        .color = (extract32(color_1, 4, 8) << 16) |
+                 (extract32(color_0, 4, 8) << 8) |
+                 extract32(color_0, 20, 8),
+        .flush = control[MDSS_CTL_FLUSH / 4],
+    };
+}
+
+static uint32_t qcom8998_mdss_transfer(Qcom8998Display *s, uint32_t active)
+{
+    uint32_t pending = 0;
+
+    for (unsigned ctl = 0; ctl < MDSS_CTL_COUNT; ctl++) {
+        Qcom8998MdpTransfer *transfer = &s->transfer[ctl];
+        unsigned panel = transfer->panel;
+        hwaddr base = MDSS_CTL_BASE + ctl * MDSS_CTL_STRIDE;
+        uint32_t *control = &s->bank[BANK_MDSS].regs[base / 4];
+        DisplaySurface *surface;
+
+        if (!transfer->flush || !(active & MDP_PP_RD_PTR_IRQ(panel))) {
+            continue;
+        }
+        if (!s->panel[panel]) {
+            s->panel[panel] = qemu_graphic_console_create(DEVICE(s), panel,
+                                                        &qcom8998_panel_ops, s);
+        }
+        qemu_console_resize(s->panel[panel], transfer->width, transfer->height);
+        surface = qemu_console_surface(s->panel[panel]);
+        for (unsigned y = 0; y < transfer->height; y++) {
+            uint32_t *row = (uint32_t *)(surface_data(surface) +
+                                        y * surface_stride(surface));
+
+            for (unsigned x = 0; x < transfer->width; x++) {
+                row[x] = transfer->color;
+            }
+        }
+        qemu_console_update_full(s->panel[panel]);
+        trace_qcom8998_mdss_transfer_done(ctl, panel, transfer->width,
+                                         transfer->height, transfer->color);
+        control[MDSS_CTL_FLUSH / 4] &= ~transfer->flush;
+        control[MDSS_CTL_START / 4] &= ~MDSS_CTL_START_REQUEST;
+        transfer->flush = 0;
+        pending |= MDP_PP_DONE_IRQ(panel);
+    }
+    return pending;
+}
+
+static void qcom8998_mdss_vsync(void *opaque)
+{
+    Qcom8998Display *s = opaque;
+    Qcom8998Bank *bank = &s->bank[BANK_MDSS];
+    uint32_t pending = qcom8998_mdss_active_panels(bank);
+
+    if (pending) {
+        /*
+         * A panel sync advances the read pointer once per refresh.
+         * The raw status latches even when the interrupt is masked.
+         */
+        bank->regs[MDP_INTR_STATUS / 4] |=
+            pending | qcom8998_mdss_transfer(s, pending);
+        qcom8998_mdss_update_irq(bank);
+        qcom8998_mdss_vsync_arm(s);
+    }
+}
+
+static void qcom8998_mdp_write(Qcom8998Bank *bank, hwaddr offset,
+                               uint32_t value)
+{
+    switch (offset) {
+    case MDP_INTR_EN:
+        bank->regs[MDP_INTR_EN / 4] = value;
+        qcom8998_mdss_update_irq(bank);
+        return;
+    case MDP_INTR_CLEAR:
+        bank->regs[MDP_INTR_STATUS / 4] &= ~value;
+        qcom8998_mdss_update_irq(bank);
+        return;
+    case MDP_INTR_STATUS:
+        return;
+    }
+    if (offset >= MDSS_CTL_BASE &&
+        offset < MDSS_CTL_BASE + MDSS_CTL_COUNT * MDSS_CTL_STRIDE) {
+        hwaddr reg = (offset - MDSS_CTL_BASE) % MDSS_CTL_STRIDE;
+        unsigned ctl = (offset - MDSS_CTL_BASE) / MDSS_CTL_STRIDE;
+
+        if (reg == MDSS_CTL_SW_RESET) {
+            if (value & MDSS_CTL_SW_RESET_REQUEST) {
+                /* Only this control path is reset. */
+                memset(&bank->regs[(offset - reg) / 4], 0, MDSS_CTL_REG_SIZE);
+                bank->display->transfer[ctl].flush = 0;
+                qcom8998_mdss_vsync_update(bank);
+            }
+            return;
+        }
+        if (reg == MDSS_CTL_TOP) {
+            if (qcom8998_mdss_ctl_panel(bank->regs[offset / 4]) !=
+                qcom8998_mdss_ctl_panel(value)) {
+                bank->display->transfer[ctl].flush = 0;
+                bank->regs[(offset - reg + MDSS_CTL_START) / 4] = 0;
+            }
+            bank->regs[offset / 4] = value;
+            qcom8998_mdss_vsync_update(bank);
+            return;
+        }
+        if (reg == MDSS_CTL_START && (value & MDSS_CTL_START_REQUEST)) {
+            qcom8998_mdss_queue_transfer(bank, ctl);
+        }
+    }
+    bank->regs[offset / 4] = value;
+    if (offset >= MDP_PP_BASE &&
+        offset < MDP_PP_BASE + MDSS_DSI_COUNT * MDP_PP_STRIDE) {
+        hwaddr reg = (offset - MDP_PP_BASE) % MDP_PP_STRIDE;
+
+        if (reg == MDP_PP_SYNC_CONFIG || reg == MDP_PP_SYNC_HEIGHT) {
+            qcom8998_mdss_vsync_update(bank);
+        }
+    }
 }
 
 /* RCG2 command offsets from Qualcomm's MSM8998 MMCC/GPUCC clock drivers. */
@@ -463,6 +723,9 @@ static void qcom8998_dsi_write(Qcom8998Bank *bank, hwaddr base,
         break;
     }
     dsi[offset / 4] = value;
+    if (offset == DSI_CTRL) {
+        qcom8998_mdss_vsync_update(bank);
+    }
 }
 
 static void qcom8998_gpmu_set_reset(Qcom8998Bank *bank, uint32_t value)
@@ -878,6 +1141,8 @@ static void qcom8998_write(void *opaque, hwaddr offset, uint64_t value,
                                value);
             return;
         }
+        qcom8998_mdp_write(bank, offset, value);
+        return;
     }
     if (qcom8998_clock_is_rcg(bank, offset)) {
         /* RCG configuration latches immediately, clearing CMD_UPDATE. */
@@ -901,19 +1166,6 @@ static void qcom8998_write(void *opaque, hwaddr offset, uint64_t value,
     }
     if (bank->index == BANK_ADRENO &&
         qcom8998_adreno_power_write(bank, offset, value)) {
-        return;
-    }
-    if (bank->index == BANK_MDSS &&
-        offset >= MDSS_CTL_BASE &&
-        offset < MDSS_CTL_BASE + MDSS_CTL_COUNT * MDSS_CTL_STRIDE &&
-        (offset - MDSS_CTL_BASE) % MDSS_CTL_STRIDE == MDSS_CTL_SW_RESET) {
-        if (value & MDSS_CTL_SW_RESET_REQUEST) {
-            hwaddr control = offset - MDSS_CTL_SW_RESET;
-
-            /* Reset completes immediately in this register-level model. */
-            memset(&bank->regs[control / sizeof(uint32_t)], 0,
-                   MDSS_CTL_REG_SIZE);
-        }
         return;
     }
     bank->regs[offset / sizeof(uint32_t)] = value;
@@ -986,6 +1238,14 @@ static void qcom8998_reset(DeviceState *dev)
 {
     Qcom8998Display *s = QCOM8998_DISPLAY(dev);
 
+    timer_del(&s->mdss_vsync);
+    memset(s->transfer, 0, sizeof(s->transfer));
+    for (unsigned panel = 0; panel < MDSS_DSI_COUNT; panel++) {
+        if (s->panel[panel]) {
+            qemu_graphic_console_close(s->panel[panel]);
+            s->panel[panel] = NULL;
+        }
+    }
     for (unsigned i = 0; i < BANK_COUNT; i++) {
         memset(s->bank[i].regs, 0, banks[i].size);
         s->bank[i].last_read_offset = HWADDR_MAX;
@@ -1038,6 +1298,7 @@ static void qcom8998_init(Object *obj)
     Qcom8998Display *s = QCOM8998_DISPLAY(obj);
     SysBusDevice *bus = SYS_BUS_DEVICE(obj);
 
+    timer_init_ns(&s->mdss_vsync, QEMU_CLOCK_VIRTUAL, qcom8998_mdss_vsync, s);
     for (unsigned i = 0; i < BANK_COUNT; i++) {
         Qcom8998Bank *bank = &s->bank[i];
         g_autofree char *name = g_strdup_printf("qcom8998.%s", banks[i].name);
@@ -1058,6 +1319,8 @@ static void qcom8998_finalize(Object *obj)
 {
     Qcom8998Display *s = QCOM8998_DISPLAY(obj);
 
+    timer_del(&s->mdss_vsync);
+    timer_deinit(&s->mdss_vsync);
     for (unsigned i = 0; i < BANK_COUNT; i++) {
         g_free(s->bank[i].regs);
     }
