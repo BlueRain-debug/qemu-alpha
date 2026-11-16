@@ -18,6 +18,8 @@ qcom_mdp4_probe_irq(uint32_t status, uint32_t mask, bool level) "status=0x%x mas
 # qcom-8998-display.c
 qcom8998_mmio_read(const char *bank, uint64_t offset, uint32_t value, uint64_t pc) "%s+0x%"PRIx64" read 0x%08x pc=0x%"PRIx64
 qcom8998_mmio_write(const char *bank, uint64_t offset, uint32_t value, uint64_t pc) "%s+0x%"PRIx64" write 0x%08x pc=0x%"PRIx64
+qcom8998_cp_packet(unsigned rptr, unsigned wptr, uint32_t header, const char *result) "rptr=0x%x wptr=0x%x header=0x%08x %s"
+qcom8998_gpmu_reset(uint32_t value, unsigned dwords, uint32_t entry, unsigned bytes, bool ready) "value=0x%x image=%u dwords entry=0x%x mailbox=%u bytes ready=%d"
 
 # jazz_led.c
 jazz_led_read(uint64_t addr, uint8_t val) "read addr=0x%"PRIx64": 0x%x"

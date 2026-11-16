@@ -11,7 +11,11 @@
 #include "hw/core/sysbus.h"
 #include "hw/display/qcom-8998-display.h"
 #include "migration/vmstate.h"
+#include "qemu/bitops.h"
+#include "qemu/bswap.h"
+#include "qemu/host-utils.h"
 #include "qemu/module.h"
+#include "system/address-spaces.h"
 #include "trace.h"
 
 #define TYPE_QCOM8998_DISPLAY "qcom-8998-display"
@@ -121,6 +125,48 @@ static const struct {
 #define ADRENO_GPMU_SP_PWR_CLK_STATUS (0xa88b * 4)
 #define ADRENO_GPMU_SW_COLLAPSE BIT(0)
 #define ADRENO_GPMU_PWR_ON BIT(20)
+/* A5xx command-processor registers, converted from dwords to bytes. */
+#define ADRENO_CP_RB_BASE (0x800 * 4)
+#define ADRENO_CP_RB_CNTL (0x802 * 4)
+#define ADRENO_CP_RB_RPTR_ADDR (0x804 * 4)
+#define ADRENO_CP_RB_RPTR (0x806 * 4)
+#define ADRENO_CP_RB_WPTR (0x807 * 4)
+#define ADRENO_CP_PFP_ME_CNTL (0x832 * 4)
+#define ADRENO_CP_RB_NO_UPDATE BIT(27)
+#define ADRENO_CP_RB_SWAP_MASK (3U << 16)
+#define ADRENO_CP_RB_SIZE_MASK 0x3f
+#define ADRENO_CP_RB_MAX_SIZE_LOG2_QWORDS 15
+#define ADRENO_PM4_TYPE4 0x40000000
+#define ADRENO_PM4_TYPE_MASK 0xf0000000
+#define ADRENO_PM4_TYPE4_MAX_PAYLOAD 127
+#define ADRENO_PM4_TYPE4_RESERVED BIT(26)
+#define ADRENO_PM4_TYPE7 0x70000000
+#define ADRENO_PM4_TYPE7_MASK 0xff004000
+#define ADRENO_PM4_NOP 0x10
+#define ADRENO_PM4_WAIT_FOR_IDLE 0x26
+#define ADRENO_PM4_ME_INIT 0x48
+#define ADRENO_PM4_SET_SECURE_MODE 0x66
+#define ADRENO_PM4_PREEMPT_ENABLE_GLOBAL 0x69
+#define ADRENO_ME_INIT_CONTEXTS BIT(0)
+#define ADRENO_ME_INIT_ERROR_DETECTION BIT(1)
+#define ADRENO_ME_INIT_HEADER_DUMP BIT(3)
+/* PM4 register indices, in dwords. Data RAM is beyond the upload window. */
+#define ADRENO_GPMU_INST_RAM_BASE 0x8800
+#define ADRENO_GPMU_DATA_RAM_BASE 0x9800
+#define ADRENO_GPMU_DATA_OFFSET \
+    ((ADRENO_GPMU_DATA_RAM_BASE - ADRENO_GPMU_INST_RAM_BASE) * 4)
+#define ADRENO_GPMU_CM3_SYSRESET (0xa8d8 * 4)
+#define ADRENO_GPMU_GENERAL_0 (0xa8e0 * 4)
+#define ADRENO_GPMU_GENERAL_1 (0xa8e1 * 4)
+#define ADRENO_GPMU_RESET_ASSERT BIT(0)
+/* A540 limits-management startup mailbox in the GPMU data RAM. */
+#define ADRENO_GPMU_INIT_MAGIC (ADRENO_GPMU_DATA_RAM_BASE + 5)
+#define ADRENO_GPMU_MSG_STATE (ADRENO_GPMU_DATA_RAM_BASE + 7)
+#define ADRENO_GPMU_MSG_COMMAND (ADRENO_GPMU_DATA_RAM_BASE + 8)
+#define ADRENO_GPMU_MSG_BYTES (ADRENO_GPMU_DATA_RAM_BASE + 10)
+#define ADRENO_GPMU_MSG_PENDING BIT(31)
+#define ADRENO_GPMU_MSG_POWER_CONFIG 1
+#define ADRENO_GPMU_READY 0xbabeface
 #define VENUS_WRAPPER_HW_VERSION 0xe0000
 /* Venus 4.4 identity recognized by the native MSM8998 video miniport. */
 #define VENUS_MSM8998_HW_VERSION 0x40440000
@@ -168,6 +214,42 @@ static const struct {
 #define SMMU_IDR2_VA_48BIT (5U << 8)
 #define SMMU_IDR2_PA_40BIT (2U << 4)
 #define SMMU_IDR2_IPA_40BIT 2U
+/* SMMUv2 global page 0, page 1, and context-bank registers. */
+#define SMMU_GR0_SMR 0x800
+#define SMMU_GR0_S2CR 0xc00
+#define SMMU_SMR_VALID BIT(31)
+#define SMMU_SMR_ID_MASK 0x7fff
+#define SMMU_S2CR_TYPE_TRANSLATE 0
+#define SMMU_GR1_CBAR 0x1000
+#define SMMU_GR1_CBA2R 0x1800
+#define SMMU_CBAR_S1_S2_BYPASS 1
+#define SMMU_CBA2R_VA64 BIT(0)
+#define SMMU_ADRENO_CONTEXT_BASE 0x8000
+#define SMMU_CONTEXT_STRIDE 0x1000
+#define SMMU_ADRENO_CONTEXTS 2
+#define SMMU_ADRENO_STREAMS 16
+#define SMMU_ADRENO_CP_STREAM_ID 0
+#define SMMU_CB_SCTLR 0
+#define SMMU_CB_TCR2 0x10
+#define SMMU_CB_TTBR0 0x20
+#define SMMU_CB_TTBR1 0x28
+#define SMMU_CB_TCR 0x30
+#define SMMU_SCTLR_M BIT(0)
+#define SMMU_TCR_EPD0 BIT(7)
+#define SMMU_TCR_EPD1 BIT(23)
+#define SMMU_TCR_TG0_4K 0
+#define SMMU_TCR_TG1_4K 2
+#define SMMU_TCR2_SEP_36BIT 1
+#define SMMU_TCR2_SEP_UPSTREAM 7
+#define SMMU_4K_SHIFT 12
+#define SMMU_4K_LEVEL_BITS 9
+#define SMMU_LONG_DESC_PA_BITS 48
+#define SMMU_PTE_TYPE_MASK 3
+#define SMMU_PTE_BLOCK 1
+#define SMMU_PTE_TABLE_OR_PAGE 3
+#define SMMU_PTE_READ_ONLY BIT_ULL(7)
+#define SMMU_PTE_ACCESS_FLAG BIT_ULL(10)
+#define SMMU_PTE_TABLE_READ_ONLY BIT_ULL(62)
 
 typedef struct Qcom8998Bank {
     MemoryRegion region;
@@ -182,6 +264,8 @@ struct Qcom8998Display {
     SysBusDevice parent_obj;
     Qcom8998Bank bank[BANK_COUNT];
     qemu_irq irq[3];
+    bool me_initialized;
+    unsigned gpmu_image_dwords;
 };
 
 static void qcom8998_mdss_update_irq(Qcom8998Bank *bank)
@@ -381,12 +465,47 @@ static void qcom8998_dsi_write(Qcom8998Bank *bank, hwaddr base,
     dsi[offset / 4] = value;
 }
 
+static void qcom8998_gpmu_set_reset(Qcom8998Bank *bank, uint32_t value)
+{
+    uint32_t *regs = bank->regs;
+    uint32_t stack = regs[ADRENO_GPMU_INST_RAM_BASE];
+    uint32_t entry = regs[ADRENO_GPMU_INST_RAM_BASE + 1];
+    uint32_t bytes = regs[ADRENO_GPMU_MSG_BYTES];
+    unsigned image_dwords = bank->display->gpmu_image_dwords;
+    bool ready = false;
+
+    regs[ADRENO_GPMU_CM3_SYSRESET / 4] = value & ADRENO_GPMU_RESET_ASSERT;
+    /*
+     * Interpret the startup mailbox without executing Cortex-M3 firmware.
+     * Require a loaded Thumb reset vector, a stack in the data RAM, and a
+     * valid power-config message before setting the ready word.
+     * Thermal and adaptive voltage algorithms are outside this model.
+     */
+    if (!(value & ADRENO_GPMU_RESET_ASSERT) && image_dwords >= 2 &&
+        stack >= ADRENO_GPMU_DATA_OFFSET &&
+        stack <= ADRENO_GPMU_DATA_OFFSET * 2 && !(stack & 3) &&
+        (entry & 1) && entry / 4 >= 2 && entry / 4 < image_dwords &&
+        regs[ADRENO_GPMU_INIT_MAGIC] == ADRENO_GPMU_READY &&
+        (regs[ADRENO_GPMU_MSG_STATE] & ADRENO_GPMU_MSG_PENDING) &&
+        regs[ADRENO_GPMU_MSG_COMMAND] == ADRENO_GPMU_MSG_POWER_CONFIG &&
+        bytes && !(bytes & 3) && bytes <= ADRENO_GPMU_DATA_OFFSET -
+        (ADRENO_GPMU_MSG_BYTES - ADRENO_GPMU_DATA_RAM_BASE + 2) * 4) {
+        ready = true;
+    }
+    regs[ADRENO_GPMU_GENERAL_0 / 4] = ready ? ADRENO_GPMU_READY : 0;
+    regs[ADRENO_GPMU_GENERAL_1 / 4] = 0;
+    trace_qcom8998_gpmu_reset(value, image_dwords, entry, bytes, ready);
+}
+
 static bool qcom8998_adreno_power_write(Qcom8998Bank *bank, hwaddr offset,
-                                        uint32_t value)
+                                       uint32_t value)
 {
     hwaddr status;
 
     switch (offset) {
+    case ADRENO_GPMU_CM3_SYSRESET:
+        qcom8998_gpmu_set_reset(bank, value);
+        return true;
     case ADRENO_GPMU_RBCCU_PWR_CLK_STATUS:
     case ADRENO_GPMU_SP_PWR_CLK_STATUS:
         return true;
@@ -405,6 +524,307 @@ static bool qcom8998_adreno_power_write(Qcom8998Bank *bank, hwaddr offset,
     bank->regs[status / 4] = value & ADRENO_GPMU_SW_COLLAPSE ?
                             0 : ADRENO_GPMU_PWR_ON;
     return true;
+}
+
+static uint64_t qcom8998_reg_pair(const uint32_t *regs, hwaddr offset)
+{
+    return deposit64(regs[offset / 4], 32, 32, regs[offset / 4 + 1]);
+}
+
+static bool qcom8998_ram_access(hwaddr address, void *data, size_t size,
+                               bool write)
+{
+    hwaddr length = size, translated;
+    MemoryRegion *mr;
+
+    mr = address_space_translate(&address_space_memory, address, &translated,
+                                 &length, write, MEMTXATTRS_UNSPECIFIED);
+    if (!memory_region_is_ram(mr) || memory_region_is_ram_device(mr) ||
+        memory_region_is_rom(mr) || length != size) {
+        return false;
+    }
+    if (write) {
+        return address_space_write(&address_space_memory, address,
+                                   MEMTXATTRS_UNSPECIFIED, data, size) ==
+               MEMTX_OK;
+    }
+    return address_space_read(&address_space_memory, address,
+                              MEMTXATTRS_UNSPECIFIED, data, size) == MEMTX_OK;
+}
+
+/*
+ * The CP's privileged DMA uses stream 0. Resolve it through the guest's
+ * stream mappings, then walk the AArch64, stage-1, 4 KiB tables. This subset
+ * has no TLB or stage-2 translation. Unsupported configurations fail DMA.
+ */
+static bool qcom8998_cp_translate(Qcom8998Display *s, uint64_t iova,
+                                 bool write, hwaddr *out)
+{
+    static const unsigned pa_width[] = { 32, 36, 40 };
+    const uint32_t *regs = s->bank[BANK_ADRENO_SMMU].regs;
+    int context = -1;
+    unsigned pasize, va_bits;
+    uint32_t tcr, tcr2;
+    uint64_t table, pa_mask, va_mask, invalid_pa;
+    bool upper;
+
+    for (unsigned i = 0; i < SMMU_ADRENO_STREAMS; i++) {
+        uint32_t smr = regs[SMMU_GR0_SMR / 4 + i];
+        uint32_t s2cr = regs[SMMU_GR0_S2CR / 4 + i];
+        uint32_t mask = (smr >> 16) & SMMU_SMR_ID_MASK;
+
+        if (!(smr & SMMU_SMR_VALID) ||
+            ((smr ^ SMMU_ADRENO_CP_STREAM_ID) & SMMU_SMR_ID_MASK & ~mask)) {
+            continue;
+        }
+        if (context >= 0 || extract32(s2cr, 16, 2) != SMMU_S2CR_TYPE_TRANSLATE) {
+            return false;
+        }
+        context = extract32(s2cr, 0, 8);
+    }
+    if (context < 0 || context >= SMMU_ADRENO_CONTEXTS ||
+        extract32(regs[SMMU_GR1_CBAR / 4 + context], 16, 2) !=
+        SMMU_CBAR_S1_S2_BYPASS ||
+        !(regs[SMMU_GR1_CBA2R / 4 + context] & SMMU_CBA2R_VA64)) {
+        return false;
+    }
+
+    regs += (SMMU_ADRENO_CONTEXT_BASE + context * SMMU_CONTEXT_STRIDE) / 4;
+    if (!(regs[SMMU_CB_SCTLR / 4] & SMMU_SCTLR_M)) {
+        return false;
+    }
+    tcr = regs[SMMU_CB_TCR / 4];
+    tcr2 = regs[SMMU_CB_TCR2 / 4];
+    switch (extract32(tcr2, 15, 3)) {
+    case SMMU_TCR2_SEP_36BIT:
+        if (iova >> 36) {
+            return false;
+        }
+        iova = sextract64(iova, 0, 36);
+        break;
+    case SMMU_TCR2_SEP_UPSTREAM:
+        break;
+    default:
+        return false;
+    }
+    upper = iova >> 63;
+    if (upper ? ((tcr & SMMU_TCR_EPD1) ||
+                 extract32(tcr, 30, 2) != SMMU_TCR_TG1_4K) :
+                ((tcr & SMMU_TCR_EPD0) ||
+                 extract32(tcr, 14, 2) != SMMU_TCR_TG0_4K)) {
+        return false;
+    }
+    va_bits = 64 - extract32(tcr, upper ? 16 : 0, 6);
+    pasize = extract32(tcr2, 0, 4);
+    if (va_bits < 25 || va_bits > 48 || pasize >= ARRAY_SIZE(pa_width)) {
+        return false;
+    }
+    va_mask = MAKE_64BIT_MASK(0, va_bits);
+    if ((iova & ~va_mask) != (upper ? ~va_mask : 0)) {
+        return false;
+    }
+    pa_mask = MAKE_64BIT_MASK(0, pa_width[pasize]);
+    invalid_pa = MAKE_64BIT_MASK(0, SMMU_LONG_DESC_PA_BITS) & ~pa_mask;
+    table = qcom8998_reg_pair(regs, upper ? SMMU_CB_TTBR1 : SMMU_CB_TTBR0);
+    for (unsigned shift = SMMU_4K_SHIFT + SMMU_4K_LEVEL_BITS *
+                          ((va_bits - SMMU_4K_SHIFT - 1) / SMMU_4K_LEVEL_BITS);
+         ; shift -= SMMU_4K_LEVEL_BITS) {
+        unsigned bits = MIN(SMMU_4K_LEVEL_BITS, va_bits - shift);
+        unsigned index = extract64(iova, shift, bits);
+        uint64_t pte;
+        unsigned type;
+
+        if (table & invalid_pa) {
+            return false;
+        }
+        table &= pa_mask & ~MAKE_64BIT_MASK(0, bits + 3);
+        if (!qcom8998_ram_access(table + index * sizeof(pte), &pte,
+                                 sizeof(pte), false)) {
+            return false;
+        }
+        pte = le64_to_cpu(pte);
+        type = pte & SMMU_PTE_TYPE_MASK;
+        if (shift > SMMU_4K_SHIFT && type == SMMU_PTE_TABLE_OR_PAGE) {
+            if (write && (pte & SMMU_PTE_TABLE_READ_ONLY)) {
+                return false;
+            }
+            table = pte & ~MAKE_64BIT_MASK(0, SMMU_4K_SHIFT);
+            continue;
+        }
+        if (type != (shift == SMMU_4K_SHIFT ? SMMU_PTE_TABLE_OR_PAGE :
+                     SMMU_PTE_BLOCK) || shift == 39 ||
+            (pte & invalid_pa) || !(pte & SMMU_PTE_ACCESS_FLAG) ||
+            (write && (pte & SMMU_PTE_READ_ONLY))) {
+            return false;
+        }
+        *out = (pte & pa_mask & ~MAKE_64BIT_MASK(0, shift)) |
+               extract64(iova, 0, shift);
+        return true;
+    }
+}
+
+static bool qcom8998_cp_word(Qcom8998Display *s, uint64_t iova, uint32_t *word,
+                            bool write)
+{
+    hwaddr pa;
+    uint32_t le = write ? cpu_to_le32(*word) : 0;
+
+    if ((iova & 3) || !qcom8998_cp_translate(s, iova, write, &pa) ||
+        !qcom8998_ram_access(pa, &le, sizeof(le), write)) {
+        return false;
+    }
+    if (!write) {
+        *word = le32_to_cpu(le);
+    }
+    return true;
+}
+
+static bool qcom8998_cp_type4(Qcom8998Display *s, uint32_t header,
+                             unsigned count, uint64_t base, unsigned mask,
+                             unsigned rptr)
+{
+    uint32_t payload[ADRENO_PM4_TYPE4_MAX_PAYLOAD];
+    unsigned reg = extract32(header, 8, 18);
+
+    /*
+     * Type 4 currently loads the GPMU's instruction RAM. Other GPU
+     * registers can have side effects and are kept outside this window.
+     */
+    if (!s->me_initialized || !count || (header & ADRENO_PM4_TYPE4_RESERVED) ||
+        !(ctpop32(extract32(header, 0, 8)) & 1) ||
+        !(ctpop32(extract32(header, 8, 20)) & 1) ||
+        reg < ADRENO_GPMU_INST_RAM_BASE ||
+        reg + count > ADRENO_GPMU_DATA_RAM_BASE) {
+        return false;
+    }
+    for (unsigned i = 0; i < count; i++) {
+        if (!qcom8998_cp_word(s, base + (((rptr + 1 + i) & mask) * 4),
+                              &payload[i], false)) {
+            return false;
+        }
+    }
+    memcpy(&s->bank[BANK_ADRENO].regs[reg], payload,
+           count * sizeof(payload[0]));
+    if (reg <= ADRENO_GPMU_INST_RAM_BASE + s->gpmu_image_dwords) {
+        s->gpmu_image_dwords = MAX(s->gpmu_image_dwords,
+                                 reg + count - ADRENO_GPMU_INST_RAM_BASE);
+    }
+    return true;
+}
+
+static bool qcom8998_cp_type7(Qcom8998Display *s, uint32_t header,
+                             unsigned count, uint64_t base, unsigned mask,
+                             unsigned rptr)
+{
+    uint32_t payload[4];
+    unsigned opcode = extract32(header, 16, 7);
+
+    if ((header & ADRENO_PM4_TYPE7_MASK) != ADRENO_PM4_TYPE7 ||
+        !(ctpop32(extract32(header, 0, 16)) & 1) ||
+        !(ctpop32(extract32(header, 16, 8)) & 1)) {
+        return false;
+    }
+    if (opcode == ADRENO_PM4_NOP) {
+        return true;
+    }
+    if (opcode == ADRENO_PM4_WAIT_FOR_IDLE) {
+        /* This command processor executes synchronously. */
+        return count == 0;
+    }
+    if (count > ARRAY_SIZE(payload)) {
+        return false;
+    }
+    for (unsigned i = 0; i < count; i++) {
+        if (!qcom8998_cp_word(s, base + (((rptr + 1 + i) & mask) * 4),
+                              &payload[i], false)) {
+            return false;
+        }
+    }
+    switch (opcode) {
+    case ADRENO_PM4_ME_INIT:
+        /*
+         * Enable contexts and error detection with header dumping off.
+         * The probe implements one command stream; it cannot dump headers.
+         */
+        if (count != 4 ||
+            payload[0] != (ADRENO_ME_INIT_CONTEXTS |
+                           ADRENO_ME_INIT_ERROR_DETECTION |
+                           ADRENO_ME_INIT_HEADER_DUMP) ||
+            payload[3]) {
+            return false;
+        }
+        s->me_initialized = true;
+        return true;
+    case ADRENO_PM4_PREEMPT_ENABLE_GLOBAL:
+    case ADRENO_PM4_SET_SECURE_MODE:
+        /* No preemptible or secure GPU contexts are exposed. */
+        return s->me_initialized && count == 1 && payload[0] == 0;
+    default:
+        return false;
+    }
+}
+
+static void qcom8998_cp_run(Qcom8998Bank *bank)
+{
+    Qcom8998Display *s = bank->display;
+    uint32_t *regs = bank->regs;
+    const uint32_t cntl = regs[ADRENO_CP_RB_CNTL / 4];
+    unsigned size = cntl & ADRENO_CP_RB_SIZE_MASK;
+    unsigned rptr = regs[ADRENO_CP_RB_RPTR / 4];
+    unsigned wptr = regs[ADRENO_CP_RB_WPTR / 4];
+    uint64_t base = qcom8998_reg_pair(regs, ADRENO_CP_RB_BASE);
+    unsigned mask;
+
+    if (size > ADRENO_CP_RB_MAX_SIZE_LOG2_QWORDS ||
+        (cntl & ADRENO_CP_RB_SWAP_MASK) ||
+        regs[ADRENO_CP_PFP_ME_CNTL / 4]) {
+        return;
+    }
+    /* BUFSZ is log2(qwords), whereas the pointers count dwords. */
+    mask = (2U << size) - 1;
+    if (rptr > mask || wptr > mask || !base || base > UINT64_MAX - mask * 4) {
+        return;
+    }
+    while (rptr != wptr) {
+        uint32_t header = 0;
+        unsigned count = 0;
+        bool executed = false;
+
+        if (!qcom8998_cp_word(s, base + rptr * 4, &header, false)) {
+            trace_qcom8998_cp_packet(rptr, wptr, header, "ring DMA fault");
+            break;
+        }
+        switch (header & ADRENO_PM4_TYPE_MASK) {
+        case ADRENO_PM4_TYPE4:
+            count = extract32(header, 0, 7);
+            if (count < ((wptr - rptr) & mask)) {
+                executed = qcom8998_cp_type4(s, header, count, base, mask, rptr);
+            }
+            break;
+        case ADRENO_PM4_TYPE7:
+            count = extract32(header, 0, 14);
+            if (count < ((wptr - rptr) & mask)) {
+                executed = qcom8998_cp_type7(s, header, count, base, mask, rptr);
+            }
+            break;
+        default:
+            break;
+        }
+        if (!executed) {
+            trace_qcom8998_cp_packet(rptr, wptr, header, "not executed");
+            break;
+        }
+        trace_qcom8998_cp_packet(rptr, wptr, header, "executed");
+        rptr = (rptr + count + 1) & mask;
+        regs[ADRENO_CP_RB_RPTR / 4] = rptr;
+    }
+    if (!(cntl & ADRENO_CP_RB_NO_UPDATE)) {
+        uint64_t shadow = qcom8998_reg_pair(regs, ADRENO_CP_RB_RPTR_ADDR);
+
+        if (shadow && !qcom8998_cp_word(s, shadow, &rptr, true)) {
+            trace_qcom8998_cp_packet(rptr, wptr, 0, "pointer DMA fault");
+        }
+    }
 }
 
 static uint64_t qcom8998_read(void *opaque, hwaddr offset, unsigned size)
@@ -497,6 +917,10 @@ static void qcom8998_write(void *opaque, hwaddr offset, uint64_t value,
         return;
     }
     bank->regs[offset / sizeof(uint32_t)] = value;
+    if (bank->index == BANK_ADRENO &&
+        (offset == ADRENO_CP_RB_WPTR || offset == ADRENO_CP_PFP_ME_CNTL)) {
+        qcom8998_cp_run(bank);
+    }
 }
 
 static const MemoryRegionOps qcom8998_mmio_ops = {
@@ -514,7 +938,7 @@ static void qcom8998_smmu_reset(Qcom8998Bank *bank, unsigned stream_entries,
 {
     /*
      * Advertise the layout used by QCSMMU's stream and context-bank setup.
-     * The probe models the registers only. It has no DMA translation yet.
+     * The Adreno CP uses the guest-programmed stage-1 context banks.
      */
     bank->regs[SMMU_IDR0 / 4] = SMMU_IDR0_STAGE1 | SMMU_IDR0_STREAM_MATCH |
         SMMU_IDR0_CONTEXT_IRQS(1U) | SMMU_IDR0_STREAM_ID_BITS(15U) |
@@ -600,7 +1024,12 @@ static void qcom8998_reset(DeviceState *dev)
     }
     /* Context banks start at 0x20000 for MDSS and 0x8000 for Adreno. */
     qcom8998_smmu_reset(&s->bank[BANK_MDSS_SMMU], 60, 4, 16);
-    qcom8998_smmu_reset(&s->bank[BANK_ADRENO_SMMU], 16, 2, 2);
+    qcom8998_smmu_reset(&s->bank[BANK_ADRENO_SMMU], SMMU_ADRENO_STREAMS, 2,
+                       SMMU_ADRENO_CONTEXTS);
+    s->me_initialized = false;
+    s->gpmu_image_dwords = 0;
+    s->bank[BANK_ADRENO].regs[ADRENO_GPMU_CM3_SYSRESET / 4] =
+        ADRENO_GPMU_RESET_ASSERT;
     qemu_set_irq(s->irq[0], 0);
 }
 
