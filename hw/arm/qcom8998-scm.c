@@ -14,6 +14,7 @@
 #include "crypto/hash.h"
 #include "elf.h"
 #include "qapi/error.h"
+#include "hw/core/boards.h"
 #include "hw/core/cpu.h"
 #include "hw/core/sysbus.h"
 #include "hw/arm/qcom8998-scm.h"
@@ -42,6 +43,10 @@
 #define QCOM_SCM_QSEE_APP_SEND 0x30000001
 #define QCOM_SCM_RESTORE_SEC_CFG 0x02000c02
 #define QCOM_SCM_DEVICE_MDSS 1
+#define QCOM_SCM_LMH_CHANGE_PROFILE 0x02001301
+#define QCOM_SCM_LMH_GET_PROFILES 0x02001302
+#define QCOM_LMH_PROFILE_WORDS 10
+#define QCOM_LMH_FIXED_PROFILE 1
 /* Exclude SMCCC fast-call and width bits. */
 #define QCOM_SCM_FNID_MASK 0x3fffffff
 #define QCOM_SCM_CALL_64BIT BIT(30)
@@ -49,6 +54,7 @@
 #define QCOM_SCM_ARGS_TWO_VALUES 2
 #define QCOM_SCM_ARGS_THREE_VALUES 3
 #define QCOM_SCM_ARGS_RW_BUFFER_LENGTH 0x22 /* Two args; first is read/write. */
+#define QCOM_SCM_ARGS_RW_BUFFER_LENGTH_INDEX 0x23
 #define QCOM_SCM_ARGS_APP_SEND 0x885 /* app, request, size, response, size */
 #define QCOM_SCM_MAX_ARGS 10
 #define QCOM_QSEE_TRACE_BYTES 256
@@ -157,6 +163,56 @@ static bool qcom8998_pas_read(ARMCPU *cpu, hwaddr address, void *data,
     return qcom8998_scm_ram_buffer(cpu, address, bytes, false) &&
         address_space_read(cpu_get_address_space(CPU(cpu), 0), address,
                            MEMTXATTRS_UNSPECIFIED, data, bytes) == MEMTX_OK;
+}
+
+static bool qcom8998_lmh_guest_ram(AddressSpace *as, hwaddr address,
+                                  hwaddr bytes)
+{
+    hwaddr length = bytes;
+    hwaddr offset;
+    MemoryRegion *mr = address_space_translate(as, address, &offset, &length,
+                                               true, MEMTXATTRS_UNSPECIFIED);
+
+    return mr == current_machine->ram && length == bytes &&
+           !memory_region_is_rom(mr);
+}
+
+static int32_t qcom8998_lmh_get_profiles(ARMCPU *cpu, bool wide, hwaddr address,
+                                        uint64_t bytes, uint64_t start,
+                                        uint64_t *count)
+{
+    AddressSpace *as = cpu_get_address_space(CPU(cpu), 0);
+    uint32_t profiles[QCOM_LMH_PROFILE_WORDS] = { 0 };
+
+    if (bytes != sizeof(profiles) || (address & (sizeof(profiles[0]) - 1)) ||
+        address > (wide ? HWADDR_MAX : UINT32_MAX) - bytes + 1) {
+        return QCOM_SCM_EINVAL;
+    }
+
+    if (!qcom8998_lmh_guest_ram(as, address, bytes)) {
+        /*
+         * The OEMSK power driver passes the low word of its buffer address
+         * in SMC32, even if virt places the buffer above 4 GiB. Restore the
+         * high word only if it resolves to ordinary machine RAM and there
+         * cannot be multiple candidates in that bank.
+         */
+        if (wide || current_machine->ram_size > 4 * GiB ||
+            !qcom8998_lmh_guest_ram(as, address + 4 * GiB, bytes)) {
+            return QCOM_SCM_EINVAL;
+        }
+        address += 4 * GiB;
+    }
+
+    /* Only one fixed profile is modeled; no thermal policy is simulated. */
+    if (start == 0) {
+        profiles[0] = cpu_to_le32(QCOM_LMH_FIXED_PROFILE);
+    }
+    if (address_space_write(as, address, MEMTXATTRS_UNSPECIFIED,
+                            profiles, bytes) != MEMTX_OK) {
+        return QCOM_SCM_EINVAL;
+    }
+    *count = 1;
+    return 0;
 }
 
 static bool qcom8998_pas_hash(const void *data, size_t bytes,
@@ -531,6 +587,8 @@ bool qcom8998_smc(ARMCPU *cpu)
                     argument == QCOM_SCM_PAS_SHUTDOWN ||
                     argument == QCOM_SCM_PAS_IS_SUPPORTED ||
                     argument == QCOM_SCM_RESTORE_SEC_CFG ||
+                    argument == QCOM_SCM_LMH_CHANGE_PROFILE ||
+                    argument == QCOM_SCM_LMH_GET_PROFILES ||
                     argument == QCOM_SCM_QSEE_REGISTER_LOG_BUFFER ||
                     argument == QCOM_SCM_QSEE_APP_LOOKUP ||
                     argument == QCOM_SCM_QSEE_APP_SEND;
@@ -582,6 +640,19 @@ bool qcom8998_smc(ARMCPU *cpu)
         status = arginfo == QCOM_SCM_ARGS_TWO_VALUES &&
                  argument == QCOM_SCM_DEVICE_MDSS && !env->xregs[3] ?
                  0 : QCOM_SCM_EINVAL;
+        break;
+    case QCOM_SCM_LMH_CHANGE_PROFILE:
+        status = arginfo == QCOM_SCM_ARGS_ONE_VALUE &&
+                 argument == QCOM_LMH_FIXED_PROFILE ? 0 : QCOM_SCM_EINVAL;
+        break;
+    case QCOM_SCM_LMH_GET_PROFILES:
+        if (arginfo == QCOM_SCM_ARGS_RW_BUFFER_LENGTH_INDEX) {
+            status = qcom8998_lmh_get_profiles(
+                cpu, env->xregs[0] & QCOM_SCM_CALL_64BIT, argument,
+                env->xregs[3], env->xregs[4], &result[0]);
+        } else {
+            status = QCOM_SCM_EINVAL;
+        }
         break;
     case QCOM_SCM_QSEE_REGISTER_LOG_BUFFER:
         if (arginfo != QCOM_SCM_ARGS_RW_BUFFER_LENGTH || !argument ||
