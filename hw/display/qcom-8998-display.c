@@ -177,6 +177,7 @@ static const struct {
 #define ADRENO_PM4_TYPE7_MASK 0xff004000
 #define ADRENO_PM4_NOP 0x10
 #define ADRENO_PM4_WAIT_FOR_IDLE 0x26
+#define ADRENO_PM4_COND_EXEC 0x44
 #define ADRENO_PM4_ME_INIT 0x48
 #define ADRENO_PM4_SET_SECURE_MODE 0x66
 #define ADRENO_PM4_PREEMPT_ENABLE_GLOBAL 0x69
@@ -377,10 +378,13 @@ static void qcom8998_mdss_vsync_arm(Qcom8998Display *s)
 static void qcom8998_mdss_vsync_update(Qcom8998Bank *bank)
 {
     Qcom8998Display *s = bank->display;
+    uint32_t active = qcom8998_mdss_active_panels(bank);
+    uint32_t pending = bank->regs[MDP_INTR_STATUS / 4] &
+                       bank->regs[MDP_INTR_EN / 4];
 
-    if (!qcom8998_mdss_active_panels(bank)) {
+    if (!active) {
         timer_del(&s->mdss_vsync);
-    } else if (!timer_pending(&s->mdss_vsync)) {
+    } else if (!(active & pending) && !timer_pending(&s->mdss_vsync)) {
         qcom8998_mdss_vsync_arm(s);
     }
 }
@@ -478,6 +482,16 @@ static void qcom8998_mdss_vsync(void *opaque)
     Qcom8998Bank *bank = &s->bank[BANK_MDSS];
     uint32_t pending = qcom8998_mdss_active_panels(bank);
 
+    /*
+     * Both read pointers share a level interrupt. If the guest has not
+     * drained the previous refresh, coalesce this tick. Latching one panel
+     * again while the guest acknowledges the other can hold the line high
+     * indefinitely. The acknowledge or mask update restarts the timer.
+     */
+    if (pending & bank->regs[MDP_INTR_STATUS / 4] &
+        bank->regs[MDP_INTR_EN / 4]) {
+        return;
+    }
     if (pending) {
         /*
          * A panel sync advances the read pointer once per refresh.
@@ -497,10 +511,12 @@ static void qcom8998_mdp_write(Qcom8998Bank *bank, hwaddr offset,
     case MDP_INTR_EN:
         bank->regs[MDP_INTR_EN / 4] = value;
         qcom8998_mdss_update_irq(bank);
+        qcom8998_mdss_vsync_update(bank);
         return;
     case MDP_INTR_CLEAR:
         bank->regs[MDP_INTR_STATUS / 4] &= ~value;
         qcom8998_mdss_update_irq(bank);
+        qcom8998_mdss_vsync_update(bank);
         return;
     case MDP_INTR_STATUS:
         return;
@@ -977,9 +993,9 @@ static bool qcom8998_cp_type4(Qcom8998Display *s, uint32_t header,
 
 static bool qcom8998_cp_type7(Qcom8998Display *s, uint32_t header,
                              unsigned count, uint64_t base, unsigned mask,
-                             unsigned rptr)
+                             unsigned rptr, unsigned available, unsigned *skip)
 {
-    uint32_t payload[4];
+    uint32_t payload[6];
     unsigned opcode = extract32(header, 16, 7);
 
     if ((header & ADRENO_PM4_TYPE7_MASK) != ADRENO_PM4_TYPE7 ||
@@ -1004,6 +1020,29 @@ static bool qcom8998_cp_type7(Qcom8998Display *s, uint32_t header,
         }
     }
     switch (opcode) {
+    case ADRENO_PM4_COND_EXEC:
+        {
+            uint32_t enabled, timestamp;
+            uint64_t bool_address, timestamp_address;
+
+            if (!s->me_initialized || count != 6) {
+                return false;
+            }
+            bool_address = deposit64(payload[0], 32, 32, payload[1]);
+            timestamp_address = deposit64(payload[2], 32, 32, payload[3]);
+            if (!qcom8998_cp_word(s, bool_address, &enabled, false) ||
+                !qcom8998_cp_word(s, timestamp_address, &timestamp, false)) {
+                return false;
+            }
+            /* Timestamp ordering is modulo 2^32, including wraparound. */
+            if (!enabled || (uint32_t)(payload[4] - timestamp) >= BIT(31)) {
+                if (payload[5] > available - count - 1) {
+                    return false;
+                }
+                *skip = payload[5];
+            }
+            return true;
+        }
     case ADRENO_PM4_ME_INIT:
         /*
          * Enable contexts and error detection with header dumping off.
@@ -1051,6 +1090,7 @@ static void qcom8998_cp_run(Qcom8998Bank *bank)
     while (rptr != wptr) {
         uint32_t header = 0;
         unsigned count = 0;
+        unsigned skip = 0;
         bool executed = false;
 
         if (!qcom8998_cp_word(s, base + rptr * 4, &header, false)) {
@@ -1067,7 +1107,8 @@ static void qcom8998_cp_run(Qcom8998Bank *bank)
         case ADRENO_PM4_TYPE7:
             count = extract32(header, 0, 14);
             if (count < ((wptr - rptr) & mask)) {
-                executed = qcom8998_cp_type7(s, header, count, base, mask, rptr);
+                executed = qcom8998_cp_type7(s, header, count, base, mask, rptr,
+                                            (wptr - rptr) & mask, &skip);
             }
             break;
         default:
@@ -1078,7 +1119,7 @@ static void qcom8998_cp_run(Qcom8998Bank *bank)
             break;
         }
         trace_qcom8998_cp_packet(rptr, wptr, header, "executed");
-        rptr = (rptr + count + 1) & mask;
+        rptr = (rptr + count + 1 + skip) & mask;
         regs[ADRENO_CP_RB_RPTR / 4] = rptr;
     }
     if (!(cntl & ADRENO_CP_RB_NO_UPDATE)) {
