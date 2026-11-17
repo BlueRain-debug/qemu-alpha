@@ -37,13 +37,9 @@
 #include "hw/core/sysbus.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/virt.h"
-#include "hw/arm/qcom8998-scm.h"
-#include "hw/arm/qcom8998-rpm.h"
-#include "hw/arm/qcom8998-spmi.h"
 #include "hw/block/flash.h"
 #include "hw/display/ramfb.h"
 #include "hw/display/qcom-mdp4-probe.h"
-#include "hw/display/qcom-8998-display.h"
 #include "net/net.h"
 #include "system/device_tree.h"
 #include "system/numa.h"
@@ -139,7 +135,7 @@ static void arm_virt_compat_default_set(MachineClass *mc)
     static const TypeInfo MACHINE_VER_SYM(info, virt, __VA_ARGS__) = \
     { \
         .name = MACHINE_VER_TYPE_NAME("virt", __VA_ARGS__), \
-        .parent = TYPE_VIRT_MACHINE, \
+        .parent = TYPE_VIRT_BOARD_MACHINE, \
         .class_init = MACHINE_VER_SYM(class_init, virt, __VA_ARGS__), \
         .is_available = target_base_arm, \
     }; \
@@ -286,32 +282,6 @@ static const int a15irqmap[] = {
     [VIRT_GIC_V2M] = 48, /* ...to 48 + NUM_GICV2M_SPIS - 1 */
     [VIRT_SMMU] = 74,    /* ...to 74 + NUM_SMMU_IRQS - 1 */
     [VIRT_PLATFORM_BUS] = 112, /* ...to 112 + PLATFORM_BUS_NUM_IRQS -1 */
-};
-
-/*
- * Native MSM8998 resources overlap virtio and the default MSI pool. Preserve
- * the SoC's INTIDs and put synthetic devices above them. Entries are SPI
- * indices, whereas the ACPI/GIC INTID includes GIC_INTERNAL interrupts.
- */
-enum {
-    QCOM8998_VIRT_SPI_BASE = QCOM8998_VIRT_IRQ_BASE - GIC_INTERNAL,
-};
-
-static const int qcom8998_irqmap[] = {
-    [VIRT_UART0] = QCOM8998_VIRT_SPI_BASE + 1,
-    [VIRT_RTC] = QCOM8998_VIRT_SPI_BASE + 2,
-    [VIRT_PCIE] = QCOM8998_VIRT_SPI_BASE + 3, /* Four legacy PCI interrupts. */
-    [VIRT_GPIO] = QCOM8998_VIRT_SPI_BASE + 7,
-    [VIRT_UART1] = QCOM8998_VIRT_SPI_BASE + 8,
-    [VIRT_ACPI_GED] = QCOM8998_VIRT_SPI_BASE + 9,
-    [VIRT_GWDT_WS0] = QCOM8998_VIRT_SPI_BASE + 10,
-    [VIRT_EHCI] = QCOM8998_VIRT_SPI_BASE + 11,
-    [VIRT_SDHCI] = QCOM8998_VIRT_SPI_BASE + 12,
-    [VIRT_WINRT_TIMER] = QCOM8998_VIRT_SPI_BASE + 13,
-    [VIRT_MMIO] = QCOM8998_VIRT_SPI_BASE + 16, /* 32 virtio transports. */
-    [VIRT_GIC_V2M] = QCOM8998_VIRT_SPI_BASE + 48, /* 64 MSI interrupts. */
-    [VIRT_SMMU] = QCOM8998_VIRT_SPI_BASE + 112, /* Four SMMUv3 interrupts. */
-    [VIRT_PLATFORM_BUS] = QCOM8998_VIRT_SPI_BASE + 128, /* 64 interrupts. */
 };
 
 static void create_randomness(MachineState *ms, const char *node)
@@ -1314,7 +1284,7 @@ static bool gicv3_nmi_present(VirtMachineState *vms)
 
 static unsigned int virt_gic_spi_count(const VirtMachineState *vms)
 {
-    return vms->qcom8998_display ? QCOM8998_GIC_IRQS - GIC_INTERNAL : NUM_IRQS;
+    return VIRT_MACHINE_GET_CLASS(vms)->gic_spi_count;
 }
 
 static void gic_connect_ppis(VirtMachineState *vms)
@@ -1903,7 +1873,8 @@ static void virt_flash_map(VirtMachineState *vms,
      */
     hwaddr flashsize = vms->memmap[VIRT_FLASH].size / 2;
     hwaddr flashbase = vms->memmap[VIRT_FLASH].base;
-    hwaddr varsize = vms->qcom8998_display ? QCOM8998_VAR_FLASH_SIZE : flashsize;
+    hwaddr varsize = VIRT_MACHINE_GET_CLASS(vms)->variable_flash_size ?:
+                     flashsize;
 
     virt_flash_map1(vms->flash[0], flashbase, flashsize,
                     secure_sysmem);
@@ -1920,7 +1891,8 @@ static void virt_flash_fdt(VirtMachineState *vms,
     hwaddr flashbase = vms->memmap[VIRT_FLASH].base;
     hwaddr variable_base = vms->winrt_qcdx_probe ? QCOM_MDP4_NVRAM_BASE :
                           flashbase + flashsize;
-    hwaddr varsize = vms->qcom8998_display ? QCOM8998_VAR_FLASH_SIZE : flashsize;
+    hwaddr varsize = VIRT_MACHINE_GET_CLASS(vms)->variable_flash_size ?:
+                     flashsize;
     MachineState *ms = MACHINE(vms);
     char *nodename;
 
@@ -2607,19 +2579,8 @@ static void virt_set_memmap(VirtMachineState *vms, int pa_bits)
         vms->memmap[i] = base_memmap[i];
     }
 
-    if (vms->qcom8998_display) {
-        /* The native SPMI resource occupies the GICv2 and low virt MMIO. */
-        for (i = VIRT_CPUPERIPHS; i <= VIRT_GIC_VCPU; i++) {
-            vms->memmap[i].base += 0x03000000;
-        }
-        for (i = 0; i < ARRAY_SIZE(base_memmap); i++) {
-            hwaddr address = base_memmap[i].base;
-
-            if (address >= 0x09000000 && address < 0x0a000000) {
-                vms->memmap[i].base = 0x0b100000 + (address - 0x09000000);
-            }
-        }
-        vms->memmap[VIRT_MMIO].base = 0x0b300000;
+    if (VIRT_MACHINE_GET_CLASS(vms)->set_board_memmap) {
+        VIRT_MACHINE_GET_CLASS(vms)->set_board_memmap(vms);
     }
 
     if (vms->winrt_legacy_ram) {
@@ -3221,6 +3182,10 @@ static void machvirt_init(MachineState *machine)
 
     possible_cpus = mc->possible_cpu_arch_ids(machine);
 
+    if (vmc->validate_board) {
+        vmc->validate_board(vms);
+    }
+
     if (vms->winrt_tegra2 &&
         (!vms->winrt_legacy_ram || !vms->winrt_tegra_timer ||
          vms->gic_version != VIRT_GIC_VERSION_2)) {
@@ -3242,23 +3207,9 @@ static void machvirt_init(MachineState *machine)
     }
 
     if (vms->winrt_qcdx_ssdt && !vms->winrt_qcdx_probe &&
-        !vms->qcom8998_display) {
-        error_report("winrt-qcdx-ssdt requires winrt-qcdx-probe=on or "
-                     "qcom8998-display=on");
+        !vmc->build_board_dsdt) {
+        error_report("Board SSDT requires a board with native ACPI devices");
         exit(1);
-    }
-
-    if (vms->qcom8998_display &&
-        (!target_aarch64() || (!tcg_enabled() && !qtest_enabled()) ||
-         vms->gic_version != VIRT_GIC_VERSION_2 || vms->winrt ||
-         !virt_is_acpi_enabled(vms))) {
-        error_report("qcom8998-display requires an AArch64 virt guest with "
-                     "TCG, gic-version=2, acpi=on and winrt=off");
-        exit(1);
-    }
-
-    if (vms->qcom8998_display) {
-        vms->irqmap = qcom8998_irqmap;
     }
 
     if (vms->winrt_qcom_cypress_touch && vms->winrt_qcom_synaptics_touch) {
@@ -3428,11 +3379,8 @@ static void machvirt_init(MachineState *machine)
     if (vms->winrt || (vms->secure && firmware_loaded)) {
         /* WinRT firmware parks secondary CPUs instead of using PSCI. */
         vms->psci_conduit = QEMU_PSCI_CONDUIT_DISABLED;
-    } else if (vms->virt || vms->qcom8998_display) {
-        /*
-         * SCM and PSCI share the synthetic monitor on the MSM8998 probe.
-         * This also makes SMC valid without a guest EL3 firmware image.
-         */
+    } else if (vms->virt || vmc->firmware_smc) {
+        /* A board monitor can share the SMC conduit with PSCI. */
         vms->psci_conduit = QEMU_PSCI_CONDUIT_SMC;
     } else {
         vms->psci_conduit = QEMU_PSCI_CONDUIT_HVC;
@@ -3542,8 +3490,8 @@ static void machvirt_init(MachineState *machine)
             object_property_set_bool(cpuobj, "has_el3", false, NULL);
         }
 
-        if (vms->qcom8998_display) {
-            ARM_CPU(cpuobj)->firmware_smc = qcom8998_smc;
+        if (vmc->firmware_smc) {
+            ARM_CPU(cpuobj)->firmware_smc = vmc->firmware_smc;
         }
 
         if (!vms->virt && object_property_find(cpuobj, "has_el2")) {
@@ -3736,11 +3684,8 @@ static void machvirt_init(MachineState *machine)
 
     create_platform_bus(vms);
 
-    if (vms->qcom8998_display) {
-        qcom8998_display_create(vms->gic);
-        qcom8998_rpm_create(vms->gic);
-        qcom8998_spmi_create();
-        qcom8998_scm_create();
+    if (vmc->create_board_devices) {
+        vmc->create_board_devices(vms);
     }
 
     if (machine->nvdimms_state->is_enabled) {
@@ -3866,16 +3811,6 @@ static bool virt_get_winrt_pci(Object *obj, Error **errp)
 static bool virt_get_winrt_qcdx_probe(Object *obj, Error **errp)
 {
     return VIRT_MACHINE(obj)->winrt_qcdx_probe;
-}
-
-static bool virt_get_qcom8998_display(Object *obj, Error **errp)
-{
-    return VIRT_MACHINE(obj)->qcom8998_display;
-}
-
-static void virt_set_qcom8998_display(Object *obj, bool value, Error **errp)
-{
-    VIRT_MACHINE(obj)->qcom8998_display = value;
 }
 
 static bool virt_get_winrt_qcom_cypress_touch(Object *obj, Error **errp)
@@ -4854,6 +4789,7 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
     MachineClass *mc = MACHINE_CLASS(oc);
     HotplugHandlerClass *hc = HOTPLUG_HANDLER_CLASS(oc);
 
+    VIRT_MACHINE_CLASS(oc)->gic_spi_count = NUM_IRQS;
     mc->init = machvirt_init;
     /* Start with max_cpus set to 512, which is the maximum supported by KVM.
      * The value may be reduced later when we have more information about the
@@ -4965,11 +4901,6 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
         "Expose native MSM8x60 graphics MMIO for local driver bring-up; "
         "requires matching reserved-memory firmware and an external SSDT; "
         "bounded experimental drawing and MDP scanout, not a complete GPU");
-    object_class_property_add_bool(oc, "qcom8998-display",
-                                   virt_get_qcom8998_display,
-                                   virt_set_qcom8998_display);
-    object_class_property_set_description(oc, "qcom8998-display",
-        "Expose experimental MSM8998 QCDX MMIO and ACPI devices");
     object_class_property_add_str(oc, "winrt-qcdx-ssdt",
                                   virt_get_winrt_qcdx_ssdt,
                                   virt_set_winrt_qcdx_ssdt);
@@ -5223,7 +5154,14 @@ static const TypeInfo virt_machine_info = {
 
 static void machvirt_machine_init(void)
 {
+    static const TypeInfo virt_board_info = {
+        .name = TYPE_VIRT_BOARD_MACHINE,
+        .parent = TYPE_VIRT_MACHINE,
+        .abstract = true,
+    };
+
     type_register_static(&virt_machine_info);
+    type_register_static(&virt_board_info);
 }
 type_init(machvirt_machine_init);
 

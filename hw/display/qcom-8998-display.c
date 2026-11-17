@@ -325,6 +325,25 @@ static const struct {
 #define SMMU_IDR2_PA_40BIT (2U << 4)
 #define SMMU_IDR2_IPA_40BIT 2U
 /* SMMUv2 global page 0, page 1, and context-bank registers. */
+#define SMMU_GR0_CR0 0x0
+#define SMMU_CR0_CLIENTPD BIT(0)
+#define SMMU_CR0_GFIE BIT(2)
+#define SMMU_CR0_USFCFG BIT(10)
+#define SMMU_CR0_SMCFCFG BIT(21)
+#define SMMU_GR0_GFSR 0x48
+#define SMMU_GR0_GFSRRESTORE 0x4c
+#define SMMU_GR0_GFSYNR0 0x50
+#define SMMU_GR0_GFSYNR1 0x54
+#define SMMU_GR0_GFSYNR2 0x58
+#define SMMU_GFSR_ICF BIT(0)
+#define SMMU_GFSR_USF BIT(1)
+#define SMMU_GFSR_SMCF BIT(2)
+#define SMMU_GFSR_UCBF BIT(3)
+#define SMMU_GFSR_UUT BIT(8)
+#define SMMU_FSR_MULTI BIT(31)
+#define SMMU_GFSR_MASK (SMMU_FSR_MULTI | 0x1ff)
+#define SMMU_GFSYNR0_WNR BIT(1)
+#define SMMU_GFSYNR0_NS (BIT(4) | BIT(5))
 #define SMMU_GR0_SMR 0x800
 #define SMMU_GR0_S2CR 0xc00
 #define SMMU_SMR_VALID BIT(31)
@@ -332,6 +351,7 @@ static const struct {
 #define SMMU_S2CR_TYPE_TRANSLATE 0
 #define SMMU_GR1_CBAR 0x1000
 #define SMMU_GR1_CBA2R 0x1800
+#define SMMU_GR1_CBFRSYNRA 0x1400
 #define SMMU_CBAR_S1_S2_BYPASS 1
 #define SMMU_CBA2R_VA64 BIT(0)
 #define SMMU_ADRENO_CONTEXT_BASE 0x8000
@@ -345,7 +365,26 @@ static const struct {
 #define SMMU_CB_TTBR1 0x28
 #define SMMU_CB_TCR 0x30
 #define SMMU_CB_CONTEXTIDR 0x34
+#define SMMU_CB_FSR 0x58
+#define SMMU_CB_FSRRESTORE 0x5c
+#define SMMU_CB_FAR 0x60
+#define SMMU_CB_FSYNR0 0x68
+#define SMMU_CB_FSYNR1 0x6c
+#define SMMU_FSR_TF BIT(1)
+#define SMMU_FSR_AFF BIT(2)
+#define SMMU_FSR_PF BIT(3)
+#define SMMU_FSR_EF BIT(4)
+#define SMMU_FSR_ASF BIT(7)
+#define SMMU_FSR_UUT BIT(8)
+#define SMMU_FSR_FORMAT_AARCH64 (2U << 9)
+#define SMMU_FSR_FAULT_MASK (SMMU_FSR_MULTI | 0x1fe)
+#define SMMU_FSYNR0_WNR BIT(4)
+#define SMMU_FSYNR0_PTWF BIT(10)
+#define SMMU_FSYNR0_NSATTR BIT(8)
 #define SMMU_SCTLR_M BIT(0)
+#define SMMU_SCTLR_CFIE BIT(6)
+#define SMMU_SCTLR_CFCFG BIT(7)
+#define SMMU_SCTLR_HUPCF BIT(8)
 #define SMMU_TCR_EPD0 BIT(7)
 #define SMMU_TCR_EPD1 BIT(23)
 #define SMMU_TCR_TG0_4K 0
@@ -399,7 +438,8 @@ typedef struct Qcom8998ClearSpan {
 struct Qcom8998Display {
     SysBusDevice parent_obj;
     Qcom8998Bank bank[BANK_COUNT];
-    qemu_irq irq[3];
+    /* MDSS, Adreno, Venus, then Adreno SMMU global and two context IRQs. */
+    qemu_irq irq[6];
     QEMUTimer mdss_vsync;
     QEMUTimer cp_resume;
     QemuConsole *panel[MDSS_DSI_COUNT];
@@ -939,83 +979,194 @@ static bool qcom8998_ram_access(hwaddr address, void *data, size_t size,
                               MEMTXATTRS_UNSPECIFIED, data, size) == MEMTX_OK;
 }
 
-/*
- * The CP's privileged DMA uses stream 0. Resolve it through the guest's
- * stream mappings, then walk the AArch64, stage-1, 4 KiB tables. This subset
- * has no TLB or stage-2 translation. Unsupported configurations fail DMA.
- */
-static uint32_t *qcom8998_cp_context(Qcom8998Display *s)
+static uint32_t *qcom8998_smmu_context(Qcom8998Display *s, unsigned context)
+{
+    return s->bank[BANK_ADRENO_SMMU].regs +
+           (SMMU_ADRENO_CONTEXT_BASE + context * SMMU_CONTEXT_STRIDE) / 4;
+}
+
+static void qcom8998_smmu_update_irq(Qcom8998Display *s)
+{
+    const uint32_t *regs = s->bank[BANK_ADRENO_SMMU].regs;
+
+    qemu_set_irq(s->irq[3], (regs[SMMU_GR0_CR0 / 4] & SMMU_CR0_GFIE) &&
+                 (regs[SMMU_GR0_GFSR / 4] & SMMU_GFSR_MASK));
+    for (unsigned i = 0; i < SMMU_ADRENO_CONTEXTS; i++) {
+        const uint32_t *cb = qcom8998_smmu_context(s, i);
+
+        qemu_set_irq(s->irq[4 + i], (cb[SMMU_CB_SCTLR / 4] & SMMU_SCTLR_CFIE) &&
+                     (cb[SMMU_CB_FSR / 4] & SMMU_FSR_FAULT_MASK));
+    }
+}
+
+static bool qcom8998_smmu_global_fault(Qcom8998Display *s, uint32_t fault,
+                                      bool write)
 {
     uint32_t *regs = s->bank[BANK_ADRENO_SMMU].regs;
-    int context = -1;
+
+    if (regs[SMMU_GR0_GFSR / 4]) {
+        regs[SMMU_GR0_GFSR / 4] |= SMMU_FSR_MULTI;
+    } else {
+        regs[SMMU_GR0_GFSR / 4] = fault;
+        regs[SMMU_GR0_GFSYNR0 / 4] = SMMU_GFSYNR0_NS |
+            (write ? SMMU_GFSYNR0_WNR : 0);
+        regs[SMMU_GR0_GFSYNR1 / 4] = SMMU_ADRENO_CP_STREAM_ID;
+        regs[SMMU_GR0_GFSYNR2 / 4] = 0;
+    }
+    qcom8998_smmu_update_irq(s);
+    return false;
+}
+
+static bool qcom8998_smmu_context_fault(Qcom8998Display *s, unsigned context,
+                                       uint64_t iova, bool write,
+                                       uint32_t fault, uint32_t syndrome)
+{
+    uint32_t *regs = qcom8998_smmu_context(s, context);
+
+    if (regs[SMMU_CB_FSR / 4]) {
+        regs[SMMU_CB_FSR / 4] |= SMMU_FSR_MULTI;
+    } else {
+        regs[SMMU_CB_FSR / 4] = fault;
+        regs[SMMU_CB_FAR / 4] = iova;
+        regs[SMMU_CB_FAR / 4 + 1] = iova >> 32;
+        regs[SMMU_CB_FSYNR0 / 4] = syndrome | SMMU_FSYNR0_NSATTR |
+            (write ? SMMU_FSYNR0_WNR : 0);
+        regs[SMMU_CB_FSYNR1 / 4] = 0;
+        s->bank[BANK_ADRENO_SMMU].regs[SMMU_GR1_CBFRSYNRA / 4 + context] =
+            SMMU_ADRENO_CP_STREAM_ID;
+    }
+    qcom8998_smmu_update_irq(s);
+    return false;
+}
+
+enum {
+    SMMU_CONTEXT_FAULT = -1,
+    SMMU_CONTEXT_BYPASS = -2,
+};
+
+/* Stream 0 is the CP's privileged DMA stream. No TLB or stage 2 is modeled. */
+static int qcom8998_cp_context_index(Qcom8998Display *s, uint32_t *fault)
+{
+    uint32_t *regs = s->bank[BANK_ADRENO_SMMU].regs;
+    int match = -1;
+    unsigned context, type;
+
+    if (regs[SMMU_GR0_CR0 / 4] & SMMU_CR0_CLIENTPD) {
+        return SMMU_CONTEXT_BYPASS;
+    }
 
     for (unsigned i = 0; i < SMMU_ADRENO_STREAMS; i++) {
         uint32_t smr = regs[SMMU_GR0_SMR / 4 + i];
-        uint32_t s2cr = regs[SMMU_GR0_S2CR / 4 + i];
         uint32_t mask = (smr >> 16) & SMMU_SMR_ID_MASK;
 
         if (!(smr & SMMU_SMR_VALID) ||
             ((smr ^ SMMU_ADRENO_CP_STREAM_ID) & SMMU_SMR_ID_MASK & ~mask)) {
             continue;
         }
-        if (context >= 0 || extract32(s2cr, 16, 2) != SMMU_S2CR_TYPE_TRANSLATE) {
-            return NULL;
+        if (match >= 0) {
+            *fault = SMMU_GFSR_SMCF;
+            return regs[SMMU_GR0_CR0 / 4] & SMMU_CR0_SMCFCFG ?
+                   SMMU_CONTEXT_FAULT : SMMU_CONTEXT_BYPASS;
         }
-        context = extract32(s2cr, 0, 8);
+        match = i;
     }
-    if (context < 0 || context >= SMMU_ADRENO_CONTEXTS ||
-        extract32(regs[SMMU_GR1_CBAR / 4 + context], 16, 2) !=
+    if (match < 0) {
+        *fault = SMMU_GFSR_USF;
+        return regs[SMMU_GR0_CR0 / 4] & SMMU_CR0_USFCFG ?
+               SMMU_CONTEXT_FAULT : SMMU_CONTEXT_BYPASS;
+    }
+    type = extract32(regs[SMMU_GR0_S2CR / 4 + match], 16, 2);
+    if (type == 1) {
+        return SMMU_CONTEXT_BYPASS;
+    }
+    if (type != SMMU_S2CR_TYPE_TRANSLATE) {
+        *fault = type == 2 ? SMMU_GFSR_USF : SMMU_GFSR_ICF;
+        return SMMU_CONTEXT_FAULT;
+    }
+    context = extract32(regs[SMMU_GR0_S2CR / 4 + match], 0, 8);
+    if (context >= SMMU_ADRENO_CONTEXTS) {
+        *fault = SMMU_GFSR_UCBF;
+        return SMMU_CONTEXT_FAULT;
+    }
+    if (extract32(regs[SMMU_GR1_CBAR / 4 + context], 16, 2) !=
         SMMU_CBAR_S1_S2_BYPASS ||
         !(regs[SMMU_GR1_CBA2R / 4 + context] & SMMU_CBA2R_VA64)) {
-        return NULL;
+        *fault = SMMU_GFSR_UUT;
+        return SMMU_CONTEXT_FAULT;
     }
+    return context;
+}
 
-    return regs + (SMMU_ADRENO_CONTEXT_BASE +
-                   context * SMMU_CONTEXT_STRIDE) / 4;
+static uint32_t *qcom8998_cp_context(Qcom8998Display *s)
+{
+    uint32_t fault;
+    int context = qcom8998_cp_context_index(s, &fault);
+
+    return context < 0 ? NULL : qcom8998_smmu_context(s, context);
 }
 
 static bool qcom8998_cp_translate(Qcom8998Display *s, uint64_t iova,
                                  bool write, hwaddr *out)
 {
     static const unsigned pa_width[] = { 32, 36, 40 };
-    const uint32_t *regs = qcom8998_cp_context(s);
+    const uint32_t *regs;
+    uint32_t fault;
+    int context = qcom8998_cp_context_index(s, &fault);
     unsigned pasize, va_bits;
     uint32_t tcr, tcr2;
     uint64_t table, pa_mask, va_mask, invalid_pa;
+    uint64_t original_iova = iova;
     bool upper;
 
-    if (!regs || !(regs[SMMU_CB_SCTLR / 4] & SMMU_SCTLR_M)) {
+    if (context == SMMU_CONTEXT_FAULT) {
+        return qcom8998_smmu_global_fault(s, fault, write);
+    }
+    if (context == SMMU_CONTEXT_BYPASS) {
+        *out = iova;
+        return true;
+    }
+    regs = qcom8998_smmu_context(s, context);
+    if (regs[SMMU_CB_FSR / 4] &&
+        !(regs[SMMU_CB_SCTLR / 4] & SMMU_SCTLR_HUPCF)) {
         return false;
+    }
+    if (!(regs[SMMU_CB_SCTLR / 4] & SMMU_SCTLR_M)) {
+        *out = iova;
+        return true;
     }
     tcr = regs[SMMU_CB_TCR / 4];
     tcr2 = regs[SMMU_CB_TCR2 / 4];
+    if (regs[SMMU_CB_SCTLR / 4] & BIT(4)) {
+        goto unsupported;
+    }
     switch (extract32(tcr2, 15, 3)) {
     case SMMU_TCR2_SEP_36BIT:
         if (iova >> 36) {
-            return false;
+            goto address_fault;
         }
         iova = sextract64(iova, 0, 36);
         break;
     case SMMU_TCR2_SEP_UPSTREAM:
         break;
     default:
-        return false;
+        goto unsupported;
     }
     upper = iova >> 63;
-    if (upper ? ((tcr & SMMU_TCR_EPD1) ||
-                 extract32(tcr, 30, 2) != SMMU_TCR_TG1_4K) :
-                ((tcr & SMMU_TCR_EPD0) ||
-                 extract32(tcr, 14, 2) != SMMU_TCR_TG0_4K)) {
-        return false;
+    if (tcr & (upper ? SMMU_TCR_EPD1 : SMMU_TCR_EPD0)) {
+        goto translation_fault;
+    }
+    if (upper ? extract32(tcr, 30, 2) != SMMU_TCR_TG1_4K :
+                extract32(tcr, 14, 2) != SMMU_TCR_TG0_4K) {
+        goto unsupported;
     }
     va_bits = 64 - extract32(tcr, upper ? 16 : 0, 6);
     pasize = extract32(tcr2, 0, 4);
     if (va_bits < 25 || va_bits > 48 || pasize >= ARRAY_SIZE(pa_width)) {
-        return false;
+        goto unsupported;
     }
     va_mask = MAKE_64BIT_MASK(0, va_bits);
     if ((iova & ~va_mask) != (upper ? ~va_mask : 0)) {
-        return false;
+        goto address_fault;
     }
     pa_mask = MAKE_64BIT_MASK(0, pa_width[pasize]);
     invalid_pa = MAKE_64BIT_MASK(0, SMMU_LONG_DESC_PA_BITS) & ~pa_mask;
@@ -1029,32 +1180,54 @@ static bool qcom8998_cp_translate(Qcom8998Display *s, uint64_t iova,
         unsigned type;
 
         if (table & invalid_pa) {
-            return false;
+            goto address_fault;
         }
         table &= pa_mask & ~MAKE_64BIT_MASK(0, bits + 3);
         if (!qcom8998_ram_access(table + index * sizeof(pte), &pte,
                                  sizeof(pte), false)) {
-            return false;
+            return qcom8998_smmu_context_fault(s, context, original_iova,
+                       write, SMMU_FSR_EF, SMMU_FSYNR0_PTWF);
         }
         pte = le64_to_cpu(pte);
         type = pte & SMMU_PTE_TYPE_MASK;
         if (shift > SMMU_4K_SHIFT && type == SMMU_PTE_TABLE_OR_PAGE) {
             if (write && (pte & SMMU_PTE_TABLE_READ_ONLY)) {
-                return false;
+                goto permission_fault;
             }
             table = pte & ~MAKE_64BIT_MASK(0, SMMU_4K_SHIFT);
             continue;
         }
         if (type != (shift == SMMU_4K_SHIFT ? SMMU_PTE_TABLE_OR_PAGE :
-                     SMMU_PTE_BLOCK) || shift == 39 ||
-            (pte & invalid_pa) || !(pte & SMMU_PTE_ACCESS_FLAG) ||
-            (write && (pte & SMMU_PTE_READ_ONLY))) {
-            return false;
+                     SMMU_PTE_BLOCK) || shift == 39) {
+            goto translation_fault;
+        }
+        if (pte & invalid_pa) {
+            goto address_fault;
+        }
+        if (!(pte & SMMU_PTE_ACCESS_FLAG)) {
+            return qcom8998_smmu_context_fault(s, context, original_iova,
+                                              write, SMMU_FSR_AFF, 0);
+        }
+        if (write && (pte & SMMU_PTE_READ_ONLY)) {
+            goto permission_fault;
         }
         *out = (pte & pa_mask & ~MAKE_64BIT_MASK(0, shift)) |
                extract64(iova, 0, shift);
         return true;
     }
+
+unsupported:
+    return qcom8998_smmu_context_fault(s, context, original_iova, write,
+                                      SMMU_FSR_UUT, 0);
+translation_fault:
+    return qcom8998_smmu_context_fault(s, context, original_iova, write,
+                                      SMMU_FSR_TF, 0);
+address_fault:
+    return qcom8998_smmu_context_fault(s, context, original_iova, write,
+                                      SMMU_FSR_ASF, 0);
+permission_fault:
+    return qcom8998_smmu_context_fault(s, context, original_iova, write,
+                                      SMMU_FSR_PF, 0);
 }
 
 static bool qcom8998_cp_word(Qcom8998Display *s, uint64_t iova, uint32_t *word,
@@ -1748,6 +1921,19 @@ static uint64_t qcom8998_read(void *opaque, hwaddr offset, unsigned size)
     Qcom8998Bank *bank = opaque;
     uint32_t value = bank->regs[offset / sizeof(value)];
 
+    if (bank->index == BANK_ADRENO_SMMU &&
+        offset >= SMMU_ADRENO_CONTEXT_BASE &&
+        offset < SMMU_ADRENO_CONTEXT_BASE +
+                 SMMU_ADRENO_CONTEXTS * SMMU_CONTEXT_STRIDE &&
+        offset % SMMU_CONTEXT_STRIDE == SMMU_CB_FSR) {
+        unsigned context = (offset - SMMU_ADRENO_CONTEXT_BASE) /
+                           SMMU_CONTEXT_STRIDE;
+
+        if (bank->regs[SMMU_GR1_CBA2R / 4 + context] & SMMU_CBA2R_VA64) {
+            value |= SMMU_FSR_FORMAT_AARCH64;
+        }
+    }
+
     /* Repeated polls should not dominate the bring-up trace. */
     if (offset != bank->last_read_offset || value != bank->last_read_value) {
         trace_qcom8998_mmio_read(banks[bank->index].name, offset, value,
@@ -1757,6 +1943,48 @@ static uint64_t qcom8998_read(void *opaque, hwaddr offset, unsigned size)
         bank->last_read_value = value;
     }
     return value;
+}
+
+static bool qcom8998_smmu_write(Qcom8998Bank *bank, hwaddr offset,
+                                uint32_t value)
+{
+    Qcom8998Display *s = bank->display;
+    unsigned context;
+    hwaddr cb_offset;
+
+    if (bank->index != BANK_ADRENO_SMMU) {
+        return false;
+    }
+    if (offset == SMMU_GR0_GFSR) {
+        bank->regs[offset / 4] &= ~(value & SMMU_GFSR_MASK);
+    } else if (offset == SMMU_GR0_GFSRRESTORE) {
+        bank->regs[SMMU_GR0_GFSR / 4] = value & SMMU_GFSR_MASK;
+    } else if (offset == SMMU_GR0_CR0) {
+        bank->regs[offset / 4] = value;
+    } else if (offset >= SMMU_ADRENO_CONTEXT_BASE &&
+               offset < SMMU_ADRENO_CONTEXT_BASE +
+                        SMMU_ADRENO_CONTEXTS * SMMU_CONTEXT_STRIDE) {
+        context = (offset - SMMU_ADRENO_CONTEXT_BASE) / SMMU_CONTEXT_STRIDE;
+        cb_offset = offset % SMMU_CONTEXT_STRIDE;
+        if (cb_offset == SMMU_CB_FSR) {
+            bank->regs[offset / 4] &= ~(value & SMMU_FSR_FAULT_MASK);
+        } else if (cb_offset == SMMU_CB_FSRRESTORE) {
+            qcom8998_smmu_context(s, context)[SMMU_CB_FSR / 4] =
+                value & SMMU_FSR_FAULT_MASK;
+        } else if (cb_offset == SMMU_CB_SCTLR) {
+            /* This implementation supports terminating faults only. */
+            bank->regs[offset / 4] = value & ~SMMU_SCTLR_CFCFG;
+        } else if (cb_offset == 0x8) {
+            /* No stalled transaction exists in the terminate-only model. */
+            return true;
+        } else {
+            return false;
+        }
+    } else {
+        return false;
+    }
+    qcom8998_smmu_update_irq(s);
+    return true;
 }
 
 static void qcom8998_write(void *opaque, hwaddr offset, uint64_t value,
@@ -1779,6 +2007,9 @@ static void qcom8998_write(void *opaque, hwaddr offset, uint64_t value,
         (bank->index == BANK_ADRENO &&
          offset == ADRENO_RBBM_HW_CONFIGURATION) ||
         (bank->index == BANK_VIDEO && offset == VENUS_WRAPPER_HW_VERSION)) {
+        return;
+    }
+    if (qcom8998_smmu_write(bank, offset, value)) {
         return;
     }
     if (bank->index == BANK_MDSS) {
@@ -1857,6 +2088,8 @@ static void qcom8998_smmu_reset(Qcom8998Bank *bank, unsigned stream_entries,
         contexts;
     bank->regs[SMMU_IDR2 / 4] = SMMU_IDR2_4K_PAGES | SMMU_IDR2_VA_48BIT |
         SMMU_IDR2_PA_40BIT | SMMU_IDR2_IPA_40BIT;
+    /* Firmware handoff: unknown or conflicting streams terminate. */
+    bank->regs[SMMU_GR0_CR0 / 4] = SMMU_CR0_USFCFG | SMMU_CR0_SMCFCFG;
 }
 
 static void qcom8998_qfprom_calibration(Qcom8998Bank *bank)
@@ -1955,6 +2188,7 @@ static void qcom8998_reset(DeviceState *dev)
     s->bank[BANK_ADRENO].regs[ADRENO_GPMU_CM3_SYSRESET / 4] =
         ADRENO_GPMU_RESET_ASSERT;
     qemu_set_irq(s->irq[0], 0);
+    qcom8998_smmu_update_irq(s);
 }
 
 static void qcom8998_init(Object *obj)
@@ -2031,7 +2265,9 @@ type_init(qcom8998_register_types)
 
 void qcom8998_display_create(DeviceState *gic)
 {
-    static const uint32_t gsiv[] = { MDSS_GSIV, ADRENO_GSIV, VIDEO_GSIV };
+    static const uint32_t gsiv[] = {
+        MDSS_GSIV, ADRENO_GSIV, VIDEO_GSIV, 366, 361, 362,
+    };
     SysBusDevice *bus = SYS_BUS_DEVICE(qdev_new(TYPE_QCOM8998_DISPLAY));
 
     DEVICE(bus)->id = g_strdup("qcdx8998");

@@ -146,8 +146,18 @@ typedef enum VirtGICType {
 #define VIRT_GIC_VERSION_4_MASK BIT(VIRT_GIC_VERSION_4)
 #define VIRT_GIC_VERSION_5_MASK BIT(VIRT_GIC_VERSION_5)
 
+typedef struct VirtMachineState VirtMachineState;
+
 struct VirtMachineClass {
     MachineClass parent;
+    /* Board policy shared by the virt and OEMSK machine families. */
+    void (*validate_board)(VirtMachineState *vms);
+    void (*set_board_memmap)(VirtMachineState *vms);
+    void (*create_board_devices)(VirtMachineState *vms);
+    void (*build_board_dsdt)(Aml *scope, VirtMachineState *vms);
+    bool (*firmware_smc)(ARMCPU *cpu);
+    unsigned gic_spi_count;
+    hwaddr variable_flash_size;
     bool no_tcg_its;
     bool no_highmem_compact;
     bool no_kvm_steal_time;
@@ -182,7 +192,6 @@ struct VirtMachineState {
     bool winrt_omap_dma;
     bool winrt_qfprom_probe;
     bool winrt_qcdx_probe;
-    bool qcom8998_display;
     bool winrt_qcom_cypress_touch;
     bool winrt_qcom_synaptics_touch;
     char *winrt_qcdx_ssdt_file;
@@ -238,7 +247,9 @@ struct VirtMachineState {
 
 #define VIRT_ECAM_ID(high) (high ? VIRT_HIGH_PCIE_ECAM : VIRT_PCIE_ECAM)
 
-#define TYPE_VIRT_MACHINE   MACHINE_TYPE_NAME("virt")
+/* Shared implementation; concrete board families are sibling QOM types. */
+#define TYPE_VIRT_MACHINE   MACHINE_TYPE_NAME("arm-virt-base")
+#define TYPE_VIRT_BOARD_MACHINE MACHINE_TYPE_NAME("virt")
 OBJECT_DECLARE_TYPE(VirtMachineState, VirtMachineClass, VIRT_MACHINE)
 
 void virt_acpi_setup(VirtMachineState *vms);

@@ -42,7 +42,8 @@
 #include "qobject/qstring.h"
 #include "qobject/qbool.h"
 
-#define MAX_IRQ 256
+/* GIC inputs on native ARM boards can exceed the legacy 256-pin limit. */
+#define MAX_IRQ 1024
 
 #ifndef _WIN32
 # define SOCKET_TIMEOUT 50

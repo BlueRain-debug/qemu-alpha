@@ -44,11 +44,17 @@ config ARM_VIRT
     select TEGRA20_APB_DMA
     select QCOM_GPT
     select QCOM_MDP4_PROBE
-    select QCOM_8998_DISPLAY
     select OMAP4_DMTIMER
     select OMAP4_DMA
     select PL310
     select UNIMP
+
+config OEMSK
+    bool
+    default y
+    depends on AARCH64 && TCG
+    select ARM_VIRT
+    select QCOM_8998_DISPLAY
 
 config CUBIEBOARD
     bool
