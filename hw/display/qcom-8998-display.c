@@ -8,6 +8,7 @@
 #include "hw/acpi/aml-build.h"
 #include "hw/core/cpu.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
 #include "hw/display/qcom-8998-display.h"
 #include "migration/vmstate.h"
@@ -196,7 +197,9 @@ static const struct {
 #define ADRENO_PM4_WAIT_FOR_IDLE 0x26
 #define ADRENO_PM4_MEM_WRITE 0x3d
 #define ADRENO_PM4_INDIRECT_BUFFER 0x3f
+#define ADRENO_PM4_SET_DRAW_STATE 0x43
 #define ADRENO_PM4_COND_EXEC 0x44
+#define ADRENO_PM4_EVENT_WRITE 0x46
 #define ADRENO_PM4_ME_INIT 0x48
 #define ADRENO_PM4_SMMU_TABLE_UPDATE 0x53
 #define ADRENO_PM4_SET_PROTECTED_MODE 0x5f
@@ -215,6 +218,45 @@ static const struct {
 /* GRAS/RB/PC/VFD/VPC/SP/TPL1/HLSQ context configuration. */
 #define ADRENO_CONTEXT_REG_BASE 0xe000
 #define ADRENO_CONTEXT_REG_END 0xe800
+/* A5xx draw-state group IDs occupy bits 24..28 of each control word. */
+#define ADRENO_CP_DRAW_GROUPS 32
+#define ADRENO_DRAW_STATE_COUNT_MASK 0xffff
+#define ADRENO_DRAW_STATE_DIRTY BIT(16)
+#define ADRENO_DRAW_STATE_DISABLE BIT(17)
+#define ADRENO_DRAW_STATE_DISABLE_ALL BIT(18)
+#define ADRENO_DRAW_STATE_LOAD_IMMED BIT(19)
+#define ADRENO_DRAW_STATE_GROUP_MASK (0x1fU << 24)
+#define ADRENO_DRAW_STATE_VALID (ADRENO_DRAW_STATE_COUNT_MASK | \
+    ADRENO_DRAW_STATE_DIRTY | ADRENO_DRAW_STATE_DISABLE | \
+    ADRENO_DRAW_STATE_DISABLE_ALL | ADRENO_DRAW_STATE_LOAD_IMMED | \
+    ADRENO_DRAW_STATE_GROUP_MASK)
+#define ADRENO_EVENT_CACHE_FLUSH_TS 0x04
+#define ADRENO_EVENT_WT_DONE_TS 0x08
+#define ADRENO_EVENT_RB_DONE_TS 0x16
+#define ADRENO_EVENT_CCU_INVALIDATE_DEPTH 0x18
+#define ADRENO_EVENT_CCU_INVALIDATE_COLOR 0x19
+#define ADRENO_EVENT_CCU_FLUSH_DEPTH_TS 0x1c
+#define ADRENO_EVENT_CCU_FLUSH_COLOR_TS 0x1d
+#define ADRENO_EVENT_CCU_RESOLVE 0x1e
+/* PM4 register indices for the fast-clear path. */
+#define ADRENO_RB_CNTL 0xe140
+#define ADRENO_RB_RENDER_CNTL 0xe141
+#define ADRENO_RB_DEST_MSAA_CNTL 0xe142
+#define ADRENO_RB_MRT_BUF_INFO 0xe152
+#define ADRENO_RB_MRT_STRIDE 7
+#define ADRENO_RB_BLIT_CNTL 0xe210
+#define ADRENO_RB_RESOLVE_MIN 0xe211
+#define ADRENO_RB_RESOLVE_MAX 0xe212
+#define ADRENO_RB_RESOLVE_CNTL 0xe213
+#define ADRENO_RB_CLEAR_COLOR 0xe218
+#define ADRENO_RB_CLEAR_CNTL 0xe21c
+#define ADRENO_RB_BYPASS BIT(17)
+#define ADRENO_RB_FAST_CLEAR BIT(1)
+#define ADRENO_RB_CLEAR_ALL_COMPONENTS (0xf << 4)
+#define ADRENO_RB_RGBA8_UNORM 0x30
+#define ADRENO_RB_COLOR_SWAP_MASK (3U << 13)
+/* Limit synchronous clear work, including its preflight span allocation. */
+#define ADRENO_CLEAR_MAX_BYTES (64U << 20)
 #define ADRENO_ME_INIT_CONTEXTS BIT(0)
 #define ADRENO_ME_INIT_ERROR_DETECTION BIT(1)
 #define ADRENO_ME_INIT_HEADER_DUMP BIT(3)
@@ -344,6 +386,16 @@ typedef struct Qcom8998CommandStream {
     unsigned parent_words;
 } Qcom8998CommandStream;
 
+typedef struct Qcom8998DrawState {
+    uint64_t address;
+    uint32_t control;
+} Qcom8998DrawState;
+
+typedef struct Qcom8998ClearSpan {
+    hwaddr address;
+    unsigned length;
+} Qcom8998ClearSpan;
+
 struct Qcom8998Display {
     SysBusDevice parent_obj;
     Qcom8998Bank bank[BANK_COUNT];
@@ -352,6 +404,7 @@ struct Qcom8998Display {
     QEMUTimer cp_resume;
     QemuConsole *panel[MDSS_DSI_COUNT];
     Qcom8998MdpTransfer transfer[MDSS_CTL_COUNT];
+    bool disable_macro_tiled_primary;
     bool me_initialized;
     bool register_protection;
     bool draw_predicate_global;
@@ -360,6 +413,7 @@ struct Qcom8998Display {
     unsigned gpmu_image_dwords;
     Qcom8998CommandStream streams[ADRENO_CP_STREAMS];
     unsigned stream_count;
+    Qcom8998DrawState draw_state[ADRENO_CP_DRAW_GROUPS];
 };
 
 static void qcom8998_mdss_update_irq(Qcom8998Bank *bank)
@@ -1184,6 +1238,207 @@ static bool qcom8998_cp_smmu_update(Qcom8998Display *s, const uint32_t *payload)
     return true;
 }
 
+static bool qcom8998_cp_draw_state(Qcom8998Display *s, unsigned count,
+                                  uint64_t base, unsigned mask, unsigned rptr)
+{
+    Qcom8998DrawState pending[ADRENO_CP_DRAW_GROUPS];
+
+    if (!s->me_initialized || !count || count % 3) {
+        return false;
+    }
+    memcpy(pending, s->draw_state, sizeof(pending));
+    for (unsigned offset = 0; offset < count; offset += 3) {
+        uint32_t words[3];
+        uint32_t control;
+        uint64_t address;
+        unsigned group, length;
+
+        for (unsigned i = 0; i < ARRAY_SIZE(words); i++) {
+            if (!qcom8998_cp_word(s,
+                    base + (((rptr + 1 + offset + i) & mask) * 4),
+                    &words[i], false)) {
+                return false;
+            }
+        }
+        control = words[0];
+        address = deposit64(words[1], 32, 32, words[2]);
+        group = extract32(control, 24, 5);
+        length = control & ADRENO_DRAW_STATE_COUNT_MASK;
+        if ((control & ~ADRENO_DRAW_STATE_VALID) ||
+            (control & ADRENO_DRAW_STATE_LOAD_IMMED) || (address & 3) ||
+            address > UINT64_MAX - length * 4) {
+            /* Immediate loads need their own resumable execution path. */
+            return false;
+        }
+        if (control & ADRENO_DRAW_STATE_DISABLE_ALL) {
+            if (control != ADRENO_DRAW_STATE_DISABLE_ALL || address) {
+                return false;
+            }
+            memset(pending, 0, sizeof(pending));
+        } else {
+            if ((control & ADRENO_DRAW_STATE_DISABLE) && (length || address)) {
+                return false;
+            }
+            pending[group].address = address;
+            pending[group].control = control & ~ADRENO_DRAW_STATE_GROUP_MASK;
+        }
+    }
+    /* Publish a complete packet only; a later bad triple changes no groups. */
+    memcpy(s->draw_state, pending, sizeof(pending));
+    for (unsigned group = 0; group < ADRENO_CP_DRAW_GROUPS; group++) {
+        trace_qcom8998_cp_draw_state(group, pending[group].control,
+                                    pending[group].address);
+    }
+    return true;
+}
+
+static bool qcom8998_ccu_clear(Qcom8998Display *s)
+{
+    const uint32_t *regs = s->bank[BANK_ADRENO].regs;
+    unsigned target = regs[ADRENO_RB_BLIT_CNTL];
+    unsigned minimum = regs[ADRENO_RB_RESOLVE_MIN];
+    unsigned maximum = regs[ADRENO_RB_RESOLVE_MAX];
+    unsigned x1 = extract32(minimum, 0, 16);
+    unsigned y1 = extract32(minimum, 16, 16);
+    unsigned x2 = extract32(maximum, 0, 16);
+    unsigned y2 = extract32(maximum, 16, 16);
+    unsigned mrt, width, height, swap;
+    uint64_t base, pitch, layer_size, last;
+    uint32_t color = regs[ADRENO_RB_CLEAR_COLOR];
+    uint32_t packed_color = 0;
+    uint32_t pixels[(1U << SMMU_4K_SHIFT) / sizeof(uint32_t)];
+    g_autoptr(GArray) spans = g_array_new(false, false,
+                                        sizeof(Qcom8998ClearSpan));
+    static const unsigned channel_order[][4] = {
+        { 0, 1, 2, 3 }, { 2, 1, 0, 3 },
+        { 3, 0, 1, 2 }, { 3, 2, 1, 0 },
+    };
+
+    if (target >= 8 || regs[ADRENO_RB_CNTL] != ADRENO_RB_BYPASS ||
+        regs[ADRENO_RB_DEST_MSAA_CNTL] || regs[ADRENO_RB_RESOLVE_CNTL] ||
+        regs[ADRENO_RB_CLEAR_CNTL] !=
+            (ADRENO_RB_FAST_CLEAR | ADRENO_RB_CLEAR_ALL_COMPONENTS) ||
+        x2 < x1 || y2 < y1) {
+        return false;
+    }
+    mrt = ADRENO_RB_MRT_BUF_INFO + target * ADRENO_RB_MRT_STRIDE;
+    /*
+     * Implement row-major RGBA8 first. Tiled/UBWC targets, GMEM, depth,
+     * multisampling and partial component masks require their own layouts.
+     * Do not complete the resolve or its timestamp for those modes.
+     */
+    if ((regs[mrt] & ~ADRENO_RB_COLOR_SWAP_MASK) != ADRENO_RB_RGBA8_UNORM ||
+        (regs[ADRENO_RB_RENDER_CNTL] & (BIT(16 + target) | BIT(24 + target)))) {
+        return false;
+    }
+    base = qcom8998_reg_pair(regs, (mrt + 3) * 4);
+    pitch = (uint64_t)regs[mrt + 1] << 6;
+    layer_size = (uint64_t)regs[mrt + 2] << 6;
+    width = x2 - x1 + 1;
+    height = y2 - y1 + 1;
+    last = (uint64_t)y2 * pitch + (uint64_t)(x2 + 1) * sizeof(uint32_t);
+    if ((base & 3) || pitch < (uint64_t)(x2 + 1) * sizeof(uint32_t) ||
+        last > layer_size || base > UINT64_MAX - last ||
+        (uint64_t)width * height * sizeof(uint32_t) > ADRENO_CLEAR_MAX_BYTES) {
+        return false;
+    }
+
+    /* Resolve every destination before changing RAM, including later rows. */
+    for (unsigned y = y1; y <= y2; y++) {
+        uint64_t address = base + y * pitch + x1 * sizeof(uint32_t);
+        unsigned remaining = width * sizeof(uint32_t);
+
+        while (remaining) {
+            Qcom8998ClearSpan span;
+            unsigned page_left = (1U << SMMU_4K_SHIFT) -
+                                 extract64(address, 0, SMMU_4K_SHIFT);
+
+            span.length = MIN(remaining, page_left);
+            if (!qcom8998_cp_translate(s, address, true, &span.address) ||
+                !qcom8998_ram_buffer(span.address, span.length, true)) {
+                return false;
+            }
+            g_array_append_val(spans, span);
+            address += span.length;
+            remaining -= span.length;
+        }
+    }
+    /* CLEAR_COLOR is packed before the MRT's byte-order permutation. */
+    swap = extract32(regs[mrt], 13, 2);
+    for (unsigned channel = 0; channel < 4; channel++) {
+        packed_color |= extract32(color, channel_order[swap][channel] * 8, 8) <<
+                        (channel * 8);
+    }
+    for (unsigned i = 0; i < ARRAY_SIZE(pixels); i++) {
+        pixels[i] = cpu_to_le32(packed_color);
+    }
+    for (unsigned i = 0; i < spans->len; i++) {
+        const Qcom8998ClearSpan *span = &g_array_index(spans,
+                                                      Qcom8998ClearSpan, i);
+
+        if (address_space_write(&address_space_memory, span->address,
+                                MEMTXATTRS_UNSPECIFIED, pixels,
+                                span->length) != MEMTX_OK) {
+            return false;
+        }
+    }
+    trace_qcom8998_ccu_clear(target, base, x1, y1, width, height, color);
+    return true;
+}
+
+static bool qcom8998_cp_event_write(Qcom8998Display *s, unsigned count,
+                                   uint32_t *payload)
+{
+    uint64_t address;
+
+    if (!s->me_initialized || (count != 1 && count != 4)) {
+        return false;
+    }
+    switch (payload[0]) {
+    case ADRENO_EVENT_CCU_RESOLVE:
+        {
+            hwaddr timestamp = 0;
+            uint32_t value = count == 4 ? cpu_to_le32(payload[3]) : 0;
+
+            if (count == 4) {
+                address = deposit64(payload[1], 32, 32, payload[2]);
+                if ((address & 3) ||
+                    !qcom8998_cp_translate(s, address, true, &timestamp) ||
+                    !qcom8998_ram_buffer(timestamp, sizeof(value), true)) {
+                    return false;
+                }
+            }
+            if (!qcom8998_ccu_clear(s)) {
+                return false;
+            }
+            return count == 1 || address_space_write(&address_space_memory,
+                timestamp, MEMTXATTRS_UNSPECIFIED, &value, sizeof(value)) ==
+                MEMTX_OK;
+        }
+    case ADRENO_EVENT_CCU_INVALIDATE_DEPTH:
+    case ADRENO_EVENT_CCU_INVALIDATE_COLOR:
+        /* The software model has no cached attachment contents. */
+        return count == 1;
+    case ADRENO_EVENT_CACHE_FLUSH_TS:
+    case ADRENO_EVENT_WT_DONE_TS:
+    case ADRENO_EVENT_RB_DONE_TS:
+    case ADRENO_EVENT_CCU_FLUSH_DEPTH_TS:
+    case ADRENO_EVENT_CCU_FLUSH_COLOR_TS:
+        /*
+         * Earlier commands complete synchronously. A blocked draw/resolve
+         * keeps this packet pending, so its timestamp cannot pass that work.
+         * Interrupt-request flags and rendering events are not handled here.
+         */
+        if (count == 1) {
+            return true;
+        }
+        address = deposit64(payload[1], 32, 32, payload[2]);
+        return qcom8998_cp_word(s, address, &payload[3], true);
+    default:
+        return false;
+    }
+}
+
 static bool qcom8998_cp_type7(Qcom8998Display *s, uint32_t header,
                              unsigned count, uint64_t base, unsigned mask,
                              unsigned rptr, unsigned available, unsigned *skip)
@@ -1206,6 +1461,9 @@ static bool qcom8998_cp_type7(Qcom8998Display *s, uint32_t header,
     if (opcode == ADRENO_PM4_MEM_WRITE) {
         return qcom8998_cp_mem_write(s, count, base, mask, rptr);
     }
+    if (opcode == ADRENO_PM4_SET_DRAW_STATE) {
+        return qcom8998_cp_draw_state(s, count, base, mask, rptr);
+    }
     if (count > ARRAY_SIZE(payload)) {
         return false;
     }
@@ -1216,6 +1474,8 @@ static bool qcom8998_cp_type7(Qcom8998Display *s, uint32_t header,
         }
     }
     switch (opcode) {
+    case ADRENO_PM4_EVENT_WRITE:
+        return qcom8998_cp_event_write(s, count, payload);
     case ADRENO_PM4_DRAW_PRED_ENABLE_GLOBAL:
     case ADRENO_PM4_DRAW_PRED_ENABLE_LOCAL:
         if (!s->me_initialized || count != 1 || payload[0] > 1) {
@@ -1690,6 +1950,7 @@ static void qcom8998_reset(DeviceState *dev)
     s->draw_predicate_global = false;
     s->draw_predicate_local = false;
     s->draw_predicate_pass = true;
+    memset(s->draw_state, 0, sizeof(s->draw_state));
     s->gpmu_image_dwords = 0;
     s->bank[BANK_ADRENO].regs[ADRENO_GPMU_CM3_SYSRESET / 4] =
         ADRENO_GPMU_RESET_ASSERT;
@@ -1737,6 +1998,11 @@ static const VMStateDescription qcom8998_vmstate = {
     .unmigratable = 1,
 };
 
+static const Property qcom8998_properties[] = {
+    DEFINE_PROP_BOOL("disable-macro-tiled-primary", Qcom8998Display,
+                     disable_macro_tiled_primary, false),
+};
+
 static void qcom8998_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -1744,6 +2010,7 @@ static void qcom8998_class_init(ObjectClass *klass, const void *data)
     device_class_set_legacy_reset(dc, qcom8998_reset);
     dc->desc = "Experimental MSM8998 QCDX MMIO bring-up";
     dc->vmsd = &qcom8998_vmstate;
+    device_class_set_props(dc, qcom8998_properties);
     dc->user_creatable = false;
 }
 
@@ -1817,6 +2084,8 @@ static void qcom8998_acpi_smmu(Aml *scope, const char *name, unsigned uid,
 
 void qcom8998_display_acpi(Aml *scope)
 {
+    Qcom8998Display *s = QCOM8998_DISPLAY(
+        qdev_find_recursive(sysbus_get_default(), "qcdx8998"));
     /*
      * RESI labels the descriptors in _CRS by position. The labels follow the
      * MSM8998 Windows ACPI ABI used by the original miniport.
@@ -1863,7 +2132,8 @@ void qcom8998_display_acpi(Aml *scope)
     Aml *resi = aml_method("RESI", 0, AML_NOTSERIALIZED);
     Aml *resource_info = aml_package(2 + ARRAY_SIZE(resources));
     Aml *regr = aml_method("REGR", 0, AML_NOTSERIALIZED);
-    Aml *settings = aml_package(ARRAY_SIZE(adapter_settings) + 1);
+    Aml *settings = aml_package(ARRAY_SIZE(adapter_settings) + 1 +
+                                s->disable_macro_tiled_primary);
     Aml *graphics_settings = aml_package(2);
     Aml *dcvs_settings = aml_package(2);
     Aml *dcvs_enable = aml_package(2);
@@ -1901,6 +2171,14 @@ void qcom8998_display_acpi(Aml *scope)
 
         aml_append(entry, aml_string("%s", adapter_settings[i].name));
         aml_append(entry, aml_int(adapter_settings[i].value));
+        aml_append(settings, entry);
+    }
+    if (s->disable_macro_tiled_primary) {
+        Aml *entry = aml_package(2);
+
+        /* Native KMD option; it changes primary-surface layout policy. */
+        aml_append(entry, aml_string("DisableMacroTiledPrimary"));
+        aml_append(entry, aml_int(1));
         aml_append(settings, entry);
     }
     /*
