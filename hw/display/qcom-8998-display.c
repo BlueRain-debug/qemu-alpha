@@ -165,6 +165,16 @@ static const struct {
 #define ADRENO_CP_RB_RPTR (0x806 * 4)
 #define ADRENO_CP_RB_WPTR (0x807 * 4)
 #define ADRENO_CP_PFP_ME_CNTL (0x832 * 4)
+#define ADRENO_CP_IB1_BASE (0xb1f * 4)
+#define ADRENO_CP_IB1_BUFSZ (0xb21 * 4)
+#define ADRENO_CP_IB_REGISTER_STRIDE (3 * 4)
+/* The ring may call IB1, which may call IB2. */
+#define ADRENO_CP_STREAMS 3
+#define ADRENO_CP_IB_SIZE_MASK 0xfffff
+/* Yield long submissions so a CPU MMIO kick cannot monopolize the main loop. */
+#define ADRENO_CP_PACKET_BUDGET 4096
+#define ADRENO_CP_WORD_BUDGET 16384
+#define ADRENO_CP_DISPATCH_DELAY_NS 1000
 #define ADRENO_CP_PROTECT_BASE 0x880
 #define ADRENO_CP_PROTECT_COUNT 32
 #define ADRENO_CP_PROTECT_CNTL (0x8a0 * 4)
@@ -181,14 +191,30 @@ static const struct {
 #define ADRENO_PM4_TYPE7 0x70000000
 #define ADRENO_PM4_TYPE7_MASK 0xff004000
 #define ADRENO_PM4_NOP 0x10
+#define ADRENO_PM4_DRAW_PRED_ENABLE_GLOBAL 0x19
+#define ADRENO_PM4_DRAW_PRED_ENABLE_LOCAL 0x1a
 #define ADRENO_PM4_WAIT_FOR_IDLE 0x26
 #define ADRENO_PM4_MEM_WRITE 0x3d
+#define ADRENO_PM4_INDIRECT_BUFFER 0x3f
 #define ADRENO_PM4_COND_EXEC 0x44
 #define ADRENO_PM4_ME_INIT 0x48
 #define ADRENO_PM4_SMMU_TABLE_UPDATE 0x53
 #define ADRENO_PM4_SET_PROTECTED_MODE 0x5f
 #define ADRENO_PM4_SET_SECURE_MODE 0x66
 #define ADRENO_PM4_PREEMPT_ENABLE_GLOBAL 0x69
+#define ADRENO_PM4_PREEMPT_ENABLE_LOCAL 0x6a
+/* Global configuration words, in the PM4 register index space. */
+#define ADRENO_RB_MODE_CNTL 0xcc6
+#define ADRENO_RB_CCU_CNTL 0xcc7
+#define ADRENO_PC_MODE_CNTL 0xd02
+#define ADRENO_HLSQ_MODE_CNTL 0xe06
+#define ADRENO_VFD_MODE_CNTL 0xe42
+#define ADRENO_VPC_DBG_ECO_CNTL 0xe60
+#define ADRENO_SP_MODE_CNTL 0xec2
+#define ADRENO_TPL1_MODE_CNTL 0xf02
+/* GRAS/RB/PC/VFD/VPC/SP/TPL1/HLSQ context configuration. */
+#define ADRENO_CONTEXT_REG_BASE 0xe000
+#define ADRENO_CONTEXT_REG_END 0xe800
 #define ADRENO_ME_INIT_CONTEXTS BIT(0)
 #define ADRENO_ME_INIT_ERROR_DETECTION BIT(1)
 #define ADRENO_ME_INIT_HEADER_DUMP BIT(3)
@@ -311,16 +337,29 @@ typedef struct Qcom8998MdpTransfer {
     uint32_t flush;
 } Qcom8998MdpTransfer;
 
+typedef struct Qcom8998CommandStream {
+    uint64_t base;
+    unsigned position;
+    unsigned end;
+    unsigned parent_words;
+} Qcom8998CommandStream;
+
 struct Qcom8998Display {
     SysBusDevice parent_obj;
     Qcom8998Bank bank[BANK_COUNT];
     qemu_irq irq[3];
     QEMUTimer mdss_vsync;
+    QEMUTimer cp_resume;
     QemuConsole *panel[MDSS_DSI_COUNT];
     Qcom8998MdpTransfer transfer[MDSS_CTL_COUNT];
     bool me_initialized;
     bool register_protection;
+    bool draw_predicate_global;
+    bool draw_predicate_local;
+    bool draw_predicate_pass;
     unsigned gpmu_image_dwords;
+    Qcom8998CommandStream streams[ADRENO_CP_STREAMS];
+    unsigned stream_count;
 };
 
 static void qcom8998_mdss_update_irq(Qcom8998Bank *bank)
@@ -1002,6 +1041,28 @@ static bool qcom8998_cp_register_write(Qcom8998Display *s, unsigned reg,
     return true;
 }
 
+static bool qcom8998_cp_stored_register(unsigned reg)
+{
+    if ((reg >= ADRENO_GPMU_INST_RAM_BASE &&
+         reg < ADRENO_GPMU_DATA_RAM_BASE) ||
+        (reg >= ADRENO_CONTEXT_REG_BASE && reg < ADRENO_CONTEXT_REG_END)) {
+        return true;
+    }
+    switch (reg) {
+    case ADRENO_RB_MODE_CNTL:
+    case ADRENO_RB_CCU_CNTL:
+    case ADRENO_PC_MODE_CNTL:
+    case ADRENO_HLSQ_MODE_CNTL:
+    case ADRENO_VFD_MODE_CNTL:
+    case ADRENO_VPC_DBG_ECO_CNTL:
+    case ADRENO_SP_MODE_CNTL:
+    case ADRENO_TPL1_MODE_CNTL:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static bool qcom8998_cp_type4(Qcom8998Display *s, uint32_t header,
                              unsigned count, uint64_t base, unsigned mask,
                              unsigned rptr)
@@ -1010,26 +1071,28 @@ static bool qcom8998_cp_type4(Qcom8998Display *s, uint32_t header,
     unsigned reg = extract32(header, 8, 18);
 
     /*
-     * Type 4 currently loads the GPMU's instruction RAM. Other GPU
-     * registers can have side effects and are kept outside this window.
+     * Type 4 can stage instruction RAM and 3D configuration. Latching
+     * context state does not execute a draw or complete a rendering fence.
+     * Control, status and other side-effectful registers remain excluded.
      */
     if (!s->me_initialized || !count || (header & ADRENO_PM4_TYPE4_RESERVED) ||
         !(ctpop32(extract32(header, 0, 8)) & 1) ||
         !(ctpop32(extract32(header, 8, 20)) & 1) ||
-        reg < ADRENO_GPMU_INST_RAM_BASE ||
-        reg + count > ADRENO_GPMU_DATA_RAM_BASE ||
         !qcom8998_cp_register_write(s, reg, count)) {
         return false;
     }
     for (unsigned i = 0; i < count; i++) {
-        if (!qcom8998_cp_word(s, base + (((rptr + 1 + i) & mask) * 4),
+        if (!qcom8998_cp_stored_register(reg + i) ||
+            !qcom8998_cp_word(s, base + (((rptr + 1 + i) & mask) * 4),
                               &payload[i], false)) {
             return false;
         }
     }
     memcpy(&s->bank[BANK_ADRENO].regs[reg], payload,
            count * sizeof(payload[0]));
-    if (reg <= ADRENO_GPMU_INST_RAM_BASE + s->gpmu_image_dwords) {
+    if (reg >= ADRENO_GPMU_INST_RAM_BASE &&
+        reg < ADRENO_GPMU_DATA_RAM_BASE &&
+        reg <= ADRENO_GPMU_INST_RAM_BASE + s->gpmu_image_dwords) {
         s->gpmu_image_dwords = MAX(s->gpmu_image_dwords,
                                  reg + count - ADRENO_GPMU_INST_RAM_BASE);
     }
@@ -1058,7 +1121,7 @@ static bool qcom8998_cp_mem_write(Qcom8998Display *s, unsigned count,
     }
 
     /*
-     * count is bounded by the published ring before entering this function.
+     * count is bounded by the current command stream before entering here.
      * Stage the payload and validate every destination before modifying RAM,
      * including when the source and destination alias or cross a page.
      */
@@ -1153,6 +1216,42 @@ static bool qcom8998_cp_type7(Qcom8998Display *s, uint32_t header,
         }
     }
     switch (opcode) {
+    case ADRENO_PM4_DRAW_PRED_ENABLE_GLOBAL:
+    case ADRENO_PM4_DRAW_PRED_ENABLE_LOCAL:
+        if (!s->me_initialized || count != 1 || payload[0] > 1) {
+            return false;
+        }
+        if (opcode == ADRENO_PM4_DRAW_PRED_ENABLE_GLOBAL) {
+            s->draw_predicate_global = payload[0];
+            if (payload[0]) {
+                s->draw_predicate_local = true;
+                s->draw_predicate_pass = true;
+            }
+        } else {
+            s->draw_predicate_local = payload[0];
+        }
+        /* Draws and predicate-setting packets remain unsupported. */
+        return true;
+    case ADRENO_PM4_INDIRECT_BUFFER:
+        {
+            uint64_t address;
+
+            if (!s->me_initialized || count != 3 ||
+                s->stream_count == ADRENO_CP_STREAMS ||
+                (payload[2] & ~ADRENO_CP_IB_SIZE_MASK)) {
+                return false;
+            }
+            address = deposit64(payload[0], 32, 32, payload[1]);
+            if ((address & 3) || address > UINT64_MAX - payload[2] * 4) {
+                return false;
+            }
+            s->streams[s->stream_count++] = (Qcom8998CommandStream) {
+                .base = address,
+                .end = payload[2],
+                .parent_words = count + 1,
+            };
+            return true;
+        }
     case ADRENO_PM4_SET_PROTECTED_MODE:
         if (!s->me_initialized || count != 1 || payload[0] > 1) {
             return false;
@@ -1188,7 +1287,7 @@ static bool qcom8998_cp_type7(Qcom8998Display *s, uint32_t header,
     case ADRENO_PM4_ME_INIT:
         /*
          * Enable contexts and error detection with header dumping off.
-         * The probe implements one command stream; it cannot dump headers.
+         * The probe implements one ring; it cannot dump headers.
          */
         if (count != 4 ||
             payload[0] != (ADRENO_ME_INIT_CONTEXTS |
@@ -1200,11 +1299,68 @@ static bool qcom8998_cp_type7(Qcom8998Display *s, uint32_t header,
         s->me_initialized = true;
         return true;
     case ADRENO_PM4_PREEMPT_ENABLE_GLOBAL:
+    case ADRENO_PM4_PREEMPT_ENABLE_LOCAL:
     case ADRENO_PM4_SET_SECURE_MODE:
         /* No preemptible or secure GPU contexts are exposed. */
         return s->me_initialized && count == 1 && payload[0] == 0;
     default:
         return false;
+    }
+}
+
+static void qcom8998_cp_ib_status(Qcom8998Display *s)
+{
+    uint32_t *regs = s->bank[BANK_ADRENO].regs;
+
+    for (unsigned i = 1; i < ADRENO_CP_STREAMS; i++) {
+        uint64_t address = 0;
+        unsigned words = 0;
+        hwaddr offset = (i - 1) * ADRENO_CP_IB_REGISTER_STRIDE;
+
+        if (i < s->stream_count) {
+            const Qcom8998CommandStream *stream = &s->streams[i];
+
+            address = stream->base + stream->position * 4;
+            words = stream->end - stream->position;
+        }
+        regs[(ADRENO_CP_IB1_BASE + offset) / 4] = address;
+        regs[(ADRENO_CP_IB1_BASE + offset) / 4 + 1] = address >> 32;
+        regs[(ADRENO_CP_IB1_BUFSZ + offset) / 4] = words;
+    }
+}
+
+static void qcom8998_cp_abort(Qcom8998Display *s)
+{
+    timer_del(&s->cp_resume);
+    s->stream_count = 0;
+    memset(s->streams, 0, sizeof(s->streams));
+    qcom8998_cp_ib_status(s);
+}
+
+static void qcom8998_cp_advance(Qcom8998Display *s, unsigned words,
+                               unsigned ring_mask)
+{
+    Qcom8998CommandStream *stream = &s->streams[s->stream_count - 1];
+
+    stream->position += words;
+    if (s->stream_count == 1) {
+        stream->position &= ring_mask;
+        s->bank[BANK_ADRENO].regs[ADRENO_CP_RB_RPTR / 4] = stream->position;
+    }
+    qcom8998_cp_ib_status(s);
+}
+
+static void qcom8998_cp_trace(Qcom8998Display *s, unsigned depth,
+                             uint32_t header,
+                             const char *result)
+{
+    const Qcom8998CommandStream *stream = &s->streams[depth - 1];
+
+    if (depth == 1) {
+        trace_qcom8998_cp_packet(stream->position, stream->end, header, result);
+    } else {
+        trace_qcom8998_cp_ib(depth - 1, stream->base,
+                            stream->position, stream->end, header, result);
     }
 }
 
@@ -1218,7 +1374,9 @@ static void qcom8998_cp_run(Qcom8998Bank *bank)
     unsigned wptr = regs[ADRENO_CP_RB_WPTR / 4];
     uint64_t base = qcom8998_reg_pair(regs, ADRENO_CP_RB_BASE);
     unsigned mask;
+    unsigned work_words = 0;
 
+    timer_del(&s->cp_resume);
     if (size > ADRENO_CP_RB_MAX_SIZE_LOG2_QWORDS ||
         (cntl & ADRENO_CP_RB_SWAP_MASK) ||
         regs[ADRENO_CP_PFP_ME_CNTL / 4]) {
@@ -1229,48 +1387,100 @@ static void qcom8998_cp_run(Qcom8998Bank *bank)
     if (rptr > mask || wptr > mask || !base || base > UINT64_MAX - mask * 4) {
         return;
     }
-    while (rptr != wptr) {
+    if (!s->stream_count) {
+        s->streams[0] = (Qcom8998CommandStream) {
+            .base = base,
+            .position = rptr,
+        };
+        s->stream_count = 1;
+    }
+    s->streams[0].end = wptr;
+    for (unsigned budget = 0; budget < ADRENO_CP_PACKET_BUDGET; budget++) {
+        Qcom8998CommandStream *stream = &s->streams[s->stream_count - 1];
+        unsigned stream_mask = s->stream_count == 1 ? mask : UINT_MAX;
+        unsigned available = (stream->end - stream->position) & stream_mask;
+        unsigned depth = s->stream_count;
         uint32_t header = 0;
         unsigned count = 0;
         unsigned skip = 0;
         bool executed = false;
 
-        if (!qcom8998_cp_word(s, base + rptr * 4, &header, false)) {
-            trace_qcom8998_cp_packet(rptr, wptr, header, "ring DMA fault");
-            break;
+        if (!available) {
+            unsigned parent_words = stream->parent_words;
+
+            if (--s->stream_count == 0) {
+                break;
+            }
+            /* Advance the caller only after its entire child has finished. */
+            qcom8998_cp_advance(s, parent_words, mask);
+            continue;
+        }
+        if (!qcom8998_cp_word(s, stream->base + stream->position * 4,
+                              &header, false)) {
+            qcom8998_cp_trace(s, depth, header, "command DMA fault");
+            goto publish;
         }
         switch (header & ADRENO_PM4_TYPE_MASK) {
         case ADRENO_PM4_TYPE4:
             count = extract32(header, 0, 7);
-            if (count < ((wptr - rptr) & mask)) {
-                executed = qcom8998_cp_type4(s, header, count, base, mask, rptr);
+            if (count < available) {
+                if (count + 1 > ADRENO_CP_WORD_BUDGET - work_words) {
+                    goto defer;
+                }
+                work_words += count + 1;
+                executed = qcom8998_cp_type4(s, header, count, stream->base,
+                                            stream_mask, stream->position);
             }
             break;
         case ADRENO_PM4_TYPE7:
             count = extract32(header, 0, 14);
-            if (count < ((wptr - rptr) & mask)) {
-                executed = qcom8998_cp_type7(s, header, count, base, mask, rptr,
-                                            (wptr - rptr) & mask, &skip);
+            if (count < available) {
+                if (count + 1 > ADRENO_CP_WORD_BUDGET - work_words) {
+                    goto defer;
+                }
+                work_words += count + 1;
+                executed = qcom8998_cp_type7(s, header, count, stream->base,
+                                            stream_mask, stream->position,
+                                            available, &skip);
             }
             break;
         default:
             break;
         }
         if (!executed) {
-            trace_qcom8998_cp_packet(rptr, wptr, header, "not executed");
-            break;
+            qcom8998_cp_trace(s, depth, header, "not executed");
+            goto publish;
         }
-        trace_qcom8998_cp_packet(rptr, wptr, header, "executed");
-        rptr = (rptr + count + 1 + skip) & mask;
-        regs[ADRENO_CP_RB_RPTR / 4] = rptr;
+        if (s->stream_count != depth) {
+            /* The parent remains pending while IB1/IB2 executes. */
+            qcom8998_cp_trace(s, depth, header, "IB dispatched");
+            qcom8998_cp_ib_status(s);
+            continue;
+        }
+        qcom8998_cp_trace(s, depth, header, "executed");
+        qcom8998_cp_advance(s, count + 1 + skip, mask);
     }
+defer:
+    if (s->stream_count) {
+        timer_mod(&s->cp_resume, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                   ADRENO_CP_DISPATCH_DELAY_NS);
+    }
+publish:
     if (!(cntl & ADRENO_CP_RB_NO_UPDATE)) {
         uint64_t shadow = qcom8998_reg_pair(regs, ADRENO_CP_RB_RPTR_ADDR);
 
+        rptr = regs[ADRENO_CP_RB_RPTR / 4];
         if (shadow && !qcom8998_cp_word(s, shadow, &rptr, true)) {
             trace_qcom8998_cp_packet(rptr, wptr, 0, "pointer DMA fault");
         }
     }
+}
+
+static void qcom8998_cp_resume(void *opaque)
+{
+    Qcom8998Display *s = opaque;
+
+    qcom8998_cp_run(&s->bank[BANK_ADRENO]);
 }
 
 static uint64_t qcom8998_read(void *opaque, hwaddr offset, unsigned size)
@@ -1351,6 +1561,11 @@ static void qcom8998_write(void *opaque, hwaddr offset, uint64_t value,
         qcom8998_adreno_power_write(bank, offset, value)) {
         return;
     }
+    if (bank->index == BANK_ADRENO &&
+        (offset == ADRENO_CP_RB_BASE || offset == ADRENO_CP_RB_BASE + 4 ||
+         offset == ADRENO_CP_RB_CNTL || offset == ADRENO_CP_RB_RPTR)) {
+        qcom8998_cp_abort(bank->display);
+    }
     bank->regs[offset / sizeof(uint32_t)] = value;
     if (bank->index == BANK_ADRENO &&
         (offset == ADRENO_CP_RB_WPTR || offset == ADRENO_CP_PFP_ME_CNTL)) {
@@ -1422,6 +1637,7 @@ static void qcom8998_reset(DeviceState *dev)
     Qcom8998Display *s = QCOM8998_DISPLAY(dev);
 
     timer_del(&s->mdss_vsync);
+    qcom8998_cp_abort(s);
     memset(s->transfer, 0, sizeof(s->transfer));
     for (unsigned panel = 0; panel < MDSS_DSI_COUNT; panel++) {
         if (s->panel[panel]) {
@@ -1471,6 +1687,9 @@ static void qcom8998_reset(DeviceState *dev)
                        SMMU_ADRENO_CONTEXTS);
     s->me_initialized = false;
     s->register_protection = true;
+    s->draw_predicate_global = false;
+    s->draw_predicate_local = false;
+    s->draw_predicate_pass = true;
     s->gpmu_image_dwords = 0;
     s->bank[BANK_ADRENO].regs[ADRENO_GPMU_CM3_SYSRESET / 4] =
         ADRENO_GPMU_RESET_ASSERT;
@@ -1483,6 +1702,7 @@ static void qcom8998_init(Object *obj)
     SysBusDevice *bus = SYS_BUS_DEVICE(obj);
 
     timer_init_ns(&s->mdss_vsync, QEMU_CLOCK_VIRTUAL, qcom8998_mdss_vsync, s);
+    timer_init_ns(&s->cp_resume, QEMU_CLOCK_VIRTUAL, qcom8998_cp_resume, s);
     for (unsigned i = 0; i < BANK_COUNT; i++) {
         Qcom8998Bank *bank = &s->bank[i];
         g_autofree char *name = g_strdup_printf("qcom8998.%s", banks[i].name);
@@ -1505,6 +1725,8 @@ static void qcom8998_finalize(Object *obj)
 
     timer_del(&s->mdss_vsync);
     timer_deinit(&s->mdss_vsync);
+    timer_del(&s->cp_resume);
+    timer_deinit(&s->cp_resume);
     for (unsigned i = 0; i < BANK_COUNT; i++) {
         g_free(s->bank[i].regs);
     }
