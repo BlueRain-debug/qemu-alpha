@@ -21,6 +21,7 @@ qcom8998_mmio_write(const char *bank, uint64_t offset, uint32_t value, uint64_t 
 qcom8998_cp_packet(unsigned rptr, unsigned wptr, uint32_t header, const char *result) "rptr=0x%x wptr=0x%x header=0x%08x %s"
 qcom8998_cp_ib(unsigned level, uint64_t base, unsigned rptr, unsigned words, uint32_t header, const char *result) "level=%u base=0x%"PRIx64" rptr=0x%x words=0x%x header=0x%08x %s"
 qcom8998_cp_draw_state(unsigned group, uint32_t control, uint64_t address) "group=%u control=0x%08x address=0x%"PRIx64
+qcom8998_cp_load_state(unsigned block, unsigned type, unsigned destination, unsigned units, unsigned unit_words, uint64_t address, uint32_t first, uint32_t last) "block=%u type=%u destination=%u units=%u unit_words=%u address=0x%"PRIx64" first=0x%08x last=0x%08x"
 qcom8998_ccu_clear(unsigned target, uint64_t base, unsigned x, unsigned y, unsigned width, unsigned height, uint32_t color) "target=%u base=0x%"PRIx64" rect=%u,%u %ux%u color=0x%08x"
 qcom8998_gpmu_reset(uint32_t value, unsigned dwords, uint32_t entry, unsigned bytes, bool ready) "value=0x%x image=%u dwords entry=0x%x mailbox=%u bytes ready=%d"
 qcom8998_mdss_transfer_done(unsigned ctl, unsigned panel, unsigned width, unsigned height, uint32_t color) "ctl=%u panel=%u %ux%u border=0x%06x"

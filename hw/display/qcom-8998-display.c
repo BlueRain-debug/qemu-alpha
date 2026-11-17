@@ -146,6 +146,17 @@ static const struct {
 #define DSI_IRQ_ENABLE (DSI_IRQ_STATUS << 1)
 #define DSI_RESET 0x118
 #define ADRENO_RBBM_HW_CONFIGURATION 0x8
+#define ADRENO_RBBM_INT_CLEAR_CMD (0x37 * 4)
+#define ADRENO_RBBM_INT_0_MASK (0x38 * 4)
+#define ADRENO_RBBM_INT_0_STATUS (0x4e1 * 4)
+#define ADRENO_IRQ_CP_IB2 BIT(13)
+#define ADRENO_IRQ_CP_IB1 BIT(14)
+#define ADRENO_IRQ_CP_RB BIT(15)
+/* CP_INTERRUPT uses bits 29..31 for IB2/IB1/RB, unlike RBBM status. */
+#define ADRENO_CP_INTERRUPT_SHIFT 16
+#define ADRENO_CP_INTERRUPT_MASK ((ADRENO_IRQ_CP_IB2 | ADRENO_IRQ_CP_IB1 | \
+                                   ADRENO_IRQ_CP_RB) << \
+                                  ADRENO_CP_INTERRUPT_SHIFT)
 /*
  * The native A5xx miniport decodes bits [23:16] as the silicon identifier:
  * 0x31 selects Adreno 540 (device 540), with stepping 2 in the low nibble.
@@ -195,8 +206,10 @@ static const struct {
 #define ADRENO_PM4_DRAW_PRED_ENABLE_GLOBAL 0x19
 #define ADRENO_PM4_DRAW_PRED_ENABLE_LOCAL 0x1a
 #define ADRENO_PM4_WAIT_FOR_IDLE 0x26
+#define ADRENO_PM4_LOAD_STATE4 0x30
 #define ADRENO_PM4_MEM_WRITE 0x3d
 #define ADRENO_PM4_INDIRECT_BUFFER 0x3f
+#define ADRENO_PM4_INTERRUPT 0x40
 #define ADRENO_PM4_SET_DRAW_STATE 0x43
 #define ADRENO_PM4_COND_EXEC 0x44
 #define ADRENO_PM4_EVENT_WRITE 0x46
@@ -206,6 +219,8 @@ static const struct {
 #define ADRENO_PM4_SET_SECURE_MODE 0x66
 #define ADRENO_PM4_PREEMPT_ENABLE_GLOBAL 0x69
 #define ADRENO_PM4_PREEMPT_ENABLE_LOCAL 0x6a
+#define ADRENO_PM4_SET_RENDER_MODE 0x6c
+#define ADRENO_RENDER_BYPASS 1
 /* Global configuration words, in the PM4 register index space. */
 #define ADRENO_RB_MODE_CNTL 0xcc6
 #define ADRENO_RB_CCU_CNTL 0xcc7
@@ -220,6 +235,17 @@ static const struct {
 #define ADRENO_CONTEXT_REG_END 0xe800
 /* A5xx draw-state group IDs occupy bits 24..28 of each control word. */
 #define ADRENO_CP_DRAW_GROUPS 32
+/*
+ * Bounded software state stores, not an advertised hardware capacity.
+ * A5xx shader units contain 16 64-bit instructions. Constant vectors and
+ * samplers use four dwords; texture descriptors use twelve dwords.
+ */
+#define ADRENO_LOAD_BLOCKS 14
+#define ADRENO_LOAD_TYPES 2
+#define ADRENO_LOAD_MAX_UNITS 1024
+#define ADRENO_LOAD_MAX_WORDS 32
+#define ADRENO_LOAD_SOURCE_DIRECT 0
+#define ADRENO_LOAD_SOURCE_INDIRECT 2
 #define ADRENO_DRAW_STATE_COUNT_MASK 0xffff
 #define ADRENO_DRAW_STATE_DIRTY BIT(16)
 #define ADRENO_DRAW_STATE_DISABLE BIT(17)
@@ -430,6 +456,11 @@ typedef struct Qcom8998DrawState {
     uint32_t control;
 } Qcom8998DrawState;
 
+typedef struct Qcom8998StateUnit {
+    uint32_t words[ADRENO_LOAD_MAX_WORDS];
+    bool valid;
+} Qcom8998StateUnit;
+
 typedef struct Qcom8998ClearSpan {
     hwaddr address;
     unsigned length;
@@ -454,7 +485,17 @@ struct Qcom8998Display {
     Qcom8998CommandStream streams[ADRENO_CP_STREAMS];
     unsigned stream_count;
     Qcom8998DrawState draw_state[ADRENO_CP_DRAW_GROUPS];
+    GArray *load_state[ADRENO_LOAD_BLOCKS][ADRENO_LOAD_TYPES];
+    uint32_t render_mode[5];
 };
+
+static void qcom8998_adreno_update_irq(Qcom8998Display *s)
+{
+    const uint32_t *regs = s->bank[BANK_ADRENO].regs;
+
+    qemu_set_irq(s->irq[1], regs[ADRENO_RBBM_INT_0_STATUS / 4] &
+                            regs[ADRENO_RBBM_INT_0_MASK / 4]);
+}
 
 static void qcom8998_mdss_update_irq(Qcom8998Bank *bank)
 {
@@ -1465,6 +1506,89 @@ static bool qcom8998_cp_draw_state(Qcom8998Display *s, unsigned count,
     return true;
 }
 
+static bool qcom8998_cp_load_state(Qcom8998Display *s, unsigned count,
+                                  uint64_t base, unsigned mask, unsigned rptr)
+{
+    uint32_t header[3];
+    unsigned block, type, source, destination, units, unit_words, words;
+    uint64_t address;
+    g_autofree uint32_t *pending = NULL;
+    GArray *state;
+
+    if (!s->me_initialized || count < ARRAY_SIZE(header)) {
+        return false;
+    }
+    for (unsigned i = 0; i < ARRAY_SIZE(header); i++) {
+        if (!qcom8998_cp_word(s, base + (((rptr + 1 + i) & mask) * 4),
+                              &header[i], false)) {
+            return false;
+        }
+    }
+    destination = extract32(header[0], 0, 14);
+    source = extract32(header[0], 16, 2);
+    block = extract32(header[0], 18, 4);
+    units = extract32(header[0], 22, 10);
+    type = extract32(header[1], 0, 2);
+    address = deposit64(header[1] & ~3U, 32, 32, header[2]);
+    if ((header[0] & (3U << 14)) || type >= ADRENO_LOAD_TYPES || !units ||
+        destination >= ADRENO_LOAD_MAX_UNITS ||
+        units > ADRENO_LOAD_MAX_UNITS - destination) {
+        return false;
+    }
+    if (block <= 5) {
+        unit_words = type == 0 ? 4 : 12;
+    } else if (block >= 8 && block < ADRENO_LOAD_BLOCKS) {
+        unit_words = type == 0 ? ADRENO_LOAD_MAX_WORDS : 4;
+    } else {
+        /* UBO tables, SSBOs and undocumented blocks need their own layout. */
+        return false;
+    }
+    words = units * unit_words;
+    if ((source == ADRENO_LOAD_SOURCE_DIRECT &&
+         (count != ARRAY_SIZE(header) + words || address)) ||
+        (source == ADRENO_LOAD_SOURCE_INDIRECT &&
+         (count != ARRAY_SIZE(header) ||
+          address > UINT64_MAX - words * sizeof(uint32_t))) ||
+        (source != ADRENO_LOAD_SOURCE_DIRECT &&
+         source != ADRENO_LOAD_SOURCE_INDIRECT)) {
+        return false;
+    }
+    pending = g_new(uint32_t, words);
+    for (unsigned i = 0; i < words; i++) {
+        uint64_t input = source == ADRENO_LOAD_SOURCE_DIRECT ?
+            base + (((rptr + 1 + ARRAY_SIZE(header) + i) & mask) * 4) :
+            address + i * sizeof(uint32_t);
+
+        if (!qcom8998_cp_word(s, input, &pending[i], false)) {
+            return false;
+        }
+    }
+    /* A later source fault must leave every previously loaded unit intact. */
+    state = s->load_state[block][type];
+    if (!state) {
+        state = g_array_new(false, true, sizeof(Qcom8998StateUnit));
+        s->load_state[block][type] = state;
+    }
+    if (state->len < destination + units) {
+        g_array_set_size(state, destination + units);
+    }
+    for (unsigned i = 0; i < units; i++) {
+        Qcom8998StateUnit *unit = &g_array_index(state, Qcom8998StateUnit,
+                                                destination + i);
+
+        memcpy(unit->words, pending + i * unit_words,
+               unit_words * sizeof(uint32_t));
+        unit->valid = true;
+    }
+    trace_qcom8998_cp_load_state(block, type, destination, units, unit_words,
+        address,
+        g_array_index(state, Qcom8998StateUnit, destination).words[0],
+        g_array_index(state, Qcom8998StateUnit,
+                      destination + units - 1).words[unit_words - 1]);
+    /* Loading state does not execute a draw or complete its fence. */
+    return true;
+}
+
 static bool qcom8998_ccu_clear(Qcom8998Display *s)
 {
     const uint32_t *regs = s->bank[BANK_ADRENO].regs;
@@ -1637,6 +1761,9 @@ static bool qcom8998_cp_type7(Qcom8998Display *s, uint32_t header,
     if (opcode == ADRENO_PM4_SET_DRAW_STATE) {
         return qcom8998_cp_draw_state(s, count, base, mask, rptr);
     }
+    if (opcode == ADRENO_PM4_LOAD_STATE4) {
+        return qcom8998_cp_load_state(s, count, base, mask, rptr);
+    }
     if (count > ARRAY_SIZE(payload)) {
         return false;
     }
@@ -1647,6 +1774,32 @@ static bool qcom8998_cp_type7(Qcom8998Display *s, uint32_t header,
         }
     }
     switch (opcode) {
+    case ADRENO_PM4_SET_RENDER_MODE:
+        /*
+         * Stage only non-preemptible sysmem mode: a one-word selector or
+         * the native five-word form without a context-save address/GMEM.
+         * Preserve its final control word without assigning it semantics.
+         * Other modes and context-save work must remain pending.
+         */
+        if (!s->me_initialized || (count != 1 && count != 5) ||
+            payload[0] != ADRENO_RENDER_BYPASS ||
+            (count == 5 && (payload[1] || payload[2] || payload[3] ||
+                            payload[4] != 1))) {
+            return false;
+        }
+        memset(s->render_mode, 0, sizeof(s->render_mode));
+        memcpy(s->render_mode, payload, count * sizeof(payload[0]));
+        return true;
+    case ADRENO_PM4_INTERRUPT:
+        if (!s->me_initialized || count != 1 ||
+            (payload[0] & ~ADRENO_CP_INTERRUPT_MASK)) {
+            return false;
+        }
+        /* Only reaching this packet signals completion of earlier work. */
+        s->bank[BANK_ADRENO].regs[ADRENO_RBBM_INT_0_STATUS / 4] |=
+            payload[0] >> ADRENO_CP_INTERRUPT_SHIFT;
+        qcom8998_adreno_update_irq(s);
+        return true;
     case ADRENO_PM4_EVENT_WRITE:
         return qcom8998_cp_event_write(s, count, payload);
     case ADRENO_PM4_DRAW_PRED_ENABLE_GLOBAL:
@@ -2005,7 +2158,8 @@ static void qcom8998_write(void *opaque, hwaddr offset, uint64_t value,
          (offset == MDSS_HW_VERSION || offset == MDSS_MDP_HW_VERSION ||
           offset == MDSS_HW_INTR_STATUS)) ||
         (bank->index == BANK_ADRENO &&
-         offset == ADRENO_RBBM_HW_CONFIGURATION) ||
+         (offset == ADRENO_RBBM_HW_CONFIGURATION ||
+          offset == ADRENO_RBBM_INT_0_STATUS)) ||
         (bank->index == BANK_VIDEO && offset == VENUS_WRAPPER_HW_VERSION)) {
         return;
     }
@@ -2050,6 +2204,17 @@ static void qcom8998_write(void *opaque, hwaddr offset, uint64_t value,
     }
     if (bank->index == BANK_ADRENO &&
         qcom8998_adreno_power_write(bank, offset, value)) {
+        return;
+    }
+    if (bank->index == BANK_ADRENO &&
+        (offset == ADRENO_RBBM_INT_CLEAR_CMD ||
+         offset == ADRENO_RBBM_INT_0_MASK)) {
+        if (offset == ADRENO_RBBM_INT_CLEAR_CMD) {
+            bank->regs[ADRENO_RBBM_INT_0_STATUS / 4] &= ~value;
+        } else {
+            bank->regs[offset / 4] = value;
+        }
+        qcom8998_adreno_update_irq(bank->display);
         return;
     }
     if (bank->index == BANK_ADRENO &&
@@ -2184,10 +2349,19 @@ static void qcom8998_reset(DeviceState *dev)
     s->draw_predicate_local = false;
     s->draw_predicate_pass = true;
     memset(s->draw_state, 0, sizeof(s->draw_state));
+    memset(s->render_mode, 0, sizeof(s->render_mode));
+    for (unsigned block = 0; block < ADRENO_LOAD_BLOCKS; block++) {
+        for (unsigned type = 0; type < ADRENO_LOAD_TYPES; type++) {
+            if (s->load_state[block][type]) {
+                g_array_set_size(s->load_state[block][type], 0);
+            }
+        }
+    }
     s->gpmu_image_dwords = 0;
     s->bank[BANK_ADRENO].regs[ADRENO_GPMU_CM3_SYSRESET / 4] =
         ADRENO_GPMU_RESET_ASSERT;
     qemu_set_irq(s->irq[0], 0);
+    qcom8998_adreno_update_irq(s);
     qcom8998_smmu_update_irq(s);
 }
 
@@ -2222,6 +2396,13 @@ static void qcom8998_finalize(Object *obj)
     timer_deinit(&s->mdss_vsync);
     timer_del(&s->cp_resume);
     timer_deinit(&s->cp_resume);
+    for (unsigned block = 0; block < ADRENO_LOAD_BLOCKS; block++) {
+        for (unsigned type = 0; type < ADRENO_LOAD_TYPES; type++) {
+            if (s->load_state[block][type]) {
+                g_array_unref(s->load_state[block][type]);
+            }
+        }
+    }
     for (unsigned i = 0; i < BANK_COUNT; i++) {
         g_free(s->bank[i].regs);
     }
