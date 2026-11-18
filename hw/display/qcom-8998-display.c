@@ -4,6 +4,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "fpu/softfloat.h"
 #include "qapi/error.h"
 #include "hw/acpi/aml-build.h"
 #include "hw/core/cpu.h"
@@ -148,6 +149,7 @@ static const struct {
 #define ADRENO_RBBM_HW_CONFIGURATION 0x8
 #define ADRENO_RBBM_INT_CLEAR_CMD (0x37 * 4)
 #define ADRENO_RBBM_INT_0_MASK (0x38 * 4)
+#define ADRENO_RBBM_INT_0_MASKED_STATUS (0x4e0 * 4)
 #define ADRENO_RBBM_INT_0_STATUS (0x4e1 * 4)
 #define ADRENO_IRQ_CP_IB2 BIT(13)
 #define ADRENO_IRQ_CP_IB1 BIT(14)
@@ -181,7 +183,9 @@ static const struct {
 #define ADRENO_CP_IB1_BUFSZ (0xb21 * 4)
 #define ADRENO_CP_IB_REGISTER_STRIDE (3 * 4)
 /* The ring may call IB1, which may call IB2. */
-#define ADRENO_CP_STREAMS 3
+#define ADRENO_CP_IB_STREAMS 3
+/* An internal draw-state stream may execute inside IB2. */
+#define ADRENO_CP_STREAMS (ADRENO_CP_IB_STREAMS + 1)
 #define ADRENO_CP_IB_SIZE_MASK 0xfffff
 /* Yield long submissions so a CPU MMIO kick cannot monopolize the main loop. */
 #define ADRENO_CP_PACKET_BUDGET 4096
@@ -205,8 +209,14 @@ static const struct {
 #define ADRENO_PM4_NOP 0x10
 #define ADRENO_PM4_DRAW_PRED_ENABLE_GLOBAL 0x19
 #define ADRENO_PM4_DRAW_PRED_ENABLE_LOCAL 0x1a
+#define ADRENO_PM4_SKIP_IB2_GLOBAL 0x1d
+#define ADRENO_PM4_SKIP_IB2_LOCAL 0x23
+#define ADRENO_PM4_SET_VISIBILITY_OVERRIDE 0x64
+#define ADRENO_PM4_WAIT_FOR_ME 0x13
 #define ADRENO_PM4_WAIT_FOR_IDLE 0x26
 #define ADRENO_PM4_LOAD_STATE4 0x30
+#define ADRENO_PM4_WAIT_REG_MEM 0x3c
+#define ADRENO_PM4_DRAW_INDX_OFFSET 0x38
 #define ADRENO_PM4_MEM_WRITE 0x3d
 #define ADRENO_PM4_INDIRECT_BUFFER 0x3f
 #define ADRENO_PM4_INTERRUPT 0x40
@@ -224,12 +234,20 @@ static const struct {
 /* Global configuration words, in the PM4 register index space. */
 #define ADRENO_RB_MODE_CNTL 0xcc6
 #define ADRENO_RB_CCU_CNTL 0xcc7
+#define ADRENO_UNKNOWN_0C82 0xc82
 #define ADRENO_PC_MODE_CNTL 0xd02
+#define ADRENO_PC_TESSFACTOR_ADDR_LO 0xd08
+#define ADRENO_PC_TESSFACTOR_ADDR_HI 0xd09
+#define ADRENO_HLSQ_TIMEOUT_THRESHOLD_0 0xe00
+#define ADRENO_HLSQ_TIMEOUT_THRESHOLD_1 0xe01
 #define ADRENO_HLSQ_MODE_CNTL 0xe06
 #define ADRENO_VFD_MODE_CNTL 0xe42
 #define ADRENO_VPC_DBG_ECO_CNTL 0xe60
+#define ADRENO_VPC_MODE_CNTL 0xe62
 #define ADRENO_SP_MODE_CNTL 0xec2
 #define ADRENO_TPL1_MODE_CNTL 0xf02
+#define ADRENO_UCHE_INVALIDATE_MIN 0xe91
+#define ADRENO_UCHE_INVALIDATE 0xe95
 /* GRAS/RB/PC/VFD/VPC/SP/TPL1/HLSQ context configuration. */
 #define ADRENO_CONTEXT_REG_BASE 0xe000
 #define ADRENO_CONTEXT_REG_END 0xe800
@@ -241,11 +259,14 @@ static const struct {
  * samplers use four dwords; texture descriptors use twelve dwords.
  */
 #define ADRENO_LOAD_BLOCKS 14
-#define ADRENO_LOAD_TYPES 2
+#define ADRENO_LOAD_TYPES 3
 #define ADRENO_LOAD_MAX_UNITS 1024
 #define ADRENO_LOAD_MAX_WORDS 32
 #define ADRENO_LOAD_SOURCE_DIRECT 0
 #define ADRENO_LOAD_SOURCE_INDIRECT 2
+#define ADRENO_LOAD_SOURCE_UBO 3
+#define ADRENO_UBO_STAGE_STRIDE 20
+#define ADRENO_UBO_STAGE_SLOTS 16
 #define ADRENO_DRAW_STATE_COUNT_MASK 0xffff
 #define ADRENO_DRAW_STATE_DIRTY BIT(16)
 #define ADRENO_DRAW_STATE_DISABLE BIT(17)
@@ -264,16 +285,21 @@ static const struct {
 #define ADRENO_EVENT_CCU_FLUSH_DEPTH_TS 0x1c
 #define ADRENO_EVENT_CCU_FLUSH_COLOR_TS 0x1d
 #define ADRENO_EVENT_CCU_RESOLVE 0x1e
+#define ADRENO_EVENT_LRZ_FLUSH_INVALIDATE 0x26
 /* PM4 register indices for the fast-clear path. */
 #define ADRENO_RB_CNTL 0xe140
 #define ADRENO_RB_RENDER_CNTL 0xe141
-#define ADRENO_RB_DEST_MSAA_CNTL 0xe142
+#define ADRENO_RB_RAS_MSAA_CNTL 0xe142
+#define ADRENO_RB_DEST_MSAA_CNTL 0xe143
 #define ADRENO_RB_MRT_BUF_INFO 0xe152
 #define ADRENO_RB_MRT_STRIDE 7
 #define ADRENO_RB_BLIT_CNTL 0xe210
 #define ADRENO_RB_RESOLVE_MIN 0xe211
 #define ADRENO_RB_RESOLVE_MAX 0xe212
 #define ADRENO_RB_RESOLVE_CNTL 0xe213
+#define ADRENO_RB_BLIT_DST 0xe214
+#define ADRENO_RB_BLIT_DST_PITCH 0xe216
+#define ADRENO_RB_BLIT_DST_ARRAY_PITCH 0xe217
 #define ADRENO_RB_CLEAR_COLOR 0xe218
 #define ADRENO_RB_CLEAR_CNTL 0xe21c
 #define ADRENO_RB_BYPASS BIT(17)
@@ -283,6 +309,8 @@ static const struct {
 #define ADRENO_RB_COLOR_SWAP_MASK (3U << 13)
 /* Limit synchronous clear work, including its preflight span allocation. */
 #define ADRENO_CLEAR_MAX_BYTES (64U << 20)
+/* A540 has 1 MiB of private, on-chip graphics memory. */
+#define ADRENO_GMEM_SIZE (1U << 20)
 #define ADRENO_ME_INIT_CONTEXTS BIT(0)
 #define ADRENO_ME_INIT_ERROR_DETECTION BIT(1)
 #define ADRENO_ME_INIT_HEADER_DUMP BIT(3)
@@ -391,6 +419,9 @@ static const struct {
 #define SMMU_CB_TTBR1 0x28
 #define SMMU_CB_TCR 0x30
 #define SMMU_CB_CONTEXTIDR 0x34
+#define SMMU_CB_TLBIALL 0x618
+#define SMMU_CB_TLBSYNC 0x7f0
+#define SMMU_CB_TLBSTATUS 0x7f4
 #define SMMU_CB_FSR 0x58
 #define SMMU_CB_FSRRESTORE 0x5c
 #define SMMU_CB_FAR 0x60
@@ -449,11 +480,13 @@ typedef struct Qcom8998CommandStream {
     unsigned position;
     unsigned end;
     unsigned parent_words;
+    unsigned state_group; /* Group + 1, or zero for ring/ordinary IB. */
 } Qcom8998CommandStream;
 
 typedef struct Qcom8998DrawState {
     uint64_t address;
     uint32_t control;
+    bool dirty;
 } Qcom8998DrawState;
 
 typedef struct Qcom8998StateUnit {
@@ -466,6 +499,12 @@ typedef struct Qcom8998ClearSpan {
     unsigned length;
 } Qcom8998ClearSpan;
 
+typedef struct Qcom8998GmemSpan {
+    hwaddr address;
+    unsigned offset;
+    unsigned length;
+} Qcom8998GmemSpan;
+
 struct Qcom8998Display {
     SysBusDevice parent_obj;
     Qcom8998Bank bank[BANK_COUNT];
@@ -473,6 +512,7 @@ struct Qcom8998Display {
     qemu_irq irq[6];
     QEMUTimer mdss_vsync;
     QEMUTimer cp_resume;
+    bool cp_wait_pending;
     QemuConsole *panel[MDSS_DSI_COUNT];
     Qcom8998MdpTransfer transfer[MDSS_CTL_COUNT];
     bool disable_macro_tiled_primary;
@@ -481,20 +521,25 @@ struct Qcom8998Display {
     bool draw_predicate_global;
     bool draw_predicate_local;
     bool draw_predicate_pass;
+    bool visibility_override;
+    bool skip_ib2_global;
+    bool skip_ib2_local;
     unsigned gpmu_image_dwords;
     Qcom8998CommandStream streams[ADRENO_CP_STREAMS];
     unsigned stream_count;
     Qcom8998DrawState draw_state[ADRENO_CP_DRAW_GROUPS];
     GArray *load_state[ADRENO_LOAD_BLOCKS][ADRENO_LOAD_TYPES];
+    uint64_t shader_address[ADRENO_LOAD_BLOCKS];
     uint32_t render_mode[5];
+    uint32_t *gmem;
 };
 
 static void qcom8998_adreno_update_irq(Qcom8998Display *s)
 {
     const uint32_t *regs = s->bank[BANK_ADRENO].regs;
 
-    qemu_set_irq(s->irq[1], regs[ADRENO_RBBM_INT_0_STATUS / 4] &
-                            regs[ADRENO_RBBM_INT_0_MASK / 4]);
+    qemu_set_irq(s->irq[1], (regs[ADRENO_RBBM_INT_0_STATUS / 4] &
+                             regs[ADRENO_RBBM_INT_0_MASK / 4]) != 0);
 }
 
 static void qcom8998_mdss_update_irq(Qcom8998Bank *bank)
@@ -1309,20 +1354,44 @@ static bool qcom8998_cp_register_write(Qcom8998Display *s, unsigned reg,
     return true;
 }
 
+/* CP register indices also address the adjacent, separately owned SMMU. */
+static bool qcom8998_cp_tlb_register(unsigned reg, bool write)
+{
+    const hwaddr first = banks[BANK_ADRENO_SMMU].base -
+                         banks[BANK_ADRENO].base + SMMU_ADRENO_CONTEXT_BASE;
+    hwaddr offset = (hwaddr)reg * sizeof(uint32_t);
+
+    if (offset < first || offset >= first +
+        SMMU_ADRENO_CONTEXTS * SMMU_CONTEXT_STRIDE) {
+        return false;
+    }
+    offset = (offset - first) % SMMU_CONTEXT_STRIDE;
+    return write ? offset == SMMU_CB_TLBIALL || offset == SMMU_CB_TLBSYNC :
+                   offset == SMMU_CB_TLBSTATUS;
+}
+
 static bool qcom8998_cp_stored_register(unsigned reg)
 {
     if ((reg >= ADRENO_GPMU_INST_RAM_BASE &&
          reg < ADRENO_GPMU_DATA_RAM_BASE) ||
-        (reg >= ADRENO_CONTEXT_REG_BASE && reg < ADRENO_CONTEXT_REG_END)) {
+        (reg >= ADRENO_CONTEXT_REG_BASE && reg < ADRENO_CONTEXT_REG_END) ||
+        (reg >= ADRENO_UCHE_INVALIDATE_MIN &&
+         reg <= ADRENO_UCHE_INVALIDATE)) {
         return true;
     }
     switch (reg) {
     case ADRENO_RB_MODE_CNTL:
     case ADRENO_RB_CCU_CNTL:
+    case ADRENO_UNKNOWN_0C82:
     case ADRENO_PC_MODE_CNTL:
+    case ADRENO_PC_TESSFACTOR_ADDR_LO:
+    case ADRENO_PC_TESSFACTOR_ADDR_HI:
+    case ADRENO_HLSQ_TIMEOUT_THRESHOLD_0:
+    case ADRENO_HLSQ_TIMEOUT_THRESHOLD_1:
     case ADRENO_HLSQ_MODE_CNTL:
     case ADRENO_VFD_MODE_CNTL:
     case ADRENO_VPC_DBG_ECO_CNTL:
+    case ADRENO_VPC_MODE_CNTL:
     case ADRENO_SP_MODE_CNTL:
     case ADRENO_TPL1_MODE_CNTL:
         return true;
@@ -1341,7 +1410,8 @@ static bool qcom8998_cp_type4(Qcom8998Display *s, uint32_t header,
     /*
      * Type 4 can stage instruction RAM and 3D configuration. Latching
      * context state does not execute a draw or complete a rendering fence.
-     * Control, status and other side-effectful registers remain excluded.
+     * Other controls/status remain excluded, except coherent UCHE handling
+     * explicitly validated below.
      */
     if (!s->me_initialized || !count || (header & ADRENO_PM4_TYPE4_RESERVED) ||
         !(ctpop32(extract32(header, 0, 8)) & 1) ||
@@ -1350,14 +1420,36 @@ static bool qcom8998_cp_type4(Qcom8998Display *s, uint32_t header,
         return false;
     }
     for (unsigned i = 0; i < count; i++) {
-        if (!qcom8998_cp_stored_register(reg + i) ||
+        if ((!qcom8998_cp_stored_register(reg + i) &&
+             !qcom8998_cp_tlb_register(reg + i, true)) ||
             !qcom8998_cp_word(s, base + (((rptr + 1 + i) & mask) * 4),
                               &payload[i], false)) {
             return false;
         }
     }
-    memcpy(&s->bank[BANK_ADRENO].regs[reg], payload,
-           count * sizeof(payload[0]));
+    for (unsigned i = 0; i < count; i++) {
+        if (reg + i == ADRENO_UNKNOWN_0C82 && payload[i]) {
+            return false;
+        }
+        if (reg + i == ADRENO_UCHE_INVALIDATE && payload[i] != 0x12) {
+            return false;
+        }
+    }
+    /*
+     * 0x12 invalidates the entire UCHE. All supported work reads coherent
+     * RAM synchronously, and there is no UCHE or deferred cache writeback.
+     * Range/other cache operations must not be inferred from this case.
+     */
+    for (unsigned i = 0; i < count; i++) {
+        if (!qcom8998_cp_tlb_register(reg + i, true)) {
+            s->bank[BANK_ADRENO].regs[reg + i] = payload[i];
+        }
+        /*
+         * TLBIALL/TLBSYNC complete synchronously: there is no GPU TLB or
+         * outstanding page walk. Never index the Adreno array with an SMMU
+         * register, and never discard fault state or translation tables.
+         */
+    }
     if (reg >= ADRENO_GPMU_INST_RAM_BASE &&
         reg < ADRENO_GPMU_DATA_RAM_BASE &&
         reg <= ADRENO_GPMU_INST_RAM_BASE + s->gpmu_image_dwords) {
@@ -1493,6 +1585,13 @@ static bool qcom8998_cp_draw_state(Qcom8998Display *s, unsigned count,
             if ((control & ADRENO_DRAW_STATE_DISABLE) && (length || address)) {
                 return false;
             }
+            pending[group].dirty = length &&
+                (pending[group].dirty ||
+                 pending[group].address != address ||
+                 (pending[group].control & ADRENO_DRAW_STATE_COUNT_MASK) !=
+                     length ||
+                 (pending[group].control & ADRENO_DRAW_STATE_DISABLE) ||
+                 (control & ADRENO_DRAW_STATE_DIRTY));
             pending[group].address = address;
             pending[group].control = control & ~ADRENO_DRAW_STATE_GROUP_MASK;
         }
@@ -1504,6 +1603,24 @@ static bool qcom8998_cp_draw_state(Qcom8998Display *s, unsigned count,
                                     pending[group].address);
     }
     return true;
+}
+
+static bool qcom8998_cp_dispatch_draw_state(Qcom8998Display *s)
+{
+    for (unsigned i = 0; i < ADRENO_CP_DRAW_GROUPS; i++) {
+        const Qcom8998DrawState *state = &s->draw_state[i];
+
+        if (state->dirty && !(state->control & ADRENO_DRAW_STATE_DISABLE)) {
+            assert(s->stream_count < ADRENO_CP_STREAMS);
+            s->streams[s->stream_count++] = (Qcom8998CommandStream) {
+                .base = state->address,
+                .end = state->control & ADRENO_DRAW_STATE_COUNT_MASK,
+                .state_group = i + 1,
+            };
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool qcom8998_cp_load_state(Qcom8998Display *s, unsigned count,
@@ -1535,22 +1652,58 @@ static bool qcom8998_cp_load_state(Qcom8998Display *s, unsigned count,
         units > ADRENO_LOAD_MAX_UNITS - destination) {
         return false;
     }
-    if (block <= 5) {
-        unit_words = type == 0 ? 4 : 12;
+    if (block == 6 && (type == 1 || type == 2)) {
+        /* Shared UBO auxiliary words / 64-bit addresses, staged only. */
+        unit_words = 2;
+    } else if (block <= 5) {
+        unit_words = type == 0 ? 4 : type == 1 ? 12 : 2;
     } else if (block >= 8 && block < ADRENO_LOAD_BLOCKS) {
-        unit_words = type == 0 ? ADRENO_LOAD_MAX_WORDS : 4;
+        unit_words = type == 0 ? ADRENO_LOAD_MAX_WORDS : type == 1 ? 4 : 2;
     } else {
-        /* UBO tables, SSBOs and undocumented blocks need their own layout. */
+        /* SSBOs and other undocumented blocks need their own layout. */
         return false;
     }
     words = units * unit_words;
+    if (source == ADRENO_LOAD_SOURCE_UBO) {
+        const GArray *table = s->load_state[6][2];
+        const Qcom8998StateUnit *descriptor;
+        unsigned slot = address >> 16;
+        unsigned offset = address & 0xffff;
+        unsigned index;
+        uint64_t buffer;
+
+        /*
+         * QCDX uses source 3 to load graphics constants from the shared UBO
+         * address table. EXT_SRC_ADDR packs slot:16 and byte offset:16.
+         * Keep this path bounded to vec4-aligned, non-bindless constants.
+         * Auxiliary block-6 words remain staged; no shader UBO instruction
+         * or preemption state is inferred from their contents.
+         */
+        if (type != 1 || block < 8 || block > 12 || address >> 32 ||
+            slot >= ADRENO_UBO_STAGE_SLOTS || (offset & 15) || count != 3) {
+            return false;
+        }
+        index = (block - 8) * ADRENO_UBO_STAGE_STRIDE + slot;
+        if (!table || index >= table->len) {
+            return false;
+        }
+        descriptor = &g_array_index(table, Qcom8998StateUnit, index);
+        buffer = deposit64(descriptor->words[0], 32, 32, descriptor->words[1]);
+        if (!descriptor->valid || !buffer || (buffer & 15) ||
+            buffer > UINT64_MAX - offset) {
+            return false;
+        }
+        address = buffer + offset;
+    }
     if ((source == ADRENO_LOAD_SOURCE_DIRECT &&
          (count != ARRAY_SIZE(header) + words || address)) ||
-        (source == ADRENO_LOAD_SOURCE_INDIRECT &&
+        ((source == ADRENO_LOAD_SOURCE_INDIRECT ||
+          source == ADRENO_LOAD_SOURCE_UBO) &&
          (count != ARRAY_SIZE(header) ||
           address > UINT64_MAX - words * sizeof(uint32_t))) ||
         (source != ADRENO_LOAD_SOURCE_DIRECT &&
-         source != ADRENO_LOAD_SOURCE_INDIRECT)) {
+         source != ADRENO_LOAD_SOURCE_INDIRECT &&
+         source != ADRENO_LOAD_SOURCE_UBO)) {
         return false;
     }
     pending = g_new(uint32_t, words);
@@ -1580,6 +1733,9 @@ static bool qcom8998_cp_load_state(Qcom8998Display *s, unsigned count,
                unit_words * sizeof(uint32_t));
         unit->valid = true;
     }
+    if (block >= 8 && type == 0 && !destination) {
+        s->shader_address[block] = address;
+    }
     trace_qcom8998_cp_load_state(block, type, destination, units, unit_words,
         address,
         g_array_index(state, Qcom8998StateUnit, destination).words[0],
@@ -1589,33 +1745,252 @@ static bool qcom8998_cp_load_state(Qcom8998Display *s, unsigned count,
     return true;
 }
 
-static bool qcom8998_ccu_clear(Qcom8998Display *s)
+static uint32_t qcom8998_color_swap(uint32_t color, unsigned swap)
+{
+    static const unsigned channel_order[][4] = {
+        { 0, 1, 2, 3 }, { 2, 1, 0, 3 },
+        { 3, 0, 1, 2 }, { 3, 2, 1, 0 },
+    };
+    uint32_t packed = 0;
+
+    for (unsigned channel = 0; channel < 4; channel++) {
+        packed |= extract32(color, channel_order[swap][channel] * 8, 8) <<
+                  (channel * 8);
+    }
+    return cpu_to_le32(packed);
+}
+
+static uint32_t qcom8998_color_unswap(uint32_t color, unsigned swap)
+{
+    static const unsigned channel_order[][4] = {
+        { 0, 1, 2, 3 }, { 2, 1, 0, 3 },
+        { 3, 0, 1, 2 }, { 3, 2, 1, 0 },
+    };
+    uint32_t result = 0;
+
+    for (unsigned c = 0; c < 4; c++) {
+        result |= extract32(color, c * 8, 8) << (channel_order[swap][c] * 8);
+    }
+    return result;
+}
+
+static bool qcom8998_sysmem_surface(Qcom8998Display *s, unsigned x1,
+                                    unsigned y1, unsigned x2, unsigned y2,
+                                    GArray *spans, uint32_t **pixels)
 {
     const uint32_t *regs = s->bank[BANK_ADRENO].regs;
-    unsigned target = regs[ADRENO_RB_BLIT_CNTL];
-    unsigned minimum = regs[ADRENO_RB_RESOLVE_MIN];
-    unsigned maximum = regs[ADRENO_RB_RESOLVE_MAX];
+    uint64_t base = qcom8998_reg_pair(regs, (ADRENO_RB_MRT_BUF_INFO + 3) * 4);
+    uint64_t pitch = (uint64_t)regs[ADRENO_RB_MRT_BUF_INFO + 1] << 6;
+    unsigned width = x2 - x1;
+    unsigned swap = extract32(regs[ADRENO_RB_MRT_BUF_INFO], 13, 2);
+    uint32_t temporary[(1U << SMMU_4K_SHIFT) / 4];
+
+    if (!width || y1 == y2) {
+        return true;
+    }
+    *pixels = g_new(uint32_t, width * (y2 - y1));
+    for (unsigned y = y1; y < y2; y++) {
+        uint64_t address = base + y * pitch + x1 * 4;
+        unsigned remaining = width * 4;
+        unsigned offset = (y - y1) * width * 4;
+
+        while (remaining) {
+            Qcom8998GmemSpan span;
+            unsigned page_left = (1U << SMMU_4K_SHIFT) -
+                                 extract64(address, 0, SMMU_4K_SHIFT);
+
+            span.length = MIN(remaining, page_left);
+            span.offset = offset;
+            if (!qcom8998_cp_translate(s, address, true, &span.address) ||
+                !qcom8998_ram_buffer(span.address, span.length, true) ||
+                address_space_read(&address_space_memory, span.address,
+                    MEMTXATTRS_UNSPECIFIED, temporary,
+                    span.length) != MEMTX_OK) {
+                return false;
+            }
+            for (unsigned i = 0; i < span.length / 4; i++) {
+                (*pixels)[offset / 4 + i] = qcom8998_color_unswap(
+                    le32_to_cpu(temporary[i]), swap);
+            }
+            g_array_append_val(spans, span);
+            address += span.length;
+            offset += span.length;
+            remaining -= span.length;
+        }
+    }
+    return true;
+}
+
+static bool qcom8998_sysmem_publish(Qcom8998Display *s, const GArray *spans,
+                                    const uint32_t *pixels)
+{
+    const uint32_t *regs = s->bank[BANK_ADRENO].regs;
+    unsigned swap = extract32(regs[ADRENO_RB_MRT_BUF_INFO], 13, 2);
+    uint32_t temporary[(1U << SMMU_4K_SHIFT) / 4];
+
+    for (unsigned i = 0; i < spans->len; i++) {
+        const Qcom8998GmemSpan *span = &g_array_index(spans,
+                                                     Qcom8998GmemSpan, i);
+
+        for (unsigned p = 0; p < span->length / 4; p++) {
+            temporary[p] = qcom8998_color_swap(pixels[span->offset / 4 + p],
+                                               swap);
+        }
+        if (address_space_write(&address_space_memory, span->address,
+            MEMTXATTRS_UNSPECIFIED, temporary, span->length) != MEMTX_OK) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * GMEM is private: keep logical RGBA8 texels rather than expose a guessed
+ * hardware tile swizzle. RB_CNTL defines the bin dimensions; a fast clear
+ * can retain the previous sysmem MRT pitch. RB_WINDOW_OFFSET locates the
+ * bin in framebuffer coordinates. External tiled/UBWC memory is separate.
+ */
+static bool qcom8998_gmem_layout(Qcom8998Display *s, unsigned target,
+                                 unsigned minimum, unsigned maximum,
+                                 unsigned *base, unsigned *width)
+{
+    const uint32_t *regs = s->bank[BANK_ADRENO].regs;
+    unsigned mrt = ADRENO_RB_MRT_BUF_INFO + target * ADRENO_RB_MRT_STRIDE;
+    unsigned height = extract32(regs[ADRENO_RB_CNTL], 9, 8) << 5;
+    unsigned origin = regs[0xe1d0];
+    unsigned ox = origin & 0xffff, oy = origin >> 16;
+    uint64_t offset;
+
+    *width = extract32(regs[ADRENO_RB_CNTL], 0, 8) << 5;
+    if (target >= 8 || !*width || !height ||
+        (regs[ADRENO_RB_CNTL] & ~0x1feffU) ||
+        regs[ADRENO_RB_RAS_MSAA_CNTL] || regs[ADRENO_RB_DEST_MSAA_CNTL] ||
+        ox + *width > 0x10000 || oy + height > 0x10000 ||
+        (minimum & 0xffff) > (maximum & 0xffff) ||
+        (minimum >> 16) > (maximum >> 16) ||
+        (minimum & 0xffff) < ox || (minimum >> 16) < oy ||
+        (maximum & 0xffff) >= ox + *width ||
+        (maximum >> 16) >= oy + height ||
+        (regs[mrt] & ~ADRENO_RB_COLOR_SWAP_MASK) !=
+            (ADRENO_RB_RGBA8_UNORM | (2U << 8)) ||
+        (regs[ADRENO_RB_RENDER_CNTL] & (BIT(16 + target) | BIT(24 + target)))) {
+        return false;
+    }
+    offset = qcom8998_reg_pair(regs, (mrt + 3) * 4);
+    if ((offset & 3) || offset >= ADRENO_GMEM_SIZE ||
+        (uint64_t)*width * height * 4 > ADRENO_GMEM_SIZE - offset) {
+        return false;
+    }
+    *base = offset / 4;
+    return true;
+}
+
+static bool qcom8998_gmem_clear(Qcom8998Display *s, unsigned target,
+                                unsigned minimum, unsigned maximum)
+{
+    const uint32_t *regs = s->bank[BANK_ADRENO].regs;
+    unsigned base, width;
+    unsigned ox = regs[0xe1d0] & 0xffff, oy = regs[0xe1d0] >> 16;
+
+    if (!qcom8998_gmem_layout(s, target, minimum, maximum, &base, &width)) {
+        return false;
+    }
+    for (unsigned y = minimum >> 16; y <= maximum >> 16; y++) {
+        for (unsigned x = minimum & 0xffff; x <= (maximum & 0xffff); x++) {
+            s->gmem[base + (y - oy) * width + x - ox] =
+                regs[ADRENO_RB_CLEAR_COLOR];
+        }
+    }
+    trace_qcom8998_gmem_transfer(true, target, base * 4, 0,
+                                minimum, maximum);
+    return true;
+}
+
+static bool qcom8998_gmem_resolve(Qcom8998Display *s, unsigned target,
+                                  unsigned minimum, unsigned maximum)
+{
+    const uint32_t *regs = s->bank[BANK_ADRENO].regs;
+    unsigned base, width, mrt;
+    unsigned x1 = minimum & 0xffff, y1 = minimum >> 16;
+    unsigned x2 = maximum & 0xffff, y2 = maximum >> 16;
+    unsigned ox = regs[0xe1d0] & 0xffff, oy = regs[0xe1d0] >> 16;
+    uint64_t destination, pitch, layer, last;
+    g_autoptr(GArray) spans = g_array_new(false, false,
+                                        sizeof(Qcom8998GmemSpan));
+    uint32_t pixels[(1U << SMMU_4K_SHIFT) / 4];
+
+    if (!qcom8998_gmem_layout(s, target, minimum, maximum, &base, &width)) {
+        return false;
+    }
+    mrt = ADRENO_RB_MRT_BUF_INFO + target * ADRENO_RB_MRT_STRIDE;
+    destination = qcom8998_reg_pair(regs, ADRENO_RB_BLIT_DST * 4);
+    pitch = (uint64_t)regs[ADRENO_RB_BLIT_DST_PITCH] << 6;
+    layer = (uint64_t)regs[ADRENO_RB_BLIT_DST_ARRAY_PITCH] << 6;
+    last = y2 * pitch + (uint64_t)(x2 + 1) * 4;
+    /* Zero layer stride is valid for a single layer, as used by QCDX. */
+    if ((destination & 3) || pitch < (uint64_t)(x2 + 1) * 4 ||
+        (layer && last > layer) || destination > UINT64_MAX - last) {
+        return false;
+    }
+    for (unsigned y = y1; y <= y2; y++) {
+        uint64_t address = destination + y * pitch + x1 * 4;
+        unsigned offset = (base + (y - oy) * width + x1 - ox) * 4;
+        unsigned remaining = (x2 - x1 + 1) * 4;
+
+        while (remaining) {
+            Qcom8998GmemSpan span;
+            unsigned page_left = (1U << SMMU_4K_SHIFT) -
+                                 extract64(address, 0, SMMU_4K_SHIFT);
+
+            span.length = MIN(remaining, page_left);
+            span.offset = offset;
+            if (!qcom8998_cp_translate(s, address, true, &span.address) ||
+                !qcom8998_ram_buffer(span.address, span.length, true)) {
+                return false;
+            }
+            g_array_append_val(spans, span);
+            address += span.length;
+            offset += span.length;
+            remaining -= span.length;
+        }
+    }
+    /* Preflight the complete destination before publishing any row. */
+    for (unsigned i = 0; i < spans->len; i++) {
+        const Qcom8998GmemSpan *span = &g_array_index(spans,
+                                                     Qcom8998GmemSpan, i);
+
+        for (unsigned p = 0; p < span->length / 4; p++) {
+            pixels[p] = qcom8998_color_swap(s->gmem[span->offset / 4 + p],
+                                             extract32(regs[mrt], 13, 2));
+        }
+        if (address_space_write(&address_space_memory, span->address,
+                                MEMTXATTRS_UNSPECIFIED, pixels,
+                                span->length) != MEMTX_OK) {
+            return false;
+        }
+    }
+    trace_qcom8998_gmem_transfer(false, target, base * 4, destination,
+                                minimum, maximum);
+    return true;
+}
+
+static bool qcom8998_fill_rect(Qcom8998Display *s, unsigned target,
+                                unsigned minimum, unsigned maximum,
+                                uint32_t color)
+{
+    const uint32_t *regs = s->bank[BANK_ADRENO].regs;
     unsigned x1 = extract32(minimum, 0, 16);
     unsigned y1 = extract32(minimum, 16, 16);
     unsigned x2 = extract32(maximum, 0, 16);
     unsigned y2 = extract32(maximum, 16, 16);
     unsigned mrt, width, height, swap;
     uint64_t base, pitch, layer_size, last;
-    uint32_t color = regs[ADRENO_RB_CLEAR_COLOR];
-    uint32_t packed_color = 0;
+    uint32_t packed_color;
     uint32_t pixels[(1U << SMMU_4K_SHIFT) / sizeof(uint32_t)];
     g_autoptr(GArray) spans = g_array_new(false, false,
                                         sizeof(Qcom8998ClearSpan));
-    static const unsigned channel_order[][4] = {
-        { 0, 1, 2, 3 }, { 2, 1, 0, 3 },
-        { 3, 0, 1, 2 }, { 3, 2, 1, 0 },
-    };
 
-    if (target >= 8 || regs[ADRENO_RB_CNTL] != ADRENO_RB_BYPASS ||
-        regs[ADRENO_RB_DEST_MSAA_CNTL] || regs[ADRENO_RB_RESOLVE_CNTL] ||
-        regs[ADRENO_RB_CLEAR_CNTL] !=
-            (ADRENO_RB_FAST_CLEAR | ADRENO_RB_CLEAR_ALL_COMPONENTS) ||
-        x2 < x1 || y2 < y1) {
+    if (target >= 8 || x2 < x1 || y2 < y1) {
         return false;
     }
     mrt = ADRENO_RB_MRT_BUF_INFO + target * ADRENO_RB_MRT_STRIDE;
@@ -1662,12 +2037,9 @@ static bool qcom8998_ccu_clear(Qcom8998Display *s)
     }
     /* CLEAR_COLOR is packed before the MRT's byte-order permutation. */
     swap = extract32(regs[mrt], 13, 2);
-    for (unsigned channel = 0; channel < 4; channel++) {
-        packed_color |= extract32(color, channel_order[swap][channel] * 8, 8) <<
-                        (channel * 8);
-    }
+    packed_color = qcom8998_color_swap(color, swap);
     for (unsigned i = 0; i < ARRAY_SIZE(pixels); i++) {
-        pixels[i] = cpu_to_le32(packed_color);
+        pixels[i] = packed_color;
     }
     for (unsigned i = 0; i < spans->len; i++) {
         const Qcom8998ClearSpan *span = &g_array_index(spans,
@@ -1679,7 +2051,1298 @@ static bool qcom8998_ccu_clear(Qcom8998Display *s)
             return false;
         }
     }
-    trace_qcom8998_ccu_clear(target, base, x1, y1, width, height, color);
+    return true;
+}
+
+static bool qcom8998_ccu_clear(Qcom8998Display *s)
+{
+    const uint32_t *regs = s->bank[BANK_ADRENO].regs;
+    unsigned target = regs[ADRENO_RB_BLIT_CNTL];
+    unsigned minimum = regs[ADRENO_RB_RESOLVE_MIN];
+    unsigned maximum = regs[ADRENO_RB_RESOLVE_MAX];
+
+    if (regs[ADRENO_RB_CNTL] != ADRENO_RB_BYPASS) {
+        if ((regs[ADRENO_RB_RESOLVE_CNTL] == 0 ||
+             regs[ADRENO_RB_RESOLVE_CNTL] == 4) &&
+            regs[ADRENO_RB_CLEAR_CNTL] ==
+                (ADRENO_RB_FAST_CLEAR | ADRENO_RB_CLEAR_ALL_COMPONENTS)) {
+            /* FAST_CLEAR also overrides the previous tile's store direction. */
+            return qcom8998_gmem_clear(s, target, minimum, maximum);
+        }
+        if (regs[ADRENO_RB_RESOLVE_CNTL] == 4 &&
+            !regs[ADRENO_RB_CLEAR_CNTL]) {
+            return qcom8998_gmem_resolve(s, target, minimum, maximum);
+        }
+        return false;
+    }
+    if (regs[ADRENO_RB_RAS_MSAA_CNTL] ||
+        regs[ADRENO_RB_DEST_MSAA_CNTL] || regs[ADRENO_RB_RESOLVE_CNTL] ||
+        regs[ADRENO_RB_CLEAR_CNTL] !=
+            (ADRENO_RB_FAST_CLEAR | ADRENO_RB_CLEAR_ALL_COMPONENTS) ||
+        !qcom8998_fill_rect(s, target, minimum, maximum,
+                            regs[ADRENO_RB_CLEAR_COLOR])) {
+        return false;
+    }
+    trace_qcom8998_ccu_clear(target,
+        qcom8998_reg_pair(regs, (ADRENO_RB_MRT_BUF_INFO +
+                         target * ADRENO_RB_MRT_STRIDE + 3) * 4),
+        minimum & 0xffff, minimum >> 16,
+        (maximum & 0xffff) - (minimum & 0xffff) + 1,
+        (maximum >> 16) - (minimum >> 16) + 1,
+        regs[ADRENO_RB_CLEAR_COLOR]);
+    return true;
+}
+
+/* A bounded, side-effect-free IR3 arithmetic subset. */
+#define ADRENO_SHADER_GPRS 244
+#define ADRENO_SHADER_STEPS 512
+
+typedef struct Qcom8998ShaderRegs {
+    uint32_t full[ADRENO_SHADER_GPRS];
+    uint16_t half[ADRENO_SHADER_GPRS];
+    bool full_valid[ADRENO_SHADER_GPRS];
+    bool half_valid[ADRENO_SHADER_GPRS];
+    int16_t address;
+    bool address_valid;
+    uint32_t input[64];
+    bool input_valid[64];
+    unsigned steps;
+    uint32_t instruction[2];
+} Qcom8998ShaderRegs;
+
+static bool qcom8998_shader_word(Qcom8998Display *s, unsigned block,
+                                 unsigned type, unsigned index,
+                                 uint32_t *value)
+{
+    const GArray *state = s->load_state[block][type];
+    unsigned words = type ? 4 : 32;
+    const Qcom8998StateUnit *unit;
+
+    if (!state || index / words >= state->len) {
+        return false;
+    }
+    unit = &g_array_index(state, Qcom8998StateUnit, index / words);
+    if (!unit->valid) {
+        return false;
+    }
+    *value = unit->words[index % words];
+    return true;
+}
+
+static bool qcom8998_shader_finite(uint32_t value)
+{
+    unsigned exponent = extract32(value, 23, 8);
+
+    /* Denormal and nonfinite arithmetic needs separate hardware policy. */
+    return exponent != 255 && (exponent || !(value & 0x7fffffff));
+}
+
+static bool qcom8998_shader_float_source(Qcom8998Display *s, unsigned block,
+                                         Qcom8998ShaderRegs *r,
+                                         unsigned encoding, unsigned increment,
+                                         uint32_t *value)
+{
+    unsigned index;
+
+    if ((encoding & 0x3800) == 0x1000) {
+        index = (encoding & 0x7ff) + increment;
+        if (!qcom8998_shader_word(s, block, 1, index, value)) {
+            return false;
+        }
+    } else {
+        index = (encoding & 0xff) + increment;
+        if ((encoding & 0x3b00) || index >= ADRENO_SHADER_GPRS ||
+            !r->full_valid[index]) {
+            return false;
+        }
+        *value = r->full[index];
+    }
+    if (encoding & BIT(14)) {
+        *value &= ~BIT(31);
+    }
+    if (encoding & BIT(15)) {
+        *value ^= BIT(31);
+    }
+    return qcom8998_shader_finite(*value);
+}
+
+static bool qcom8998_shader_execute(Qcom8998Display *s, unsigned block,
+                                    Qcom8998ShaderRegs *r)
+{
+    float_status fp = { 0 };
+
+    set_float_rounding_mode(float_round_nearest_even, &fp);
+    for (unsigned pc = 0; pc < ADRENO_SHADER_STEPS; pc++) {
+        uint32_t low, high;
+        uint64_t instruction;
+        unsigned category, dst;
+
+        r->steps = pc + 1;
+        if (!qcom8998_shader_word(s, block, 0, pc * 2, &low) ||
+            !qcom8998_shader_word(s, block, 0, pc * 2 + 1, &high)) {
+            return false;
+        }
+        instruction = deposit64(low, 32, 32, high);
+        r->instruction[0] = low;
+        r->instruction[1] = high;
+        category = extract64(instruction, 61, 3);
+        dst = extract64(instruction, 32, 8);
+        if (category == 0) {
+            uint64_t scheduling = BIT_ULL(44) | BIT_ULL(59) | BIT_ULL(60);
+
+            if ((instruction & ~scheduling) == (6ULL << 55)) {
+                return true; /* END, not the padding after it. */
+            }
+            if (!(instruction & ~(scheduling | (7ULL << 40)))) {
+                continue; /* NOP and its sequential delay slots. */
+            }
+        } else if (category == 2) {
+            unsigned source = low & 0xff;
+            unsigned immediate = low >> 16;
+            unsigned opcode = extract64(instruction, 53, 6);
+            unsigned repeat = extract64(instruction, 40, 2);
+
+            if (opcode == 0 || opcode == 3 || opcode == 57) {
+                if (!(instruction & BIT_ULL(52)) ||
+                    (instruction & (BIT_ULL(42) | BIT_ULL(46))) ||
+                    extract64(instruction, 48, 3) ||
+                    dst + repeat >= ADRENO_SHADER_GPRS) {
+                    return false;
+                }
+                for (unsigned n = 0; n <= repeat; n++) {
+                    unsigned inc1 = instruction & BIT_ULL(43) ? n : 0;
+                    unsigned inc2 = instruction & BIT_ULL(51) ? n : 0;
+                    uint32_t a, b, value;
+
+                    if (opcode == 57) {
+                        unsigned input = (low & 0x7ff) + inc1;
+
+                        /* Barycentric interpolation of uniform inputs only. */
+                        if (block != 12 || (low & 0xf800) != 0x2000 ||
+                            input >= ARRAY_SIZE(r->input) ||
+                            !r->input_valid[input]) {
+                            return false;
+                        }
+                        value = r->input[input];
+                    } else {
+                        if ((instruction & BIT_ULL(47)) ||
+                            !qcom8998_shader_float_source(s, block, r,
+                                                         low & 0xffff, inc1,
+                                                         &a) ||
+                            !qcom8998_shader_float_source(s, block, r,
+                                                         low >> 16, inc2, &b)) {
+                            return false;
+                        }
+                        value = opcode == 3 ? float32_mul(a, b, &fp) :
+                                              float32_add(a, b, &fp);
+                    }
+                    if (!qcom8998_shader_finite(value)) {
+                        return false;
+                    }
+                    r->full[dst + n] = value;
+                    r->full_valid[dst + n] = true;
+                }
+                continue;
+            }
+
+            /* Full-width SHL.B, register source and small immediate shift. */
+            if (extract64(instruction, 53, 6) != 54 ||
+                extract64(instruction, 40, 3) ||
+                extract64(instruction, 46, 5) ||
+                !(instruction & BIT_ULL(52)) || (low & 0xff00) ||
+                (immediate & ~0x7ffU) != 0x2000 ||
+                (immediate & 0x7ff) > 31 || dst >= ADRENO_SHADER_GPRS ||
+                source >= ADRENO_SHADER_GPRS || !r->full_valid[source]) {
+                return false;
+            }
+            r->full[dst] = r->full[source] << (immediate & 31);
+            r->full_valid[dst] = true;
+            continue;
+        } else if (category == 3) {
+            unsigned repeat = extract64(instruction, 40, 2);
+            unsigned src2 = extract64(instruction, 47, 8);
+
+            if (extract64(instruction, 55, 4) != 7 ||
+                (instruction & (BIT_ULL(13) | BIT_ULL(42) | BIT_ULL(46))) ||
+                dst + repeat >= ADRENO_SHADER_GPRS) {
+                return false;
+            }
+            for (unsigned n = 0; n <= repeat; n++) {
+                unsigned enc1 = low & 0x1fff;
+                unsigned enc3 = extract32(low, 16, 13);
+                unsigned inc1 = instruction & BIT_ULL(43) ? n : 0;
+                unsigned inc2 = instruction & BIT_ULL(15) ? n : 0;
+                unsigned inc3 = instruction & BIT_ULL(29) ? n : 0;
+                uint32_t a, b, c, value;
+
+                enc1 |= instruction & BIT_ULL(14) ? BIT(15) : 0;
+                enc3 |= instruction & BIT_ULL(31) ? BIT(15) : 0;
+                if (!qcom8998_shader_float_source(s, block, r,
+                                                  enc1, inc1, &a) ||
+                    !qcom8998_shader_float_source(s, block, r,
+                        src2 | (instruction & BIT_ULL(30) ? BIT(15) : 0),
+                        inc2, &b) ||
+                    !qcom8998_shader_float_source(s, block, r,
+                                                  enc3, inc3, &c)) {
+                    return false;
+                }
+                /* IR3 MAD is an unfused operation: round the product first. */
+                value = float32_add(float32_mul(a, b, &fp), c, &fp);
+                if (!qcom8998_shader_finite(value)) {
+                    return false;
+                }
+                r->full[dst + n] = value;
+                r->full_valid[dst + n] = true;
+            }
+            continue;
+        } else if (category == 1) {
+            unsigned src_type = extract64(instruction, 50, 3);
+            unsigned dst_type = extract64(instruction, 46, 3);
+            unsigned mode = extract64(instruction, 53, 2);
+            unsigned repeat = extract64(instruction, 40, 2);
+            bool source_half = src_type == 2 || src_type == 4;
+            bool dest_half = dst_type == 2 || dst_type == 4;
+
+            if ((instruction & (BIT_ULL(42) | BIT_ULL(49))) ||
+                extract64(instruction, 55, 4) || mode == 3 ||
+                (src_type != 1 && src_type != 2 && src_type != 3 &&
+                 src_type != 4 && src_type != 5) ||
+                (src_type != dst_type && !(src_type == 5 && dst_type == 4)) ||
+                (dst >= ADRENO_SHADER_GPRS &&
+                 !(dst == 244 && dst_type == 4 && !repeat)) ||
+                (dst < ADRENO_SHADER_GPRS &&
+                 dst + repeat >= ADRENO_SHADER_GPRS)) {
+                return false;
+            }
+            for (unsigned n = 0; n <= repeat; n++) {
+                unsigned increment = instruction & BIT_ULL(43) ? n : 0;
+                uint32_t value;
+                int index;
+
+                if (mode == 2) {
+                    value = low;
+                } else if (mode == 1 || (low & BIT(11))) {
+                    if (source_half) {
+                        return false; /* Packed half constants are separate. */
+                    }
+                    if (mode == 1) {
+                        if (low & ~0x7ffU) {
+                            return false;
+                        }
+                        index = low + increment;
+                    } else {
+                        if ((low & ~0xfffU) || !(low & BIT(10)) ||
+                            !r->address_valid) {
+                            return false;
+                        }
+                        index = r->address + sextract32(low, 0, 10) + increment;
+                    }
+                    if (index < 0 || !qcom8998_shader_word(s, block, 1,
+                                                           index, &value)) {
+                        return false;
+                    }
+                } else {
+                    index = (low & 0xff) + increment;
+                    if ((low & ~(0xffU | BIT(10))) ||
+                        index >= ADRENO_SHADER_GPRS ||
+                        !(source_half ? r->half_valid[index] :
+                                        r->full_valid[index])) {
+                        return false;
+                    }
+                    value = source_half ? r->half[index] : r->full[index];
+                }
+                /* Reject S32->S16 narrowing outside its exact range. */
+                if (src_type == 5 && dst_type == 4 &&
+                    ((int32_t)value < INT16_MIN ||
+                     (int32_t)value > INT16_MAX)) {
+                    return false;
+                }
+                if (dst == 244) {
+                    r->address = (int16_t)value;
+                    r->address_valid = true;
+                } else if (dest_half) {
+                    r->half[dst + n] = value;
+                    r->half_valid[dst + n] = true;
+                } else {
+                    r->full[dst + n] = value;
+                    r->full_valid[dst + n] = true;
+                }
+            }
+            continue;
+        }
+        /* Branches, textures, memory effects and other ALU are not executed. */
+        return false;
+    }
+    return false;
+}
+
+static bool qcom8998_shader_run(Qcom8998Display *s, unsigned block,
+                                unsigned vertex, unsigned vertex_reg,
+                                Qcom8998ShaderRegs *r)
+{
+    memset(r, 0, sizeof(*r));
+    if (block == 8) {
+        if (vertex_reg >= ADRENO_SHADER_GPRS) {
+            return false;
+        }
+        r->full[vertex_reg] = vertex;
+        r->full_valid[vertex_reg] = true;
+    }
+    return qcom8998_shader_execute(s, block, r);
+}
+
+static bool qcom8998_screen_coordinate(uint32_t bits, unsigned *value)
+{
+    unsigned exponent = extract32(bits, 23, 8);
+    unsigned shift;
+    uint32_t significand;
+
+    if (!(bits & 0x7fffffff)) {
+        *value = 0;
+        return true;
+    }
+    if ((bits & BIT(31)) || exponent < 127 || exponent > 139) {
+        return false;
+    }
+    shift = 150 - exponent;
+    significand = (bits & 0x7fffff) | BIT(23);
+    if ((significand & ((1U << shift) - 1)) ||
+        (significand >> shift) > MDP_MAX_OUTPUT_SIZE) {
+        return false;
+    }
+    *value = significand >> shift;
+    return true;
+}
+
+static bool qcom8998_unorm8(uint32_t bits, unsigned *value)
+{
+    unsigned exponent = extract32(bits, 23, 8);
+    uint64_t scaled, remainder, halfway;
+    unsigned shift;
+
+    if (exponent == 255) {
+        return false;
+    }
+    if (bits & BIT(31)) {
+        *value = 0;
+    } else if (bits >= 0x3f800000) {
+        *value = 255;
+    } else {
+        shift = 150 - exponent;
+        if (shift >= 64) {
+            *value = 0;
+            return true;
+        }
+        scaled = (uint64_t)((bits & 0x7fffff) | BIT(23)) * 255;
+        remainder = scaled & ((1ULL << shift) - 1);
+        halfway = 1ULL << (shift - 1);
+        *value = (scaled >> shift) + (remainder > halfway ||
+                 (remainder == halfway && ((scaled >> shift) & 1)));
+    }
+    return true;
+}
+
+static bool qcom8998_cp_textured_rectangle(Qcom8998Display *s, unsigned count,
+                                           const uint32_t *payload);
+
+static bool qcom8998_cp_rectangle(Qcom8998Display *s, unsigned count,
+                                  const uint32_t *payload)
+{
+    const uint32_t *regs = s->bank[BANK_ADRENO].regs;
+    Qcom8998ShaderRegs vertex, fragment;
+    unsigned coordinates[2][2];
+    unsigned position = regs[0xe593] & 0xff;
+    unsigned output = regs[0xe5cb] & 0xff;
+    uint32_t color = 0;
+    unsigned x1, y1, x2, y2;
+    static const unsigned scissor[] = { 0xe0aa, 0xe0ca, 0xe0ea };
+    static const unsigned disabled[] = {
+        0xe001, 0xe002, 0xe003, 0xe090, 0xe0a1, 0xe0a2, 0xe0a3,
+        0xe0a4, 0xe100, 0xe142, 0xe143, 0xe1a8, 0xe1b1, 0xe1c0,
+        0xe1d0, 0xe1d1, 0xe2a1, 0xe385, 0xe400, 0xe408, 0xe409,
+        0xe5db, 0xe704, 0xe705,
+    };
+
+    if (regs[0xe5db]) {
+        return qcom8998_cp_textured_rectangle(s, count, payload);
+    }
+
+    /* A nonindexed, pretransformed screen rectangle and constant-color FS. */
+    if (!s->me_initialized || count != 3 || (payload[0] & ~0xc00U) != 0x88 ||
+        payload[1] != 1 || payload[2] != 2 ||
+        s->render_mode[0] != ADRENO_RENDER_BYPASS ||
+        regs[ADRENO_RB_CNTL] != ADRENO_RB_BYPASS ||
+        (regs[ADRENO_RB_RENDER_CNTL] & ~BIT(8)) ||
+        (regs[0xe0a0] & ~BIT(8)) ||
+        regs[0xe000] != 0x181 || regs[0xe146] != 1 || regs[0xe147] != 0xf ||
+        regs[0xe150] != 0x780 || regs[0xe1a9] != 0xffff0000 ||
+        !(regs[0xe584] & 1) || !(regs[0xe585] & 1) ||
+        ((regs[0xe586] | regs[0xe587] | regs[0xe588]) & 1) ||
+        regs[0xe5ac] != 1 || regs[0xe5ad] ||
+        regs[0xe5c3] != 1 || regs[0xe5c4] ||
+        regs[0xe592] != 1 || (regs[0xe593] & ~0xffU) != 0xf00 ||
+        regs[0xe5a3] || (regs[0xe5cb] & ~0xffU) ||
+        (regs[0xe5ca] & 0x3f) != 1 || regs[0xe5d3] != 0x30 ||
+        position > ADRENO_SHADER_GPRS - 4 ||
+        output > ADRENO_SHADER_GPRS - 4) {
+        return false;
+    }
+    for (unsigned i = 0; i < ARRAY_SIZE(disabled); i++) {
+        if (regs[disabled[i]]) {
+            return false;
+        }
+    }
+    for (unsigned v = 0; v < 2; v++) {
+        if (!qcom8998_shader_run(s, 8, v, regs[0xe401] & 0xff, &vertex)) {
+            return false;
+        }
+        for (unsigned c = 0; c < 4; c++) {
+            if (!vertex.full_valid[position + c]) {
+                return false;
+            }
+        }
+        if ((vertex.full[position + 2] != 0 &&
+             vertex.full[position + 2] != 0x3f800000) ||
+            vertex.full[position + 3] != 0x3f800000 ||
+            !qcom8998_screen_coordinate(vertex.full[position],
+                                         &coordinates[v][0]) ||
+            !qcom8998_screen_coordinate(vertex.full[position + 1],
+                                         &coordinates[v][1])) {
+            return false;
+        }
+    }
+    x1 = MIN(coordinates[0][0], coordinates[1][0]);
+    y1 = MIN(coordinates[0][1], coordinates[1][1]);
+    x2 = MAX(coordinates[0][0], coordinates[1][0]);
+    y2 = MAX(coordinates[0][1], coordinates[1][1]);
+    for (unsigned i = 0; i < ARRAY_SIZE(scissor); i++) {
+        x1 = MAX(x1, regs[scissor[i]] & 0xffff);
+        y1 = MAX(y1, regs[scissor[i]] >> 16);
+        x2 = MIN(x2, (regs[scissor[i] + 1] & 0xffff) + 1);
+        y2 = MIN(y2, (regs[scissor[i] + 1] >> 16) + 1);
+    }
+    if (x1 >= x2 || y1 >= y2) {
+        return true; /* No fragment invocation or attachment access. */
+    }
+    if (!qcom8998_shader_run(s, 12, 0, 0, &fragment)) {
+        return false;
+    }
+    for (unsigned c = 0; c < 4; c++) {
+        unsigned component;
+
+        if (!fragment.full_valid[output + c] ||
+            !qcom8998_unorm8(fragment.full[output + c], &component)) {
+            return false;
+        }
+        color |= component << (c * 8);
+    }
+    if (!qcom8998_fill_rect(s, 0, x1 | (y1 << 16),
+                            (x2 - 1) | ((y2 - 1) << 16), color)) {
+        return false;
+    }
+    trace_qcom8998_cp_rectangle(x1, y1, x2 - x1, y2 - y1, color);
+    return true;
+}
+
+typedef struct Qcom8998RasterVertex {
+    int x, y; /* D3D 16.8 positions, bounded to +/-4096 pixels here. */
+    uint32_t color[4];
+} Qcom8998RasterVertex;
+
+static bool qcom8998_vertex_fetch(Qcom8998Display *s, unsigned index,
+                                  Qcom8998ShaderRegs *r)
+{
+    const uint32_t *regs = s->bank[BANK_ADRENO].regs;
+    unsigned attributes = regs[0xe400];
+    float_status fp = { 0 };
+
+    if (attributes > 16 || (regs[0xe401] & ~0xffffffU) ||
+        regs[0xe408] || regs[0xe409]) {
+        return false;
+    }
+    memset(r, 0, sizeof(*r));
+    for (unsigned i = 0; i < 3; i++) {
+        unsigned reg = extract32(regs[0xe401], i * 8, 8);
+
+        if (reg != 0xfc) {
+            if (reg >= ADRENO_SHADER_GPRS || i == 2) {
+                return false;
+            }
+            r->full[reg] = i ? 0 : index;
+            r->full_valid[reg] = true;
+        }
+    }
+    for (unsigned i = 0; i < attributes; i++) {
+        unsigned decode = regs[0xe48a + i * 2];
+        unsigned fetch = 0xe40a + (decode & 31) * 4;
+        unsigned format = extract32(decode, 20, 8);
+        unsigned offset = extract32(decode, 5, 12);
+        unsigned dest = regs[0xe4ca + i];
+        unsigned out = extract32(dest, 4, 8);
+        unsigned components, bytes;
+        uint32_t value[4] = { 0, 0, 0, 0x3f800000 };
+        uint64_t address, position;
+
+        if ((decode & (BIT(17) | BIT(18) | BIT(19))) ||
+            (dest & ~0xfffU) || out > ADRENO_SHADER_GPRS - 4 ||
+            (regs[0xe48b + i * 2] > 1)) {
+            return false;
+        }
+        if (format == 0x74 || format == 0x67) {
+            components = format == 0x74 ? 3 : 2;
+            bytes = components * 4;
+            if (extract32(decode, 28, 2)) {
+                return false;
+            }
+        } else if (format == 0x30) {
+            components = 4;
+            bytes = 4;
+        } else {
+            return false;
+        }
+        address = qcom8998_reg_pair(regs, fetch * 4);
+        position = (uint64_t)index * regs[fetch + 3] + offset;
+        if ((address & 3) || (position & 3) ||
+            position + bytes > regs[fetch + 2] ||
+            address > UINT64_MAX - position - bytes) {
+            return false;
+        }
+        address += position;
+        if (format == 0x30) {
+            uint32_t packed;
+
+            if (!qcom8998_cp_word(s, address, &packed, false)) {
+                return false;
+            }
+            packed = le32_to_cpu(qcom8998_color_swap(packed,
+                                                     (decode >> 28) & 3));
+            for (unsigned c = 0; c < 4; c++) {
+                value[c] = float32_div(uint32_to_float32(
+                    extract32(packed, c * 8, 8), &fp), 0x437f0000, &fp);
+            }
+        } else {
+            for (unsigned c = 0; c < components; c++) {
+                if (!qcom8998_cp_word(s, address + c * 4, &value[c], false) ||
+                    !qcom8998_shader_finite(value[c])) {
+                    return false;
+                }
+            }
+        }
+        for (unsigned c = 0; c < 4; c++) {
+            if (dest & BIT(c)) {
+                r->full[out + c] = value[c];
+                r->full_valid[out + c] = true;
+            }
+        }
+    }
+    if (!qcom8998_shader_execute(s, 8, r)) {
+        trace_qcom8998_cp_draw_reject("vertex shader", r->instruction[0],
+                                      r->instruction[1]);
+        return false;
+    }
+    return true;
+}
+
+static bool qcom8998_vertex_position(Qcom8998Display *s,
+                                     const Qcom8998ShaderRegs *r,
+                                     Qcom8998RasterVertex *v)
+{
+    const uint32_t *regs = s->bank[BANK_ADRENO].regs;
+    unsigned position = regs[0xe593] & 0xff;
+    unsigned color = extract32(regs[0xe593], 16, 8);
+    float_status fp = { 0 };
+
+    if (position > ADRENO_SHADER_GPRS - 4 ||
+        color > ADRENO_SHADER_GPRS - 4) {
+        return false;
+    }
+    for (unsigned c = 0; c < 4; c++) {
+        if (!r->full_valid[position + c] || !r->full_valid[color + c]) {
+            return false;
+        }
+        v->color[c] = r->full[color + c];
+    }
+    if ((r->full[position + 2] != 0 &&
+         r->full[position + 2] != 0x3f800000) ||
+        r->full[position + 3] != 0x3f800000) {
+        trace_qcom8998_cp_draw_reject("clip Z/W", r->full[position + 2],
+                                      r->full[position + 3]);
+        return false; /* Perspective division and Z clipping are separate. */
+    }
+    for (unsigned c = 0; c < 2; c++) {
+        uint32_t offset = regs[0xe010 + c * 2];
+        uint32_t scale = regs[0xe011 + c * 2];
+        uint32_t coordinate;
+        int fixed;
+
+        if (!qcom8998_shader_finite(r->full[position + c]) ||
+            !qcom8998_shader_finite(offset) ||
+            !qcom8998_shader_finite(scale)) {
+            return false;
+        }
+        coordinate = float32_add(float32_mul(r->full[position + c], scale,
+                                             &fp), offset, &fp);
+        if (!qcom8998_shader_finite(coordinate) ||
+            (coordinate & 0x7fffffff) > 0x45800000) {
+            return false;
+        }
+        /* D3D11 requires eight fractional bits and nearest-even snap. */
+        fixed = float32_to_int32_scalbn(coordinate, float_round_nearest_even,
+                                        8, &fp);
+        if (c) {
+            v->y = fixed;
+        } else {
+            v->x = fixed;
+        }
+    }
+    return true;
+}
+
+static int64_t qcom8998_edge(const Qcom8998RasterVertex *a,
+                            const Qcom8998RasterVertex *b, int x, int y)
+{
+    return (int64_t)(b->x - a->x) * (y - a->y) -
+           (int64_t)(b->y - a->y) * (x - a->x);
+}
+
+static bool qcom8998_top_left(const Qcom8998RasterVertex *a,
+                              const Qcom8998RasterVertex *b)
+{
+    return b->y < a->y || (b->y == a->y && b->x > a->x);
+}
+
+static bool qcom8998_fragment_color(Qcom8998Display *s,
+                                     Qcom8998ShaderRegs *shader,
+                                     uint32_t destination, bool blend,
+                                     uint32_t *color)
+{
+    const uint32_t *regs = s->bank[BANK_ADRENO].regs;
+    unsigned output = regs[0xe5cb] & 0xff;
+    float_status fp = { 0 };
+    uint32_t factor = 0;
+
+    if (output > ADRENO_SHADER_GPRS - 4 ||
+        !qcom8998_shader_execute(s, 12, shader)) {
+        trace_qcom8998_cp_draw_reject("fragment shader", shader->instruction[0],
+                                      shader->instruction[1]);
+        return false;
+    }
+    if (blend) {
+        uint32_t alpha = shader->full[output + 3];
+
+        if (!shader->full_valid[output + 3] || alpha > 0x3f800000) {
+            return false;
+        }
+        factor = float32_sub(0x3f800000, alpha, &fp);
+    }
+    *color = 0;
+    for (unsigned c = 0; c < 4; c++) {
+        unsigned component;
+        uint32_t value = shader->full[output + c];
+
+        if (!shader->full_valid[output + c]) {
+            return false;
+        }
+        if (blend) {
+            uint32_t dest;
+
+            /* ONE + ONE_MINUS_SRC_ALPHA, linear RGBA8, ADD on all lanes. */
+            if (value > 0x3f800000) {
+                return false;
+            }
+            dest = float32_div(uint32_to_float32(
+                extract32(destination, c * 8, 8), &fp), 0x437f0000, &fp);
+            value = float32_add(value, float32_mul(dest, factor, &fp), &fp);
+        }
+        if (!qcom8998_unorm8(value, &component)) {
+            return false;
+        }
+        *color |= component << (c * 8);
+    }
+    return true;
+}
+
+/* Cache only sampled pages, before publishing any destination pixels. */
+static bool qcom8998_texture_word(Qcom8998Display *s, GHashTable *pages,
+                                   uint64_t address, unsigned cpp,
+                                   uint32_t *value)
+{
+    uint64_t page = address & ~((1ULL << SMMU_4K_SHIFT) - 1);
+    gpointer key = (gpointer)(uintptr_t)(page >> SMMU_4K_SHIFT);
+    uint8_t *data = g_hash_table_lookup(pages, key);
+
+    if (!data) {
+        hwaddr physical;
+        g_autofree uint8_t *pending = g_malloc(1U << SMMU_4K_SHIFT);
+
+        if (!qcom8998_cp_translate(s, address, false, &physical)) {
+            return false;
+        }
+        physical &= ~((1ULL << SMMU_4K_SHIFT) - 1);
+        if (!qcom8998_ram_buffer(physical, 1U << SMMU_4K_SHIFT, false) ||
+            address_space_read(&address_space_memory, physical,
+                MEMTXATTRS_UNSPECIFIED, pending,
+                1U << SMMU_4K_SHIFT) != MEMTX_OK) {
+            return false;
+        }
+        data = g_steal_pointer(&pending);
+        g_hash_table_insert(pages, key, data);
+    }
+    *value = cpp == 1 ? data[address - page] :
+                       ldl_le_p(data + (address - page));
+    return true;
+}
+
+static bool qcom8998_texture_surface(Qcom8998Display *s, uint64_t base,
+                                      uint64_t pitch, unsigned x1, unsigned y1,
+                                      unsigned x2, unsigned y2, unsigned cpp,
+                                      GArray *spans,
+                                      uint8_t **pixels)
+{
+    unsigned row_bytes = (x2 - x1) * cpp;
+
+    *pixels = g_malloc(row_bytes * (y2 - y1));
+    for (unsigned y = y1; y < y2; y++) {
+        unsigned offset = (y - y1) * row_bytes;
+        unsigned remaining = row_bytes;
+        uint64_t address = base + y * pitch + x1 * cpp;
+
+        while (remaining) {
+            Qcom8998GmemSpan span;
+
+            span.offset = offset;
+            span.length = MIN(remaining, (1U << SMMU_4K_SHIFT) -
+                              extract64(address, 0, SMMU_4K_SHIFT));
+            if (!qcom8998_cp_translate(s, address, true, &span.address) ||
+                !qcom8998_ram_buffer(span.address, span.length, true) ||
+                address_space_read(&address_space_memory, span.address,
+                    MEMTXATTRS_UNSPECIFIED, *pixels + offset,
+                    span.length) != MEMTX_OK) {
+                return false;
+            }
+            g_array_append_val(spans, span);
+            offset += span.length;
+            address += span.length;
+            remaining -= span.length;
+        }
+    }
+    return true;
+}
+
+static bool qcom8998_cp_textured_rectangle(Qcom8998Display *s, unsigned count,
+                                           const uint32_t *payload)
+{
+    const uint32_t *regs = s->bank[BANK_ADRENO].regs;
+    const GArray *samplers = s->load_state[4][0];
+    const GArray *textures = s->load_state[4][1];
+    const uint32_t *sampler, *texture;
+    Qcom8998ShaderRegs vertex;
+    unsigned coordinates[2][2];
+    uint32_t uv[2][2], instruction[2];
+    uint64_t address, pitch, layer, dest;
+    unsigned width, height, swap, cpp, x1, y1, x2, y2;
+    unsigned tile = extract32(regs[ADRENO_RB_MRT_BUF_INFO], 8, 2);
+    bool r8 = regs[0xe5d3] == 3;
+    unsigned position = extract32(regs[0xe593], 16, 8);
+    unsigned varying = regs[0xe593] & 0xff;
+    unsigned *texel[2];
+    float_status fp = { 0 };
+    g_autoptr(GHashTable) pages = g_hash_table_new_full(g_direct_hash,
+                                                       g_direct_equal,
+                                                       NULL, g_free);
+    g_autoptr(GArray) spans = g_array_new(false, false,
+                                        sizeof(Qcom8998GmemSpan));
+    g_autofree uint32_t *pending = NULL;
+    g_autofree uint8_t *raw_pixels = NULL;
+    g_autofree unsigned *texel_x = NULL;
+    g_autofree unsigned *texel_y = NULL;
+    static const unsigned scissor[] = { 0xe0aa, 0xe0ca, 0xe0ea };
+    static const unsigned disabled[] = {
+        0xe001, 0xe002, 0xe003, 0xe090, 0xe0a2, 0xe0a3, 0xe0a4,
+        0xe100, 0xe142, 0xe143, 0xe1a8, 0xe1b1, 0xe1c0, 0xe2a1,
+        0xe385, 0xe400, 0xe408, 0xe409, 0xe5c9, 0xe704, 0xe705,
+    };
+
+    /*
+     * QCDX's single initial texture load: varying 4, sampler/texture 0,
+     * full r0.xyzw, followed by END. A5xx's undocumented e5db/e5dc
+     * encoding is restricted to the observed pair; this does not infer
+     * other A6xx prefetch fields from the similar command word.
+     */
+    if (!s->me_initialized || count != 3 || (payload[0] & ~0xc00U) != 0x88 ||
+        payload[1] != 1 || payload[2] != 2 ||
+        s->render_mode[0] != ADRENO_RENDER_BYPASS ||
+        regs[ADRENO_RB_CNTL] != ADRENO_RB_BYPASS ||
+        (regs[ADRENO_RB_RENDER_CNTL] & ~BIT(8)) ||
+        regs[0xe000] != 0x181 || (regs[0xe0a0] & ~BIT(8)) ||
+        (regs[0xe0a1] && regs[0xe0a1] != 0x20) ||
+        regs[0xe146] != 1 || regs[0xe147] != 0xf ||
+        regs[0xe150] != 0x780 || regs[0xe1a9] != 0xffff0000 ||
+        !(regs[0xe584] & 1) || !(regs[0xe585] & 1) ||
+        ((regs[0xe586] | regs[0xe587] | regs[0xe588]) & 1) ||
+        regs[0xe5ac] != 1 || regs[0xe5ad] ||
+        regs[0xe5c3] != 1 || regs[0xe5c4] ||
+        regs[0xe592] != 2 || (regs[0xe593] & 0xff00ff00) != 0x0f000300 ||
+        regs[0xe5a3] != 4 || regs[0xe5cb] ||
+        (regs[0xe5ca] & 0x3f) != 1 ||
+        (regs[0xe5d3] != 0x30 && !r8) ||
+        regs[0xe5db] != 0x19 || regs[0xe5dc] != 0x23c00004 ||
+        regs[0xe791] != 4 || regs[0xe792] != 2 ||
+        position > ADRENO_SHADER_GPRS - 4 ||
+        varying > ADRENO_SHADER_GPRS - 2 ||
+        !qcom8998_shader_word(s, 12, 0, 0, &instruction[0]) ||
+        !qcom8998_shader_word(s, 12, 0, 1, &instruction[1]) ||
+        instruction[0] || instruction[1] != 0x03000000 ||
+        !samplers || !samplers->len || !textures || !textures->len ||
+        !g_array_index(samplers, Qcom8998StateUnit, 0).valid ||
+        !g_array_index(textures, Qcom8998StateUnit, 0).valid) {
+        trace_qcom8998_cp_draw_reject("texture rectangle", regs[0xe5db],
+                                      regs[0xe5dc]);
+        return false;
+    }
+    for (unsigned i = 0; i < ARRAY_SIZE(disabled); i++) {
+        if (regs[disabled[i]]) {
+            trace_qcom8998_cp_draw_reject("rectangle state", disabled[i],
+                                          regs[disabled[i]]);
+            return false;
+        }
+    }
+    sampler = g_array_index(samplers, Qcom8998StateUnit, 0).words;
+    texture = g_array_index(textures, Qcom8998StateUnit, 0).words;
+    width = extract32(texture[1], 0, 15);
+    height = extract32(texture[1], 15, 15);
+    pitch = extract32(texture[2], 7, 22);
+    address = deposit64(texture[4], 32, 17, texture[5] & 0x1ffff);
+    swap = extract32(texture[0], 30, 2);
+    cpp = r8 ? 1 : 4;
+    /* Linear RGBA8/R8, nearest/clamp, unnormalized XY. */
+    if (sampler[0] != 0x60920 || sampler[1] != 0x67 ||
+        sampler[2] || sampler[3] ||
+        (texture[0] & ~0xc0000000U) != (r8 ? 0x00c0b200 : 0x0c006880) ||
+        (r8 && swap) ||
+        !width || !height || width > MDP_MAX_OUTPUT_SIZE ||
+        height > MDP_MAX_OUTPUT_SIZE || (texture[1] & 0xc0000000) ||
+        (texture[2] & 0xe000007f) != 0x20000000 ||
+        pitch < width * cpp || (pitch & 3) ||
+        pitch * height > ADRENO_CLEAR_MAX_BYTES ||
+        (texture[3] & ~0x0f803fffU) ||
+        (texture[4] & 31) || (texture[5] & ~0x3ffffU) ||
+        !(texture[5] & BIT(17)) ||
+        address > UINT64_MAX - pitch * height) {
+        trace_qcom8998_cp_draw_reject("texture descriptor", texture[0],
+                                      texture[2]);
+        return false;
+    }
+    for (unsigned i = 6; i < 12; i++) {
+        if (texture[i]) {
+            return false;
+        }
+    }
+    for (unsigned v = 0; v < 2; v++) {
+        if (!qcom8998_shader_run(s, 8, v, regs[0xe401] & 0xff, &vertex)) {
+            trace_qcom8998_cp_draw_reject("rectangle shader",
+                vertex.instruction[0], vertex.instruction[1]);
+            return false;
+        }
+        for (unsigned c = 0; c < 4; c++) {
+            if (!vertex.full_valid[position + c]) {
+                return false;
+            }
+        }
+        if (vertex.full[position + 2] ||
+            vertex.full[position + 3] != 0x3f800000) {
+            return false;
+        }
+        for (unsigned c = 0; c < 2; c++) {
+            if (!vertex.full_valid[varying + c] ||
+                !qcom8998_shader_finite(vertex.full[varying + c]) ||
+                (vertex.full[varying + c] & 0x7fffffff) > 0x48000000 ||
+                !qcom8998_screen_coordinate(vertex.full[position + c],
+                                             &coordinates[v][c])) {
+                trace_qcom8998_cp_draw_reject("rectangle coordinates",
+                    vertex.full[position + c], vertex.full[varying + c]);
+                return false;
+            }
+            uv[v][c] = vertex.full[varying + c];
+        }
+    }
+    x1 = MIN(coordinates[0][0], coordinates[1][0]);
+    y1 = MIN(coordinates[0][1], coordinates[1][1]);
+    x2 = MAX(coordinates[0][0], coordinates[1][0]);
+    y2 = MAX(coordinates[0][1], coordinates[1][1]);
+    for (unsigned i = 0; i < ARRAY_SIZE(scissor); i++) {
+        x1 = MAX(x1, regs[scissor[i]] & 0xffff);
+        y1 = MAX(y1, regs[scissor[i]] >> 16);
+        x2 = MIN(x2, (regs[scissor[i] + 1] & 0xffff) + 1);
+        y2 = MIN(y2, (regs[scissor[i] + 1] >> 16) + 1);
+    }
+    if (x1 >= x2 || y1 >= y2) {
+        return true;
+    }
+    pitch = (uint64_t)regs[ADRENO_RB_MRT_BUF_INFO + 1] << 6;
+    layer = (uint64_t)regs[ADRENO_RB_MRT_BUF_INFO + 2] << 6;
+    dest = qcom8998_reg_pair(regs, (ADRENO_RB_MRT_BUF_INFO + 3) * 4);
+    if ((regs[ADRENO_RB_MRT_BUF_INFO] &
+         ~(ADRENO_RB_COLOR_SWAP_MASK | 0x300U)) != (r8 ? 3 : 0x30) ||
+        (r8 && (regs[ADRENO_RB_MRT_BUF_INFO] & ADRENO_RB_COLOR_SWAP_MASK)) ||
+        (tile && tile != 3) ||
+        /* Pixel zero is at BASE; other TILE5_3 addresses need a layout. */
+        (tile && (!r8 || x1 || y1 || x2 != 1 || y2 != 1 || pitch % 128)) ||
+        regs[ADRENO_RB_RAS_MSAA_CNTL] || regs[ADRENO_RB_DEST_MSAA_CNTL] ||
+        !pitch || !layer || layer % pitch ||
+        layer > ADRENO_CLEAR_MAX_BYTES || x2 * cpp > pitch ||
+        y2 > layer / pitch || (dest & 3) || dest > UINT64_MAX - layer) {
+        trace_qcom8998_cp_draw_reject("texture attachment",
+            regs[ADRENO_RB_MRT_BUF_INFO], layer);
+        return false;
+    }
+    if (r8 ? !qcom8998_texture_surface(s, dest, pitch, x1, y1, x2, y2, cpp,
+                                        spans, &raw_pixels) :
+              !qcom8998_sysmem_surface(s, x1, y1, x2, y2, spans, &pending)) {
+        return false;
+    }
+    /* Affine XY are separable. Round interpolation to float32 once. */
+    texel_x = g_new(unsigned, x2 - x1);
+    texel_y = g_new(unsigned, y2 - y1);
+    texel[0] = texel_x;
+    texel[1] = texel_y;
+    for (unsigned c = 0; c < 2; c++) {
+        unsigned first = c ? y1 : x1;
+        unsigned last = c ? y2 : x2;
+        unsigned extent = c ? height : width;
+        float64 start = uint32_to_float64(coordinates[0][c], &fp);
+        float64 end = uint32_to_float64(coordinates[1][c], &fp);
+        float64 origin = float32_to_float64(uv[0][c], &fp);
+        float64 delta = float64_sub(float32_to_float64(uv[1][c], &fp),
+                                     origin, &fp);
+
+        for (unsigned p = first; p < last; p++) {
+            float64 center = float64_add(uint32_to_float64(p, &fp),
+                                          0x3fe0000000000000ULL, &fp);
+            float64 weight = float64_div(float64_sub(center, start, &fp),
+                                          float64_sub(end, start, &fp), &fp);
+            uint32_t coord = float64_to_float32(float64_add(origin,
+                float64_mul(delta, weight, &fp), &fp), &fp);
+            int index = float32_to_int32_scalbn(coord, float_round_down,
+                                                 0, &fp);
+
+            texel[c][p - first] = CLAMP(index, 0, (int)extent - 1);
+        }
+    }
+    for (unsigned y = y1; y < y2; y++) {
+        for (unsigned x = x1; x < x2; x++) {
+            uint32_t color;
+
+            if (!qcom8998_texture_word(s, pages, address +
+                texel_y[y - y1] * (uint64_t)extract32(texture[2], 7, 22) +
+                texel_x[x - x1] * cpp, cpp, &color)) {
+                return false;
+            }
+            if (r8) {
+                unsigned offset = ((y - y1) * (x2 - x1) + x - x1) * cpp;
+
+                raw_pixels[offset] = color;
+            } else {
+                pending[(y - y1) * (x2 - x1) + x - x1] =
+                    qcom8998_color_unswap(color, swap);
+            }
+        }
+    }
+    if (r8) {
+        for (unsigned i = 0; i < spans->len; i++) {
+            const Qcom8998GmemSpan *span = &g_array_index(spans,
+                                                         Qcom8998GmemSpan, i);
+
+            if (address_space_write(&address_space_memory, span->address,
+                MEMTXATTRS_UNSPECIFIED, raw_pixels + span->offset,
+                span->length) != MEMTX_OK) {
+                return false;
+            }
+        }
+    } else if (!qcom8998_sysmem_publish(s, spans, pending)) {
+        return false;
+    }
+    trace_qcom8998_cp_texture_rectangle(x1, y1, x2 - x1, y2 - y1, address);
+    return true;
+}
+
+static bool qcom8998_cp_triangles(Qcom8998Display *s, unsigned count,
+                                  const uint32_t *payload)
+{
+    const uint32_t *regs = s->bank[BANK_ADRENO].regs;
+    unsigned base, width, height, total = 0;
+    uint64_t indices, end;
+    unsigned x1 = 0, y1 = 0, x2, y2;
+    unsigned ox = regs[0xe1d0] & 0xffff, oy = regs[0xe1d0] >> 16;
+    bool blend = regs[0xe150] == 0x783;
+    bool sysmem = regs[ADRENO_RB_CNTL] == ADRENO_RB_BYPASS;
+    uint64_t raster_budget = 8U << 20;
+    uint64_t fragment_budget = 32U << 20;
+    g_autoptr(GArray) spans = g_array_new(false, false,
+                                        sizeof(Qcom8998GmemSpan));
+    g_autofree uint32_t *pending = NULL;
+    float_status fp = { 0 };
+    static const unsigned scissor[] = { 0xe0aa, 0xe0ca, 0xe0ea };
+
+    /* Single-instance indexed TRIANGLELIST and one vec4 color varying. */
+    if (!s->me_initialized || count != 7 ||
+        (payload[0] & ~0x300U) != 0x404 ||
+        ((payload[0] & 0x300) && !s->visibility_override) ||
+        payload[1] != 1 || !payload[2] || payload[2] % 3 || payload[2] > 255 ||
+        regs[0xe000] != 0x60 || regs[0xe001] || regs[0xe389] ||
+        (regs[0xe090] & 3) ||
+        (regs[0xe0a0] & ~(BIT(3) | BIT(8))) ||
+        (regs[0xe0a1] && regs[0xe0a1] != 0x20) ||
+        regs[0xe0a2] || regs[0xe0a3] || (regs[0xe1a8] & BIT(8)) ||
+        (regs[0xe1b1] & (BIT(0) | BIT(1) | BIT(6))) || regs[0xe1c0] ||
+        regs[0xe100] || regs[0xe2a1] || regs[0xe385] ||
+        (regs[0xe141] & ~(BIT(3) | BIT(8))) ||
+        regs[0xe146] != 1 || regs[0xe147] != 0xf ||
+        (blend ? (regs[0xe151] != 0x07010701 ||
+                  regs[0xe1a9] != 0xffff00ff || regs[0xe5c9] != 1) :
+                 (regs[0xe150] != 0x780 || regs[0xe1a9] != 0xffff0000 ||
+                  regs[0xe5c9])) ||
+        !(regs[0xe584] & 1) || !(regs[0xe585] & 1) ||
+        regs[0xe070] || regs[0xe071] != 0x3f800000 ||
+        regs[0xe200] || regs[0xe201] != 0x3f800000 ||
+        regs[0xe388] != 0x12 || regs[0xe592] != 2 ||
+        (regs[0xe593] & 0x0f000f00) != 0x0f000f00 ||
+        regs[0xe5a3] != 0x400 || regs[0xe5d3] != 0x30 ||
+        regs[0xe793] || regs[0xe794] || regs[0xe795] ||
+        regs[0xe5db] ||
+        (regs[0xe384] & BIT(9)) || regs[0xe1b0] ||
+        !(regs[0xe590] & BIT(2)) || !(regs[0xe5c0] & BIT(2)) ||
+        qcom8998_reg_pair(regs, 0xe5ac * 4) != (s->shader_address[8] | 1) ||
+        qcom8998_reg_pair(regs, 0xe5c3 * 4) != (s->shader_address[12] | 1)) {
+        trace_qcom8998_cp_draw_reject("draw configuration", regs[0xe140],
+                                      regs[0xe592]);
+        return false;
+    }
+    if (sysmem) {
+        uint64_t pitch = (uint64_t)regs[ADRENO_RB_MRT_BUF_INFO + 1] << 6;
+        uint64_t layer = (uint64_t)regs[ADRENO_RB_MRT_BUF_INFO + 2] << 6;
+        uint64_t address = qcom8998_reg_pair(regs,
+                                            (ADRENO_RB_MRT_BUF_INFO + 3) * 4);
+
+        if ((regs[ADRENO_RB_MRT_BUF_INFO] & ~ADRENO_RB_COLOR_SWAP_MASK) !=
+                ADRENO_RB_RGBA8_UNORM ||
+            regs[ADRENO_RB_RAS_MSAA_CNTL] ||
+            regs[ADRENO_RB_DEST_MSAA_CNTL] || !pitch || !layer ||
+            pitch / 4 > MDP_MAX_OUTPUT_SIZE || layer % pitch ||
+            layer / pitch > MDP_MAX_OUTPUT_SIZE ||
+            layer > ADRENO_CLEAR_MAX_BYTES || (address & 3) ||
+            address > UINT64_MAX - layer) {
+            trace_qcom8998_cp_draw_reject("linear layout", pitch, layer);
+            return false;
+        }
+        width = pitch / 4;
+        height = layer / pitch;
+        ox = oy = base = 0; /* RB_WINDOW_OFFSET applies only to GMEM bins. */
+    } else {
+        height = extract32(regs[ADRENO_RB_CNTL], 9, 8) << 5;
+        width = extract32(regs[ADRENO_RB_CNTL], 0, 8) << 5;
+        if (!height || !width || ox + width > 0x10000 ||
+            oy + height > 0x10000 ||
+            !qcom8998_gmem_layout(s, 0, regs[0xe1d0],
+            (ox + width - 1) | ((oy + height - 1) << 16), &base, &width)) {
+            return false;
+        }
+    }
+    x1 = ox;
+    y1 = oy;
+    x2 = ox + width;
+    y2 = oy + height;
+    /* Restrict clipping to a positive, origin-zero symmetric viewport. */
+    for (unsigned c = 0; c < 2; c++) {
+        unsigned extent;
+        uint32_t scale = regs[0xe011 + c * 2];
+
+        if ((regs[0xe010 + c * 2] != (scale & ~BIT(31))) ||
+            !qcom8998_screen_coordinate(float32_mul(scale & ~BIT(31),
+                                                    0x40000000, &fp),
+                                         &extent)) {
+            return false;
+        }
+        if (c) {
+            y2 = MIN(y2, extent);
+        } else {
+            x2 = MIN(x2, extent);
+        }
+    }
+    for (unsigned i = 0; i < ARRAY_SIZE(scissor); i++) {
+        x1 = MAX(x1, regs[scissor[i]] & 0xffff);
+        y1 = MAX(y1, regs[scissor[i]] >> 16);
+        x2 = MIN(x2, (regs[scissor[i] + 1] & 0xffff) + 1);
+        y2 = MIN(y2, (regs[scissor[i] + 1] >> 16) + 1);
+    }
+    x2 = MAX(x1, x2);
+    y2 = MAX(y1, y2);
+    indices = deposit64(payload[4], 32, 32, payload[5]);
+    end = ((uint64_t)payload[3] + payload[2]) * 2;
+    if ((indices & 1) || end > payload[6] || indices > UINT64_MAX - end) {
+        return false;
+    }
+    indices += (uint64_t)payload[3] * 2;
+    if (sysmem) {
+        if (!qcom8998_sysmem_surface(s, x1, y1, x2, y2, spans, &pending)) {
+            return false;
+        }
+        ox = x1;
+        oy = y1;
+        width = x2 - x1;
+    } else {
+        pending = g_memdup2(s->gmem, ADRENO_GMEM_SIZE);
+    }
+    for (unsigned t = 0; t < payload[2]; t += 3) {
+        Qcom8998RasterVertex vertex[3];
+        Qcom8998ShaderRegs shader;
+        int64_t area;
+        uint32_t color = 0;
+        bool uniform = true;
+        bool constant[4];
+        int bx1, by1, bx2, by2;
+
+        for (unsigned v = 0; v < 3; v++) {
+            uint64_t address = indices + (t + v) * 2;
+            uint32_t packed;
+            unsigned index;
+
+            if (!qcom8998_cp_word(s, address & ~3ULL, &packed, false)) {
+                return false;
+            }
+            index = extract32(packed, (address & 2) * 8, 16);
+            if ((regs[0xe384] & BIT(8)) &&
+                index == (regs[0xe38c] & 0xffff)) {
+                return false; /* Primitive restart is not decoded here. */
+            }
+            if (!qcom8998_vertex_fetch(s, index, &shader) ||
+                !qcom8998_vertex_position(s, &shader, &vertex[v])) {
+                return false;
+            }
+        }
+        area = qcom8998_edge(&vertex[0], &vertex[1], vertex[2].x, vertex[2].y);
+        if (!area) {
+            continue;
+        }
+        if (x1 == x2 || y1 == y2) {
+            /* Empty clipping causes no fragment invocation. */
+            continue;
+        }
+        if (area < 0) {
+            Qcom8998RasterVertex swap = vertex[1];
+
+            vertex[1] = vertex[2];
+            vertex[2] = swap;
+            area = -area;
+        }
+        memset(&shader, 0, sizeof(shader));
+        for (unsigned c = 0; c < 4; c++) {
+            constant[c] = vertex[0].color[c] == vertex[1].color[c] &&
+                          vertex[0].color[c] == vertex[2].color[c];
+            uniform &= constant[c];
+            for (unsigned v = 0; v < 3; v++) {
+                if (!qcom8998_shader_finite(vertex[v].color[c])) {
+                    return false;
+                }
+            }
+            shader.input[4 + c] = vertex[0].color[c];
+            shader.input_valid[4 + c] = true;
+        }
+        if (!qcom8998_fragment_color(s, &shader, 0, false, &color)) {
+            return false;
+        }
+        bx1 = MAX((int)x1, MIN(vertex[0].x,
+                  MIN(vertex[1].x, vertex[2].x)) / 256);
+        by1 = MAX((int)y1, MIN(vertex[0].y,
+                  MIN(vertex[1].y, vertex[2].y)) / 256);
+        bx2 = MIN((int)x2, MAX(vertex[0].x,
+                  MAX(vertex[1].x, vertex[2].x)) / 256 + 1);
+        by2 = MIN((int)y2, MAX(vertex[0].y,
+                  MAX(vertex[1].y, vertex[2].y)) / 256 + 1);
+        if (bx1 >= bx2 || by1 >= by2) {
+            continue;
+        }
+        if ((uint64_t)(bx2 - bx1) * (by2 - by1) > raster_budget) {
+            return false;
+        }
+        raster_budget -= (uint64_t)(bx2 - bx1) * (by2 - by1);
+        if (!uniform || blend) {
+            uint64_t work = (uint64_t)(bx2 - bx1) * (by2 - by1) *
+                            (shader.steps * 4 + 32);
+
+            if (work > fragment_budget) {
+                return false;
+            }
+            fragment_budget -= work;
+        }
+        for (unsigned y = by1; y < by2; y++) {
+            for (unsigned x = bx1; x < bx2; x++) {
+                bool inside = true;
+
+                for (unsigned e = 0; e < 3; e++) {
+                    unsigned next = (e + 1) % 3;
+                    int64_t edge = qcom8998_edge(&vertex[e], &vertex[next],
+                                                 x * 256 + 128, y * 256 + 128);
+
+                    if (edge < 0 || (!edge &&
+                        !qcom8998_top_left(&vertex[e], &vertex[next]))) {
+                        inside = false;
+                        break;
+                    }
+                }
+                if (inside) {
+                    if (!uniform || blend) {
+                        uint32_t weights[3] = { 0 };
+
+                        memset(&shader, 0, sizeof(shader));
+                        if (!uniform) {
+                            for (unsigned v = 0; v < 3; v++) {
+                                unsigned next = (v + 1) % 3;
+                                unsigned last = (v + 2) % 3;
+                                uint64_t numerator = qcom8998_edge(
+                                    &vertex[next], &vertex[last],
+                                    x * 256 + 128, y * 256 + 128);
+
+                                /* Edge integers fit exactly in float64. */
+                                weights[v] = float64_to_float32(float64_div(
+                                    uint64_to_float64(numerator, &fp),
+                                    uint64_to_float64(area, &fp), &fp), &fp);
+                            }
+                        }
+                        for (unsigned c = 0; c < 4; c++) {
+                            uint32_t value = vertex[0].color[c];
+
+                            if (!constant[c]) {
+                                value = 0;
+                                for (unsigned v = 0; v < 3; v++) {
+                                    value = float32_add(value, float32_mul(
+                                        vertex[v].color[c], weights[v], &fp),
+                                        &fp);
+                                }
+                            }
+                            shader.input[4 + c] = value;
+                            shader.input_valid[4 + c] = true;
+                        }
+                        if (!qcom8998_fragment_color(s, &shader,
+                            pending[base + (y - oy) * width + x - ox],
+                            blend, &color)) {
+                            return false;
+                        }
+                    }
+                    pending[base + (y - oy) * width + x - ox] = color;
+                    total++;
+                }
+            }
+        }
+    }
+    if (sysmem) {
+        if (!qcom8998_sysmem_publish(s, spans, pending)) {
+            return false;
+        }
+    } else {
+        memcpy(s->gmem, pending, ADRENO_GMEM_SIZE);
+    }
+    trace_qcom8998_cp_triangles(payload[2], total);
     return true;
 }
 
@@ -1712,6 +3375,9 @@ static bool qcom8998_cp_event_write(Qcom8998Display *s, unsigned count,
                 timestamp, MEMTXATTRS_UNSPECIFIED, &value, sizeof(value)) ==
                 MEMTX_OK;
         }
+    case ADRENO_EVENT_LRZ_FLUSH_INVALIDATE:
+        /* No LRZ cache or deferred writes exist in the synchronous model. */
+        return count == 1;
     case ADRENO_EVENT_CCU_INVALIDATE_DEPTH:
     case ADRENO_EVENT_CCU_INVALIDATE_COLOR:
         /* The software model has no cached attachment contents. */
@@ -1736,11 +3402,91 @@ static bool qcom8998_cp_event_write(Qcom8998Display *s, unsigned count,
     }
 }
 
+/* Retry a real dependency without requiring another guest WPTR write. */
+static bool qcom8998_cp_wait(Qcom8998Display *s, unsigned count,
+                             const uint32_t *payload)
+{
+    uint64_t address;
+    uint32_t value;
+    unsigned function, poll;
+    bool passed;
+    int64_t left, right;
+
+    if (!s->me_initialized || count != 6 || (payload[0] & ~0x3fU)) {
+        return false;
+    }
+    function = extract32(payload[0], 0, 3);
+    poll = extract32(payload[0], 4, 2);
+    address = deposit64(payload[1], 32, 32, payload[2]);
+    if (function == 7 || poll > 1) {
+        /* Scratch and write modes need their own address/side-effect rules. */
+        return false;
+    }
+    if (poll == 1) {
+        if (!qcom8998_cp_word(s, address, &value, false)) {
+            return false;
+        }
+    } else {
+        /* Register addresses are dword indices, not memory addresses. */
+        if (address > UINT_MAX) {
+            return false;
+        }
+        if (qcom8998_cp_tlb_register(address, false)) {
+            value = 0; /* No outstanding invalidation: SACTIVE is clear. */
+        } else if (qcom8998_cp_stored_register(address)) {
+            value = s->bank[BANK_ADRENO].regs[address];
+        } else {
+            return false;
+        }
+    }
+    value &= payload[4];
+    if (payload[0] & BIT(3)) {
+        left = (int32_t)value;
+        right = (int32_t)payload[3];
+    } else {
+        left = value;
+        right = payload[3];
+    }
+    switch (function) {
+    case 0:
+        passed = true;
+        break;
+    case 1:
+        passed = left < right;
+        break;
+    case 2:
+        passed = left <= right;
+        break;
+    case 3:
+        passed = left == right;
+        break;
+    case 4:
+        passed = left != right;
+        break;
+    case 5:
+        passed = left >= right;
+        break;
+    case 6:
+        passed = left > right;
+        break;
+    default:
+        g_assert_not_reached();
+    }
+    trace_qcom8998_cp_wait(address, value, payload[3], payload[4], function,
+                           !!(payload[0] & BIT(3)), poll, passed);
+    /*
+     * No GPU core clock is modeled: coalesce polls at 1 ms virtual time,
+     * rather than interpreting DELAY_LOOP_CYCLES as a host busy loop.
+     */
+    s->cp_wait_pending = !passed;
+    return passed;
+}
+
 static bool qcom8998_cp_type7(Qcom8998Display *s, uint32_t header,
                              unsigned count, uint64_t base, unsigned mask,
                              unsigned rptr, unsigned available, unsigned *skip)
 {
-    uint32_t payload[6];
+    uint32_t payload[7];
     unsigned opcode = extract32(header, 16, 7);
 
     if ((header & ADRENO_PM4_TYPE7_MASK) != ADRENO_PM4_TYPE7 ||
@@ -1748,8 +3494,26 @@ static bool qcom8998_cp_type7(Qcom8998Display *s, uint32_t header,
         !(ctpop32(extract32(header, 16, 8)) & 1)) {
         return false;
     }
+    if (s->streams[s->stream_count - 1].state_group &&
+        opcode != ADRENO_PM4_LOAD_STATE4 && opcode != ADRENO_PM4_NOP &&
+        opcode != ADRENO_PM4_WAIT_FOR_IDLE) {
+        return false; /* State buffers cannot recursively dispatch work. */
+    }
+    if ((opcode == ADRENO_PM4_DRAW_INDX_OFFSET ||
+         opcode == ADRENO_PM4_INDIRECT_BUFFER) &&
+        s->skip_ib2_global && s->skip_ib2_local && !s->visibility_override) {
+        return false; /* Consuming a visibility stream is not implemented. */
+    }
+    if (opcode == ADRENO_PM4_DRAW_INDX_OFFSET && s->me_initialized &&
+        (count == 3 || count == 7) && qcom8998_cp_dispatch_draw_state(s)) {
+        return true; /* The draw stays pending until all dirty groups return. */
+    }
     if (opcode == ADRENO_PM4_NOP) {
         return true;
+    }
+    if (opcode == ADRENO_PM4_WAIT_FOR_ME) {
+        /* No independent prefetch engine or queued ME work is modeled. */
+        return s->me_initialized && count == 0;
     }
     if (opcode == ADRENO_PM4_WAIT_FOR_IDLE) {
         /* This command processor executes synchronously. */
@@ -1774,6 +3538,28 @@ static bool qcom8998_cp_type7(Qcom8998Display *s, uint32_t header,
         }
     }
     switch (opcode) {
+    case ADRENO_PM4_SKIP_IB2_GLOBAL:
+    case ADRENO_PM4_SKIP_IB2_LOCAL:
+        if (!s->me_initialized || count != 1 || payload[0] > 1) {
+            return false;
+        }
+        if (opcode == ADRENO_PM4_SKIP_IB2_GLOBAL) {
+            s->skip_ib2_global = payload[0];
+        } else {
+            s->skip_ib2_local = payload[0];
+        }
+        return true;
+    case ADRENO_PM4_SET_VISIBILITY_OVERRIDE:
+        if (!s->me_initialized || count != 1 || payload[0] > 1) {
+            return false;
+        }
+        s->visibility_override = payload[0];
+        return true;
+    case ADRENO_PM4_DRAW_INDX_OFFSET:
+        return count == 7 ? qcom8998_cp_triangles(s, count, payload) :
+                            qcom8998_cp_rectangle(s, count, payload);
+    case ADRENO_PM4_WAIT_REG_MEM:
+        return qcom8998_cp_wait(s, count, payload);
     case ADRENO_PM4_SET_RENDER_MODE:
         /*
          * Stage only non-preemptible sysmem mode: a one-word selector or
@@ -1823,7 +3609,7 @@ static bool qcom8998_cp_type7(Qcom8998Display *s, uint32_t header,
             uint64_t address;
 
             if (!s->me_initialized || count != 3 ||
-                s->stream_count == ADRENO_CP_STREAMS ||
+                s->stream_count >= ADRENO_CP_IB_STREAMS ||
                 (payload[2] & ~ADRENO_CP_IB_SIZE_MASK)) {
                 return false;
             }
@@ -1898,12 +3684,12 @@ static void qcom8998_cp_ib_status(Qcom8998Display *s)
 {
     uint32_t *regs = s->bank[BANK_ADRENO].regs;
 
-    for (unsigned i = 1; i < ADRENO_CP_STREAMS; i++) {
+    for (unsigned i = 1; i < ADRENO_CP_IB_STREAMS; i++) {
         uint64_t address = 0;
         unsigned words = 0;
         hwaddr offset = (i - 1) * ADRENO_CP_IB_REGISTER_STRIDE;
 
-        if (i < s->stream_count) {
+        if (i < s->stream_count && !s->streams[i].state_group) {
             const Qcom8998CommandStream *stream = &s->streams[i];
 
             address = stream->base + stream->position * 4;
@@ -1918,6 +3704,7 @@ static void qcom8998_cp_ib_status(Qcom8998Display *s)
 static void qcom8998_cp_abort(Qcom8998Display *s)
 {
     timer_del(&s->cp_resume);
+    s->cp_wait_pending = false;
     s->stream_count = 0;
     memset(s->streams, 0, sizeof(s->streams));
     qcom8998_cp_ib_status(s);
@@ -1963,6 +3750,7 @@ static void qcom8998_cp_run(Qcom8998Bank *bank)
     unsigned work_words = 0;
 
     timer_del(&s->cp_resume);
+    s->cp_wait_pending = false;
     if (size > ADRENO_CP_RB_MAX_SIZE_LOG2_QWORDS ||
         (cntl & ADRENO_CP_RB_SWAP_MASK) ||
         regs[ADRENO_CP_PFP_ME_CNTL / 4]) {
@@ -1994,6 +3782,13 @@ static void qcom8998_cp_run(Qcom8998Bank *bank)
         if (!available) {
             unsigned parent_words = stream->parent_words;
 
+            if (stream->state_group) {
+                Qcom8998DrawState *state =
+                    &s->draw_state[stream->state_group - 1];
+
+                state->dirty = false;
+                state->control &= ~ADRENO_DRAW_STATE_DIRTY;
+            }
             if (--s->stream_count == 0) {
                 break;
             }
@@ -2035,6 +3830,9 @@ static void qcom8998_cp_run(Qcom8998Bank *bank)
         }
         if (!executed) {
             qcom8998_cp_trace(s, depth, header, "not executed");
+            if (s->cp_wait_pending) {
+                goto defer;
+            }
             goto publish;
         }
         if (s->stream_count != depth) {
@@ -2049,7 +3847,8 @@ static void qcom8998_cp_run(Qcom8998Bank *bank)
 defer:
     if (s->stream_count) {
         timer_mod(&s->cp_resume, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                   ADRENO_CP_DISPATCH_DELAY_NS);
+                   (s->cp_wait_pending ? 1000000 :
+                    ADRENO_CP_DISPATCH_DELAY_NS));
     }
 publish:
     if (!(cntl & ADRENO_CP_RB_NO_UPDATE)) {
@@ -2074,6 +3873,12 @@ static uint64_t qcom8998_read(void *opaque, hwaddr offset, unsigned size)
     Qcom8998Bank *bank = opaque;
     uint32_t value = bank->regs[offset / sizeof(value)];
 
+    /* The native ISR probes the masked summary before reading raw status. */
+    if (bank->index == BANK_ADRENO &&
+        offset == ADRENO_RBBM_INT_0_MASKED_STATUS) {
+        value = bank->regs[ADRENO_RBBM_INT_0_STATUS / 4] &
+                bank->regs[ADRENO_RBBM_INT_0_MASK / 4];
+    }
     if (bank->index == BANK_ADRENO_SMMU &&
         offset >= SMMU_ADRENO_CONTEXT_BASE &&
         offset < SMMU_ADRENO_CONTEXT_BASE +
@@ -2119,7 +3924,11 @@ static bool qcom8998_smmu_write(Qcom8998Bank *bank, hwaddr offset,
                         SMMU_ADRENO_CONTEXTS * SMMU_CONTEXT_STRIDE) {
         context = (offset - SMMU_ADRENO_CONTEXT_BASE) / SMMU_CONTEXT_STRIDE;
         cb_offset = offset % SMMU_CONTEXT_STRIDE;
-        if (cb_offset == SMMU_CB_FSR) {
+        if (cb_offset == SMMU_CB_TLBIALL || cb_offset == SMMU_CB_TLBSYNC ||
+            cb_offset == SMMU_CB_TLBSTATUS) {
+            /* No TLB/pending invalidation; command/status writes are WI. */
+            return true;
+        } else if (cb_offset == SMMU_CB_FSR) {
             bank->regs[offset / 4] &= ~(value & SMMU_FSR_FAULT_MASK);
         } else if (cb_offset == SMMU_CB_FSRRESTORE) {
             qcom8998_smmu_context(s, context)[SMMU_CB_FSR / 4] =
@@ -2159,7 +3968,8 @@ static void qcom8998_write(void *opaque, hwaddr offset, uint64_t value,
           offset == MDSS_HW_INTR_STATUS)) ||
         (bank->index == BANK_ADRENO &&
          (offset == ADRENO_RBBM_HW_CONFIGURATION ||
-          offset == ADRENO_RBBM_INT_0_STATUS)) ||
+          offset == ADRENO_RBBM_INT_0_STATUS ||
+          offset == ADRENO_RBBM_INT_0_MASKED_STATUS)) ||
         (bank->index == BANK_VIDEO && offset == VENUS_WRAPPER_HW_VERSION)) {
         return;
     }
@@ -2348,8 +4158,13 @@ static void qcom8998_reset(DeviceState *dev)
     s->draw_predicate_global = false;
     s->draw_predicate_local = false;
     s->draw_predicate_pass = true;
+    s->visibility_override = false;
+    s->skip_ib2_global = false;
+    s->skip_ib2_local = false;
+    memset(s->gmem, 0, ADRENO_GMEM_SIZE);
     memset(s->draw_state, 0, sizeof(s->draw_state));
     memset(s->render_mode, 0, sizeof(s->render_mode));
+    memset(s->shader_address, 0, sizeof(s->shader_address));
     for (unsigned block = 0; block < ADRENO_LOAD_BLOCKS; block++) {
         for (unsigned type = 0; type < ADRENO_LOAD_TYPES; type++) {
             if (s->load_state[block][type]) {
@@ -2370,6 +4185,7 @@ static void qcom8998_init(Object *obj)
     Qcom8998Display *s = QCOM8998_DISPLAY(obj);
     SysBusDevice *bus = SYS_BUS_DEVICE(obj);
 
+    s->gmem = g_malloc0(ADRENO_GMEM_SIZE);
     timer_init_ns(&s->mdss_vsync, QEMU_CLOCK_VIRTUAL, qcom8998_mdss_vsync, s);
     timer_init_ns(&s->cp_resume, QEMU_CLOCK_VIRTUAL, qcom8998_cp_resume, s);
     for (unsigned i = 0; i < BANK_COUNT; i++) {
@@ -2395,6 +4211,7 @@ static void qcom8998_finalize(Object *obj)
     timer_del(&s->mdss_vsync);
     timer_deinit(&s->mdss_vsync);
     timer_del(&s->cp_resume);
+    s->cp_wait_pending = false;
     timer_deinit(&s->cp_resume);
     for (unsigned block = 0; block < ADRENO_LOAD_BLOCKS; block++) {
         for (unsigned type = 0; type < ADRENO_LOAD_TYPES; type++) {
@@ -2406,6 +4223,7 @@ static void qcom8998_finalize(Object *obj)
     for (unsigned i = 0; i < BANK_COUNT; i++) {
         g_free(s->bank[i].regs);
     }
+    g_free(s->gmem);
 }
 
 static const VMStateDescription qcom8998_vmstate = {

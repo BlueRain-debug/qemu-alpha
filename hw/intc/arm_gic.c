@@ -58,7 +58,8 @@ static const uint8_t gic_id_gicv2[] = {
 
 static inline int gic_get_current_cpu(GICState *s)
 {
-    if (!qtest_enabled() && s->num_cpu > 1) {
+    /* Debugger memory reads have no current CPU; use CPU0 as in qtest. */
+    if (current_cpu && !qtest_enabled() && s->num_cpu > 1) {
         return current_cpu->cpu_index - s->first_cpu_index;
     }
     return 0;

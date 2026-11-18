@@ -35,7 +35,7 @@
 #include "qobject/qobject.h"
 #include "qapi-commands-block.h"
 
-#define MAX_IRQ 256
+#define MAX_IRQ 1024
 
 #define TYPE_QTEST "qtest"
 
@@ -327,6 +327,7 @@ void qtest_sendf(CharFrontend *chr, const char *fmt, ...)
 
 static void qtest_irq_handler(void *opaque, int n, int level)
 {
+    g_assert(n >= 0 && n < MAX_IRQ);
     if (irq_levels[n] != level) {
         CharFrontend *chr = &qtest->qtest_chr;
         irq_levels[n] = level;

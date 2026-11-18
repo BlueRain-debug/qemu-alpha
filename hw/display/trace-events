@@ -253,3 +253,11 @@ apple_gfx_iosfc_unmap_memory(void *a, void *b, void *c, void *d, void *e, void *
 apple_gfx_iosfc_unmap_memory_region(void* mem, void *region) "unmapping @ %p from memory region %p"
 apple_gfx_iosfc_raise_irq(uint32_t vector) "vector=0x%x"
 
+
+qcom8998_cp_wait(uint64_t address, uint32_t value, uint32_t reference, uint32_t mask, unsigned function, bool sign, unsigned poll, bool passed) "address=0x%"PRIx64" value=0x%08x reference=0x%08x mask=0x%08x function=%u signed=%d poll=%u passed=%d"
+
+qcom8998_cp_rectangle(unsigned x, unsigned y, unsigned width, unsigned height, uint32_t color) "rect=%u,%u %ux%u color=0x%08x"
+qcom8998_gmem_transfer(bool clear, unsigned target, unsigned offset, uint64_t destination, unsigned minimum, unsigned maximum) "clear=%d MRT%u GMEM=0x%x destination=0x%"PRIx64" min=0x%x max=0x%x"
+qcom8998_cp_triangles(unsigned indices, unsigned pixels) "indices=%u pixels=%u"
+qcom8998_cp_draw_reject(const char *reason, uint64_t first, uint64_t second) "%s first=0x%"PRIx64" second=0x%"PRIx64
+qcom8998_cp_texture_rectangle(unsigned x, unsigned y, unsigned width, unsigned height, uint64_t address) "xy=%u,%u size=%ux%u texture=0x%" PRIx64
