@@ -2,6 +2,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 #include "qemu/osdep.h"
+#include <glib/gstdio.h>
 #include "libqtest.h"
 #include "qobject/qdict.h"
 #include "qobject/qlist.h"
@@ -851,10 +852,11 @@ static void test_texture_rectangle(void)
     qtest_writel(qts, SMMU, CR0_FAULTS | 1);
     qtest_writeq(qts, GPU + 0x2000, RING_RAM);
     qtest_writel(qts, GPU + 0x2008, 13 | (1U << 27));
-    for (unsigned trial = 0; trial < 20; trial++) {
+    for (unsigned trial = 0; trial < 21; trial++) {
         unsigned n = 0, swap = trial & 3, tswap = (trial >> 2) & 3;
         bool r8 = trial == 17 || trial == 18;
         bool tiled = trial >= 18;
+        bool ubwc = trial == 20;
         unsigned pitch = tiled ? (r8 ? 128 : 256) : 64;
         unsigned length = tiled ? sizeof(expected) : 512;
 
@@ -864,6 +866,11 @@ static void test_texture_rectangle(void)
         qtest_writel(qts, 0x43001000, 0);
         memset(expected, 0xa5, sizeof(expected));
         qtest_memwrite(qts, 0x43000000, expected, length);
+        if (ubwc) {
+            uint8_t zero_flags[4096] = { 0 };
+
+            qtest_memwrite(qts, 0x43002000, zero_flags, sizeof(zero_flags));
+        }
         rect_packet(words, &n, 0x48, init, G_N_ELEMENTS(init));
         rect_packet(words, &n, 0x6c, mode, G_N_ELEMENTS(mode));
         rect_packet(words, &n, 0x64, mode, G_N_ELEMENTS(mode));
@@ -872,6 +879,13 @@ static void test_texture_rectangle(void)
         }
         if (trial >= 17) {
             swap = tswap = 0;
+        }
+        rect_register(words, &n, 0xe141, ubwc ? (1U << 16) : 0);
+        if (ubwc) {
+            rect_register(words, &n, 0xe243, 0x43002000);
+            rect_register(words, &n, 0xe244, 0);
+            rect_register(words, &n, 0xe245, 1);
+            rect_register(words, &n, 0xe246, 64);
         }
         rect_register(words, &n, 0xe152,
                       (r8 ? 3 : 0x30) | swap << 13 | (tiled ? 0x300 : 0));
@@ -902,10 +916,30 @@ static void test_texture_rectangle(void)
         qtest_writel(qts, GPU + 0x201c, n);
         qtest_writel(qts, GPU + 0x20c8, 0);
         g_assert_cmphex(qtest_readl(qts, 0x43001000), ==,
-                       trial == 16 || trial == 19 ? 0 : 0x12345678);
+                        trial == 16 ? 0 : 0x12345678);
         if (trial == 18) {
             expected[0] = source[0];
-        } else if (trial != 16 && trial != 19) {
+        } else if (trial == 19 || trial == 20) {
+            g_assert_cmphex(qtest_readl(qts, GPU + 0x2018), ==, n);
+            if (ubwc) {
+                /* Partial block write expands old flag 0x00 block to zero. */
+                memset(expected, 0, 256);
+                g_assert_cmphex(qtest_readb(qts, 0x43002000), ==, 0xff);
+            }
+            for (unsigned y = 1; y < 4; y++) {
+                for (unsigned x = 2; x < 6; x++) {
+                    unsigned tx = x == 2 ? 0 : x - 3;
+                    unsigned pix = (x & 1) | ((y & 1) << 1) |
+                                   (((x & 2) >> 1) << 2) |
+                                   (((y & 2) >> 1) << 3) |
+                                   (((x & 0x1c) >> 2) << 4) |
+                                   (((y & 4) >> 2) << 7);
+
+                    memcpy(expected + pix * 4,
+                           source + (y - 1) * 64 + tx * 4, 4);
+                }
+            }
+        } else if (trial != 16) {
             g_assert_cmphex(qtest_readl(qts, GPU + 0x2018), ==, n);
             for (unsigned y = 1; y < 4; y++) {
                 for (unsigned x = 2; x < 6; x++) {
@@ -1017,6 +1051,97 @@ static void test_draw_state_execution(void)
     qtest_quit(qts);
 }
 
+static void assert_panel_rgb(QTestState *qts, const char *path,
+                             uint8_t r, uint8_t g, uint8_t b)
+{
+    g_autofree gchar *contents = NULL;
+    gsize len = 0;
+    const char *hdr = "P6\n16 16\n255\n";
+    size_t hlen = strlen(hdr);
+    const uint8_t *px;
+
+    qtest_qmp_assert_success(qts,
+        "{ 'execute': 'screendump', 'arguments': "
+        "{ 'filename': %s, 'format': 'ppm', 'head': 0, 'device': 'qcdx8998' } }",
+        path);
+    g_assert_true(g_file_get_contents(path, &contents, &len, NULL));
+    g_assert_cmpuint(len, ==, hlen + 16 * 16 * 3);
+    g_assert_cmpint(memcmp(contents, hdr, hlen), ==, 0);
+    px = (const uint8_t *)contents + hlen;
+    g_assert_cmpuint(px[0], ==, r);
+    g_assert_cmpuint(px[1], ==, g);
+    g_assert_cmpuint(px[2], ==, b);
+    g_unlink(path);
+}
+
+static void test_mdss_autorefresh_scanout(void)
+{
+    QTestState *qts = start_oemsk();
+    g_autofree char *dump = g_build_filename(g_get_tmp_dir(),
+                                             "oemsk-mdss-test.ppm", NULL);
+    const uint64_t mdss = 0x0c900000;
+    const uint64_t mdss_smmu = 0x0cd00000;
+    const uint64_t fb0 = 0x43000000;
+    const uint64_t fb1 = 0x43010000;
+    uint32_t pixels[16 * 16];
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(pixels); i++) {
+        pixels[i] = 0xff112233;
+    }
+    qtest_memwrite(qts, fb0, pixels, sizeof(pixels));
+    for (unsigned i = 0; i < G_N_ELEMENTS(pixels); i++) {
+        pixels[i] = 0xff445566;
+    }
+    qtest_memwrite(qts, fb1, pixels, sizeof(pixels));
+
+    /* Bypass MDSS SMMU so source-pipe addresses map directly to guest RAM. */
+    qtest_writel(qts, mdss_smmu + 0x0, 1);
+
+    /* Configure DSI0 + LM0 (16x16) + PP0 (autorefresh) + CTL0 + VIG1. */
+    qtest_writel(qts, mdss + 0x94004, 0x5);        /* DSI0_CTRL EN | CMD */
+    qtest_writel(qts, mdss + 0x45004, (16U << 16) | 16U); /* LM0_OUT_SIZE */
+    qtest_writel(qts, mdss + 0x71030, 1);          /* PP0_AUTOREFRESH */
+    qtest_writel(qts, mdss + 0x71004, 1U << 19);   /* PP0_SYNC_CONFIG */
+    qtest_writel(qts, mdss + 0x71008, 16);         /* PP0_SYNC_HEIGHT */
+    qtest_writel(qts, mdss + 0x2014, (1U << 17) | (2U << 4)); /* CTL0_TOP */
+    qtest_writel(qts, mdss + 0x2000, 0x01000010);  /* CTL0_LAYER0: VIG1 stg 2 */
+
+    /* Program VIG1 (0x07000) to fb0. */
+    qtest_writel(qts, mdss + 0x7000, (16U << 16) | 16U);
+    qtest_writel(qts, mdss + 0x700c, (16U << 16) | 16U);
+    qtest_writel(qts, mdss + 0x7010, 0);
+    qtest_writel(qts, mdss + 0x7014, fb0);
+    qtest_writel(qts, mdss + 0x7024, 16 * 4);
+    qtest_writel(qts, mdss + 0x7030, 0x000237ff);
+    qtest_writel(qts, mdss + 0x7034, 0x03020001);
+    qtest_writel(qts, mdss + 0x7038, 0x80000000);
+
+    /* Initial flush + start scans out fb0 and arms autorefresh. */
+    qtest_writel(qts, mdss + 0x2018, 0x42);
+    qtest_writel(qts, mdss + 0x201c, 1);
+    qtest_clock_step(qts, 20000000);
+    g_assert_cmphex(qtest_readl(qts, mdss + 0x2018), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, mdss + 0x70a4), ==, fb0);
+    g_assert_true(qtest_readl(qts, mdss + 0x1014) & (1U << 8));
+    assert_panel_rgb(qts, dump, 0x11, 0x22, 0x33);
+    qtest_writel(qts, mdss + 0x1018, 0xffffffff);
+
+    /*
+     * Subsequent flip updates VIG1_SRC0_ADDR + CTL0_FLUSH without CTL_START.
+     * Periodic autorefresh scans out fb1 without disturbing guest flush/IRQ.
+     */
+    qtest_writel(qts, mdss + 0x7014, fb1);
+    qtest_writel(qts, mdss + 0x2018, 0x2);
+    for (unsigned i = 0; i < 16; i++) {
+        qtest_clock_step(qts, 20000000);
+    }
+    g_assert_cmphex(qtest_readl(qts, mdss + 0x2018), ==, 0x2);
+    g_assert_cmphex(qtest_readl(qts, mdss + 0x70a4), ==, fb0);
+    g_assert_false(qtest_readl(qts, mdss + 0x1014) & (1U << 8));
+    assert_panel_rgb(qts, dump, 0x44, 0x55, 0x66);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1033,5 +1158,7 @@ int main(int argc, char **argv)
     qtest_add_func("/oemsk/texture-rectangle", test_texture_rectangle);
     qtest_add_func("/oemsk/gmem-resolve", test_gmem_resolve);
     qtest_add_func("/oemsk/draw-state-execution", test_draw_state_execution);
+    qtest_add_func("/oemsk/mdss-autorefresh-scanout",
+                   test_mdss_autorefresh_scanout);
     return g_test_run();
 }

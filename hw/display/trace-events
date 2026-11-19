@@ -25,6 +25,8 @@ qcom8998_cp_load_state(unsigned block, unsigned type, unsigned destination, unsi
 qcom8998_ccu_clear(unsigned target, uint64_t base, unsigned x, unsigned y, unsigned width, unsigned height, uint32_t color) "target=%u base=0x%"PRIx64" rect=%u,%u %ux%u color=0x%08x"
 qcom8998_gpmu_reset(uint32_t value, unsigned dwords, uint32_t entry, unsigned bytes, bool ready) "value=0x%x image=%u dwords entry=0x%x mailbox=%u bytes ready=%d"
 qcom8998_mdss_transfer_done(unsigned ctl, unsigned panel, unsigned width, unsigned height, uint32_t color) "ctl=%u panel=%u %ux%u border=0x%06x"
+qcom8998_mdss_pipe_scanout(unsigned ctl, unsigned panel, unsigned pipe_base, unsigned stage, uint32_t addr, unsigned src_w, unsigned src_h, unsigned out_w, unsigned out_h) "ctl=%u panel=%u pipe=0x%x stage=%u addr=0x%08x src=%ux%u out=%ux%u"
+qcom8998_mdss_ctl_write(uint32_t offset, uint32_t value) "offset=0x%05x value=0x%08x"
 
 # jazz_led.c
 jazz_led_read(uint64_t addr, uint8_t val) "read addr=0x%"PRIx64": 0x%x"
