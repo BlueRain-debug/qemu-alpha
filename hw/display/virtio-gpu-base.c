@@ -102,7 +102,8 @@ static void virtio_gpu_ui_info(void *opaque, uint32_t idx, QemuUIInfo *info)
 {
     VirtIOGPUBase *g = opaque;
 
-    if (idx >= g->conf.max_outputs) {
+    /* A fixed panel keeps its configured modes and EDID when the UI resizes. */
+    if (idx >= g->conf.max_outputs || g->conf.fixed_outputs) {
         return;
     }
 

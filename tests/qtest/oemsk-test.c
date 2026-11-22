@@ -8,6 +8,8 @@
 #include "qobject/qlist.h"
 
 #define GPU 0x05000000
+#define RBBM_STATUS (GPU + 0x13d4)
+#define CP_GPU_BUSY_MASK 0x80000040U
 #define SMMU 0x05040000
 #define CB(n) (SMMU + 0x8000 + (n) * 0x1000)
 #define ROOT 0x41000000
@@ -324,18 +326,27 @@ static void test_wait_reg_mem(void)
         { 4, 7, 8, 7 }, { 5, 6, 7, 7 }, { 6, 6, 8, 7 },
     };
 
+    /* Status is read-only and reflects work, including deferred polls. */
+    qtest_writel(qts, RBBM_STATUS, UINT32_MAX);
+    g_assert_cmphex(qtest_readl(qts, RBBM_STATUS), ==, 0);
     for (unsigned i = 0; i < G_N_ELEMENTS(comparisons); i++) {
         qtest_writel(qts, operand, comparisons[i].initial);
         wait_ring(qts, 0x10 | comparisons[i].function, operand,
                    comparisons[i].reference, UINT32_MAX);
         g_assert_cmphex(qtest_readl(qts, GPU + 0x2018), ==, 5);
+        g_assert_cmphex(qtest_readl(qts, RBBM_STATUS) & CP_GPU_BUSY_MASK,
+                       ==, CP_GPU_BUSY_MASK);
+        qtest_writel(qts, RBBM_STATUS, 0);
         qtest_clock_step(qts, 2000000);
         g_assert_cmphex(qtest_readl(qts, GPU + 0x2018), ==, 5);
+        g_assert_cmphex(qtest_readl(qts, RBBM_STATUS) & CP_GPU_BUSY_MASK,
+                       ==, CP_GPU_BUSY_MASK);
         g_assert_cmphex(qtest_readl(qts, GPU + 0x22000), ==, 0);
         qtest_writel(qts, operand, comparisons[i].final);
         qtest_clock_step(qts, 2000000);
         g_assert_cmphex(qtest_readl(qts, GPU + 0x2018), ==, 14);
         g_assert_cmphex(qtest_readl(qts, GPU + 0x22000), ==, 0x13572468);
+        g_assert_cmphex(qtest_readl(qts, RBBM_STATUS), ==, 0);
     }
     /* Mask applies to the observed operand; signed comparison is explicit. */
     qtest_writel(qts, operand, 0x80000007);
@@ -396,6 +407,7 @@ static void test_wait_reg_mem(void)
     qtest_clock_step(qts, 2000000);
     g_assert_cmphex(qtest_readl(qts, GPU + 0x2018), ==, 5);
     g_assert_cmphex(qtest_readl(qts, GPU + 0x22000), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, RBBM_STATUS), ==, 0);
     qtest_quit(qts);
 }
 
@@ -628,7 +640,7 @@ static void test_rectangle(void)
         g_assert_cmpmem(actual, sizeof(actual), expected, sizeof(expected));
     }
     /* Fetch the same vertex constants through a shared UBO table. */
-    for (unsigned trial = 0; trial < 3; trial++) {
+    for (unsigned trial = 0; trial < 8; trial++) {
         uint32_t table[] = {
             (1U << 22) | (6U << 18) | 1, 2, 0, 0x44003000, 0
         };
@@ -645,9 +657,18 @@ static void test_rectangle(void)
         words[override_word] = 1;
         if (trial == 1) {
             constants[7] = 0x40d00000; /* Read the changed buffer contents. */
-        } else if (trial == 2) {
+        } else if (trial >= 2 && trial <= 4) {
             /* Metadata stages, but the fetch cannot read MMIO. */
             table[3] = GPU;
+        } else if (trial == 5) {
+            indirect[1] = 0x1fff1; /* Two vec4s cannot cross a UBO slot. */
+        } else if (trial == 6) {
+            /* Native Composer binds stage slot 18, beyond the old limit. */
+            table[0] = (1U << 22) | (6U << 18) | 18;
+            indirect[1] = 0x120011;
+        } else if (trial == 7) {
+            table[0] = (1U << 22) | (6U << 18) | 19;
+            indirect[1] = 0x140011; /* Slot 20 belongs to the next stage. */
         }
         for (unsigned i = 0; i < 8; i++) {
             qtest_writel(qts, 0x44003010 + i * 4, constants[3 + i]);
@@ -656,8 +677,15 @@ static void test_rectangle(void)
         rect_packet(words, &n, 0x30, table, G_N_ELEMENTS(table));
         rect_packet(words, &n, 0x30, auxiliary, G_N_ELEMENTS(auxiliary));
         rect_packet(words, &n, 0x30, indirect, G_N_ELEMENTS(indirect));
+        if (trial == 3) {
+            /* Native order: bind against stale metadata, then replace it. */
+            table[3] = 0x44003000;
+            rect_packet(words, &n, 0x30, table, G_N_ELEMENTS(table));
+        }
         rect_packet(words, &n, 0x30, color, G_N_ELEMENTS(color));
-        rect_packet(words, &n, 0x38, draw, G_N_ELEMENTS(draw));
+        if (trial != 4) {
+            rect_packet(words, &n, 0x38, draw, G_N_ELEMENTS(draw));
+        }
         rect_packet(words, &n, 0x3d, finish, G_N_ELEMENTS(finish));
         qtest_writel(qts, GPU + 0x20c8, 1);
         qtest_writel(qts, GPU + 0x2018, 0);
@@ -670,10 +698,10 @@ static void test_rectangle(void)
         }
         qtest_writel(qts, GPU + 0x201c, n);
         qtest_writel(qts, GPU + 0x20c8, 0);
-        if (!trial) {
+        if (!trial || trial == 3 || trial == 4 || trial == 6) {
             g_assert_cmphex(qtest_readl(qts, GPU + 0x2018), ==, n);
             g_assert_cmphex(qtest_readl(qts, fence), ==, 0x12345678);
-            for (unsigned y = 1; y < 4; y++) {
+            for (unsigned y = 1; trial != 4 && y < 4; y++) {
                 for (unsigned x = 2; x < 6; x++) {
                     memcpy(expected + y * 64 + x * 4, "\x80\xff\0\xff", 4);
                 }
@@ -1142,6 +1170,533 @@ static void test_mdss_autorefresh_scanout(void)
     qtest_quit(qts);
 }
 
+static void test_vsc_hardware_binning(void)
+{
+    QTestState *qts = start_oemsk();
+    const uint64_t fence = 0x44001000;
+    const uint32_t init[] = { 0xb, 0, 0, 0 };
+    const uint32_t mode_bin[] = { 2, 0, 0, 0x8, 1 };
+    const uint32_t mode_gmem[] = { 3, 0, 0, 0x18, 1 };
+    const uint32_t mode_bypass[] = { 1 };
+    const uint32_t vsc_start[] = { 0x2c };
+    const uint32_t vsc_end[] = { 0x2d };
+    const uint32_t enable[] = { 1 };
+    const uint32_t disable[] = { 0 };
+    const uint32_t bin_data[] = { 0x00010000, 0x100000, 0, 0x200000, 0 };
+    const uint32_t tri_bin[] = { 0x84, 1, 3 };
+    const uint32_t finish[] = { fence, 0, 0x12345678 };
+    uint32_t words[128], n = 0;
+
+    /*
+     * Exercise A540 VSC binning registers (VSC_BIN_SIZE/SIZE_ADDRESS/PIPE_*),
+     * BINNING pass draw skip, and GMEM tile visibility binding (SET_BIN_DATA5).
+     */
+    rect_packet(words, &n, 0x48, init, G_N_ELEMENTS(init));
+    rect_register(words, &n, 0x0bc2, 0x00020002); /* VSC_BIN_SIZE */
+    rect_register(words, &n, 0x0bc3, 0x00200000); /* VSC_SIZE_ADDRESS_LO */
+    rect_register(words, &n, 0x0bc4, 0x00000000); /* VSC_SIZE_ADDRESS_HI */
+    rect_register(words, &n, 0x0bd0, 0x01100000); /* VSC_PIPE_CONFIG[0] */
+    rect_register(words, &n, 0x0be0, 0x00100000); /* VSC_PIPE_DATA_ADDR[0].LO */
+    rect_register(words, &n, 0x0be1, 0x00000000); /* VSC_PIPE_DATA_ADDR[0].HI */
+    rect_register(words, &n, 0x0c00, 0x0001ffe0); /* VSC_PIPE_DATA_LENGTH[0] */
+    rect_packet(words, &n, 0x6c, mode_bin, G_N_ELEMENTS(mode_bin));
+    rect_packet(words, &n, 0x46, vsc_start, G_N_ELEMENTS(vsc_start));
+    rect_packet(words, &n, 0x38, tri_bin, G_N_ELEMENTS(tri_bin));
+    rect_packet(words, &n, 0x46, vsc_end, G_N_ELEMENTS(vsc_end));
+    rect_packet(words, &n, 0x12, NULL, 0);        /* CP_WAIT_MEM_WRITES */
+    rect_packet(words, &n, 0x6c, mode_gmem, G_N_ELEMENTS(mode_gmem));
+    rect_packet(words, &n, 0x1d, enable, G_N_ELEMENTS(enable));
+    rect_packet(words, &n, 0x23, enable, G_N_ELEMENTS(enable));
+    rect_packet(words, &n, 0x64, disable, G_N_ELEMENTS(disable));
+    rect_packet(words, &n, 0x2f, bin_data, G_N_ELEMENTS(bin_data));
+    rect_packet(words, &n, 0x6c, mode_bypass, G_N_ELEMENTS(mode_bypass));
+    rect_packet(words, &n, 0x3d, finish, G_N_ELEMENTS(finish));
+
+    qtest_writel(qts, SMMU, CR0_FAULTS | 1);
+    qtest_writeq(qts, GPU + 0x2000, RING_RAM);
+    qtest_writel(qts, GPU + 0x2008, 13 | (1U << 27));
+    qtest_writel(qts, GPU + 0x20c8, 1);
+    qtest_writel(qts, GPU + 0x2018, 0);
+    qtest_writel(qts, GPU + 0x201c, 0);
+    qtest_writel(qts, fence, 0);
+    for (unsigned i = 0; i < n; i++) {
+        qtest_writel(qts, RING_RAM + i * 4, words[i]);
+    }
+    qtest_writel(qts, GPU + 0x201c, n);
+    qtest_writel(qts, GPU + 0x20c8, 0);
+    g_assert_cmphex(qtest_readl(qts, GPU + 0x2018), ==, n);
+    g_assert_cmphex(qtest_readl(qts, fence), ==, 0x12345678);
+    g_assert_cmphex(qtest_readl(qts, GPU + 0x0bc2 * 4), ==, 0x00020002);
+    g_assert_cmphex(qtest_readl(qts, GPU + 0x0c00 * 4), ==, 0x0001ffe0);
+
+    /* Leaving GMEM clears bin_data_valid so an unbound visibility draw stops. */
+    n = 0;
+    rect_packet(words, &n, 0x38, tri_bin, G_N_ELEMENTS(tri_bin));
+    rect_packet(words, &n, 0x3d, finish, G_N_ELEMENTS(finish));
+    qtest_writel(qts, GPU + 0x20c8, 1);
+    qtest_writel(qts, GPU + 0x2018, 0);
+    qtest_writel(qts, GPU + 0x201c, 0);
+    qtest_writel(qts, fence, 0);
+    for (unsigned i = 0; i < n; i++) {
+        qtest_writel(qts, RING_RAM + i * 4, words[i]);
+    }
+    qtest_writel(qts, GPU + 0x201c, n);
+    qtest_writel(qts, GPU + 0x20c8, 0);
+    g_assert_cmphex(qtest_readl(qts, fence), ==, 0);
+    qtest_quit(qts);
+}
+
+static void test_gmem_restore(void)
+{
+    QTestState *qts = start_oemsk();
+    const uint64_t source = RING_IOVA + 0x10000;
+    const uint64_t destination = RING_IOVA + 0x20000;
+    const uint64_t source_ram = 0x43000000, dest_ram = 0x43010000;
+    const uint64_t fence_ram = 0x43020000;
+    const uint64_t fence = SHADOW_IOVA & ~UINT64_C(0xfff);
+    const uint32_t init[] = { 0xb, 0, 0, 0 };
+    uint32_t event[] = { 0x1e, (uint32_t)fence, fence >> 32, 0x1111 };
+    uint8_t pixels[384 * 48], actual[sizeof(pixels)], expected[sizeof(pixels)];
+    const unsigned inverse[4][4] = {
+        { 0, 1, 2, 3 }, { 2, 1, 0, 3 }, { 1, 2, 3, 0 }, { 3, 2, 1, 0 }
+    };
+
+    set_context(qts, 0, HUPCF | CFIE);
+    set_ring(qts);
+    qtest_writeq(qts, L3 + 5 * 8, RING_RAM | AF | 3);
+    qtest_writeq(qts, L3, fence_ram | AF | 3);
+    for (unsigned trial = 0; trial < 6; trial++) {
+        uint32_t words[128], n = 0, resume;
+        for (unsigned i = 0; i < sizeof(pixels); i++) {
+            pixels[i] = (i * 37 + i / 384) ^ (trial >= 4 ? 0x80 : 0);
+        }
+        qtest_memwrite(qts, source_ram, pixels, sizeof(pixels));
+        memset(expected, 0xa5, sizeof(expected));
+        qtest_memwrite(qts, dest_ram, expected, sizeof(expected));
+        qtest_writel(qts, fence_ram, 0);
+        for (unsigned page = 0; page < 5; page++) {
+            qtest_writeq(qts, L3 + (21 + page) * 8,
+                         trial == 4 && page == 3 ? 0 :
+                         (source_ram + page * 4096) | AF | 3);
+            qtest_writeq(qts, L3 + (37 + page) * 8,
+                         (dest_ram + page * 4096) | AF | 3);
+        }
+        rect_packet(words, &n, 0x48, init, G_N_ELEMENTS(init));
+        /* 64x32 bin at (16,8), with a nonzero GMEM destination offset. */
+        rect_register(words, &n, 0xe140, 0x20202);
+        rect_register(words, &n, 0xe141, 0);
+        rect_register(words, &n, 0xe142, 0);
+        rect_register(words, &n, 0xe143, 0);
+        rect_register(words, &n, 0xe1d0, 0x80010);
+        rect_register(words, &n, 0xe152,
+                      trial == 5 ? 0x31 : 0x30 | ((trial & 3) << 13));
+        rect_register(words, &n, 0xe153, 6);
+        rect_register(words, &n, 0xe154, sizeof(pixels) / 64);
+        rect_register(words, &n, 0xe155, (uint32_t)source);
+        rect_register(words, &n, 0xe156, source >> 32);
+        rect_register(words, &n, 0xe210, 0);
+        rect_register(words, &n, 0xe211, 0x80010);
+        rect_register(words, &n, 0xe212, 0x27004f);
+        rect_register(words, &n, 0xe213, 0);
+        rect_register(words, &n, 0xe214, 256);
+        rect_register(words, &n, 0xe215, 0);
+        rect_register(words, &n, 0xe216, 4);
+        rect_register(words, &n, 0xe217, 0);
+        rect_register(words, &n, 0xe21c, 0);
+        event[3] = 0x1111;
+        rect_packet(words, &n, 0x46, event, G_N_ELEMENTS(event));
+        resume = n;
+        /* Store with identity byte order to expose the imported RGBA texels. */
+        rect_register(words, &n, 0xe140, 0x202);
+        rect_register(words, &n, 0xe152, 0x230);
+        rect_register(words, &n, 0xe155, 256);
+        rect_register(words, &n, 0xe156, 0);
+        rect_register(words, &n, 0xe213, 4);
+        rect_register(words, &n, 0xe214, (uint32_t)destination);
+        rect_register(words, &n, 0xe215, destination >> 32);
+        rect_register(words, &n, 0xe216, 6);
+        event[3] = 0x2222;
+        rect_packet(words, &n, 0x46, event, G_N_ELEMENTS(event));
+        qtest_writel(qts, GPU + 0x20c8, 1);
+        qtest_writel(qts, GPU + 0x2018, 0);
+        qtest_writel(qts, GPU + 0x201c, 0);
+        for (unsigned i = 0; i < n; i++) {
+            qtest_writel(qts, RING_RAM + i * 4, words[i]);
+        }
+        qtest_writel(qts, GPU + 0x201c, n);
+        qtest_writel(qts, GPU + 0x20c8, 0);
+        if (trial >= 4) {
+            g_assert_cmphex(qtest_readl(qts, fence_ram), ==, 0);
+            if (trial == 4) {
+                g_assert_cmphex(fault(qts, 0), ==, 2);
+                g_assert_cmphex(qtest_readq(qts, CB(0) + CB_FAR), ==,
+                               source + 0x3040);
+                g_assert_cmphex(qtest_readl(qts, CB(0) + FSYNR0) & (1U << 4),
+                               ==, 0);
+                clear_fault(qts, 0);
+            }
+            /* Inspect the previous tile through a real resolve after failure. */
+            qtest_writel(qts, GPU + 0x20c8, 1);
+            qtest_writel(qts, GPU + 0x2018, resume);
+            qtest_writel(qts, GPU + 0x201c, n);
+            qtest_writel(qts, GPU + 0x20c8, 0);
+        }
+        g_assert_cmphex(qtest_readl(qts, fence_ram), ==, 0x2222);
+        for (unsigned y = 8; y < 40; y++) {
+            for (unsigned x = 16; x < 80; x++) {
+                for (unsigned c = 0; c < 4; c++) {
+                    unsigned index = y * 384 + x * 4 + inverse[MIN(trial, 3)][c];
+                    expected[y * 384 + x * 4 + c] = index * 37 + index / 384;
+                }
+            }
+        }
+        qtest_memread(qts, dest_ram, actual, sizeof(actual));
+        g_assert_cmpmem(actual, sizeof(actual), expected, sizeof(expected));
+    }
+    qtest_quit(qts);
+}
+
+static void test_gmem_a8_tiled(void)
+{
+    QTestState *qts = start_oemsk();
+    const uint64_t source = RING_IOVA + 0x10000;
+    const uint64_t destination = RING_IOVA + 0x20000;
+    const uint64_t source_ram = 0x43000000, dest_ram = 0x43010000;
+    const uint64_t fence_ram = 0x43020000;
+    const uint64_t fence = SHADOW_IOVA & ~UINT64_C(0xfff);
+    const uint32_t init[] = { 0xb, 0, 0, 0 };
+    uint32_t event[] = { 0x1e, (uint32_t)fence, fence >> 32, 0x3333 };
+    /* 128x32 TILE5_3 A8_UNORM (cpp=1): 1 macrotile = 4096 bytes. */
+    uint8_t src_buf[4096], dst_buf[4096];
+    uint32_t words[128], n = 0;
+
+    set_context(qts, 0, HUPCF | CFIE);
+    set_ring(qts);
+    qtest_writeq(qts, L3 + 5 * 8, RING_RAM | AF | 3);
+    qtest_writeq(qts, L3, fence_ram | AF | 3);
+    qtest_writeq(qts, L3 + 21 * 8, source_ram | AF | 3);
+    qtest_writeq(qts, L3 + 37 * 8, dest_ram | AF | 3);
+
+    for (unsigned i = 0; i < sizeof(src_buf); i++) {
+        src_buf[i] = (uint8_t)((i * 29 + 7) & 0xff);
+    }
+    qtest_memwrite(qts, source_ram, src_buf, sizeof(src_buf));
+    memset(dst_buf, 0x5a, sizeof(dst_buf));
+    qtest_memwrite(qts, dest_ram, dst_buf, sizeof(dst_buf));
+    qtest_writel(qts, fence_ram, 0);
+
+    rect_packet(words, &n, 0x48, init, G_N_ELEMENTS(init));
+    /* Restore 128x32 TILE5_3 A8_UNORM (0x0302) -> GMEM (128x32x1 = 4096B). */
+    rect_register(words, &n, 0xe140, 0x20204); /* width=128, height=32, BYPASS */
+    rect_register(words, &n, 0xe141, 0);
+    rect_register(words, &n, 0xe142, 0);
+    rect_register(words, &n, 0xe143, 0);
+    rect_register(words, &n, 0xe1d0, 0);
+    rect_register(words, &n, 0xe152, 0x0302); /* A8_UNORM + TILE5_3 */
+    rect_register(words, &n, 0xe153, 2);      /* pitch = 2 * 64 = 128 */
+    rect_register(words, &n, 0xe154, 0);      /* single layer */
+    rect_register(words, &n, 0xe155, (uint32_t)source);
+    rect_register(words, &n, 0xe156, source >> 32);
+    rect_register(words, &n, 0xe210, 0);
+    rect_register(words, &n, 0xe211, 0);
+    rect_register(words, &n, 0xe212, (31U << 16) | 127U);
+    rect_register(words, &n, 0xe213, 0);      /* LOAD / restore */
+    rect_register(words, &n, 0xe214, 0);      /* GMEM offset 0 */
+    rect_register(words, &n, 0xe215, 0);
+    rect_register(words, &n, 0xe216, 2);      /* GMEM pitch = 128 */
+    rect_register(words, &n, 0xe217, 0);
+    rect_register(words, &n, 0xe21c, 0);
+    event[3] = 0x3333;
+    rect_packet(words, &n, 0x46, event, G_N_ELEMENTS(event));
+    /* Resolve back from GMEM A8_UNORM (0x0202) -> TILE5_3 sysmem (0xe213=7). */
+    rect_register(words, &n, 0xe140, 0x0204); /* width=128, height=32, GMEM */
+    rect_register(words, &n, 0xe152, 0x0202); /* A8_UNORM + TILE5_2 */
+    rect_register(words, &n, 0xe155, 0);
+    rect_register(words, &n, 0xe156, 0);
+    rect_register(words, &n, 0xe213, 7);      /* STORE + TILE5_3 */
+    rect_register(words, &n, 0xe214, (uint32_t)destination);
+    rect_register(words, &n, 0xe215, destination >> 32);
+    rect_register(words, &n, 0xe216, 2);      /* pitch = 128 */
+    rect_register(words, &n, 0xe217, 0);
+    rect_register(words, &n, 0xe21c, 0);
+    event[3] = 0x4444;
+    rect_packet(words, &n, 0x46, event, G_N_ELEMENTS(event));
+
+    qtest_writel(qts, GPU + 0x20c8, 1);
+    qtest_writel(qts, GPU + 0x2018, 0);
+    qtest_writel(qts, GPU + 0x201c, 0);
+    for (unsigned i = 0; i < n; i++) {
+        qtest_writel(qts, RING_RAM + i * 4, words[i]);
+    }
+    qtest_writel(qts, GPU + 0x201c, n);
+    qtest_writel(qts, GPU + 0x20c8, 0);
+    g_assert_cmphex(qtest_readl(qts, fence_ram), ==, 0x4444);
+    qtest_memread(qts, dest_ram, dst_buf, sizeof(dst_buf));
+    g_assert_cmpmem(dst_buf, sizeof(dst_buf), src_buf, sizeof(src_buf));
+    qtest_quit(qts);
+}
+
+static void test_register_predicate(void)
+{
+    QTestState *qts = start_oemsk();
+    const uint64_t conditional = 0x44001000, fence = 0x44001004;
+    const uint32_t init[] = { 0xb, 0, 0, 0 };
+    const uint32_t bin[] = { 0x10000, 0x100000, 0, 0x200000, 0 };
+    const uint32_t selected[] = { conditional, 0, 0x12345678 };
+    const uint32_t finish[] = { fence, 0, 0xabcdef01 };
+    const uint32_t bypass[] = { 1 };
+
+    for (unsigned trial = 0; trial < 11; trial++) {
+        uint32_t words[128], n = 0;
+        uint32_t test[] = { 0xe000 | (17U << 20) };
+        uint32_t condition[] = { 0x10000000, 4 };
+        bool blocked = (trial >= 3 && trial <= 6) || trial == 10;
+        bool passed = trial == 1 || trial == 2 || trial == 7 || trial == 8;
+
+        rect_packet(words, &n, 0x48, init, G_N_ELEMENTS(init));
+        rect_register(words, &n, 0xe000, trial ? 1U << 17 : 0);
+        if (trial == 2) {
+            test[0] |= 1U << 25; /* Synchronous implicit WAIT_FOR_ME. */
+        } else if (trial == 3) {
+            test[0] = 0x3ffff; /* Unknown register; never index past MMIO. */
+        } else if (trial == 4) {
+            test[0] |= 1U << 18; /* Unsupported on-chip memory source. */
+        } else if (trial == 5) {
+            condition[0] = 0x20000000; /* Not the predicate-test form. */
+        } else if (trial == 6) {
+            condition[1] = 0xffffff; /* Cannot skip out of this stream. */
+        } else if (trial >= 7) {
+            /* Captured QCDX bin selection and conditional IB pattern. */
+            rect_packet(words, &n, 0x2f, bin, G_N_ELEMENTS(bin));
+            if (trial == 9) {
+                rect_packet(words, &n, 0x6c, bypass, G_N_ELEMENTS(bypass));
+            }
+            test[0] = trial == 8 ? 0xc1f | (31U << 20) :
+                      trial == 10 ? 0xc20 : 0xc10;
+        }
+        rect_packet(words, &n, 0x39, test, G_N_ELEMENTS(test));
+        rect_packet(words, &n, 0x47, condition, G_N_ELEMENTS(condition));
+        rect_packet(words, &n, 0x3d, selected, G_N_ELEMENTS(selected));
+        rect_packet(words, &n, 0x3d, finish, G_N_ELEMENTS(finish));
+        qtest_writel(qts, SMMU, CR0_FAULTS | 1);
+        qtest_writeq(qts, GPU + 0x2000, RING_RAM);
+        qtest_writel(qts, GPU + 0x2008, 13 | (1U << 27));
+        qtest_writel(qts, GPU + 0x20c8, 1);
+        qtest_writel(qts, GPU + 0x2018, 0);
+        qtest_writel(qts, GPU + 0x201c, 0);
+        qtest_writel(qts, conditional, 0);
+        qtest_writel(qts, fence, 0);
+        for (unsigned i = 0; i < n; i++) {
+            qtest_writel(qts, RING_RAM + i * 4, words[i]);
+        }
+        qtest_writel(qts, GPU + 0x201c, n);
+        qtest_writel(qts, GPU + 0x20c8, 0);
+        g_assert_cmphex(qtest_readl(qts, conditional), ==,
+                        passed && !blocked ? 0x12345678 : 0);
+        g_assert_cmphex(qtest_readl(qts, fence), ==,
+                        blocked ? 0 : 0xabcdef01);
+        if (!blocked) {
+            g_assert_cmphex(qtest_readl(qts, GPU + 0x2018), ==, n);
+        }
+    }
+    qtest_quit(qts);
+}
+
+static void test_mdss_merged_view(void)
+{
+    QTestState *qts = start_oemsk();
+    g_autofree char *dump = g_build_filename(g_get_tmp_dir(),
+                                             "oemsk-mdss-merged.ppm", NULL);
+    const uint64_t mdss = 0x0c900000;
+    const uint64_t mdss_smmu = 0x0cd00000;
+    const uint64_t fb0 = 0x43000000;
+    const uint64_t fb1 = 0x43010000;
+    const uint64_t fb2 = 0x43020000;
+    uint32_t pixels[16 * 16];
+    const char *hdr = "P6\n32 16\n255\n";
+    size_t hlen = strlen(hdr);
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(pixels); i++) {
+        pixels[i] = 0xff112233;
+    }
+    qtest_memwrite(qts, fb0, pixels, sizeof(pixels));
+    for (unsigned i = 0; i < G_N_ELEMENTS(pixels); i++) {
+        pixels[i] = 0xff445566;
+    }
+    qtest_memwrite(qts, fb1, pixels, sizeof(pixels));
+    for (unsigned i = 0; i < G_N_ELEMENTS(pixels); i++) {
+        pixels[i] = 0xff778899;
+    }
+    qtest_memwrite(qts, fb2, pixels, sizeof(pixels));
+
+    qtest_writel(qts, mdss_smmu + 0x0, 1);
+
+    /* Panel 0: DSI0 + LM0 (16x16) + PP0 + CTL0 + VIG1 (fb0). */
+    qtest_writel(qts, mdss + 0x94004, 0x5);
+    qtest_writel(qts, mdss + 0x45004, (16U << 16) | 16U);
+    qtest_writel(qts, mdss + 0x71004, 1U << 19);
+    qtest_writel(qts, mdss + 0x71008, 16);
+    qtest_writel(qts, mdss + 0x2014, (1U << 17) | (2U << 4));
+    qtest_writel(qts, mdss + 0x2000, 0x01000010);
+    qtest_writel(qts, mdss + 0x7000, (16U << 16) | 16U);
+    qtest_writel(qts, mdss + 0x700c, (16U << 16) | 16U);
+    qtest_writel(qts, mdss + 0x7010, 0);
+    qtest_writel(qts, mdss + 0x7014, fb0);
+    qtest_writel(qts, mdss + 0x7024, 16 * 4);
+    qtest_writel(qts, mdss + 0x7030, 0x000237ff);
+    qtest_writel(qts, mdss + 0x7034, 0x03020001);
+    qtest_writel(qts, mdss + 0x7038, 0x80000000);
+
+    /* Panel 1: DSI1 + LM1 (16x16) + PP1 + CTL1 + RGB0 (fb1). */
+    qtest_writel(qts, mdss + 0x96004, 0x5);
+    qtest_writel(qts, mdss + 0x46004, (16U << 16) | 16U);
+    qtest_writel(qts, mdss + 0x71804, 1U << 19);
+    qtest_writel(qts, mdss + 0x71808, 16);
+    qtest_writel(qts, mdss + 0x2214, (1U << 17) | (3U << 4));
+    qtest_writel(qts, mdss + 0x2204, 0x01000000 | (2U << 9));
+    qtest_writel(qts, mdss + 0x15000, (16U << 16) | 16U);
+    qtest_writel(qts, mdss + 0x1500c, (16U << 16) | 16U);
+    qtest_writel(qts, mdss + 0x15010, 0);
+    qtest_writel(qts, mdss + 0x15014, fb1);
+    qtest_writel(qts, mdss + 0x15024, 16 * 4);
+    qtest_writel(qts, mdss + 0x15030, 0x000237ff);
+    qtest_writel(qts, mdss + 0x15034, 0x03020001);
+    qtest_writel(qts, mdss + 0x15038, 0x80000000);
+
+    qtest_writel(qts, mdss + 0x2018, 0x42);
+    qtest_writel(qts, mdss + 0x201c, 1);
+    qtest_writel(qts, mdss + 0x2218, 0x88);
+    qtest_writel(qts, mdss + 0x221c, 1);
+    qtest_clock_step(qts, 20000000);
+
+    {
+        g_autofree gchar *contents = NULL;
+        gsize len = 0;
+        const uint8_t *px;
+
+        qtest_qmp_assert_success(qts,
+            "{ 'execute': 'screendump', 'arguments': "
+            "{ 'filename': %s, 'format': 'ppm', 'head': 2, "
+            "'device': 'qcdx8998' } }", dump);
+        g_assert_true(g_file_get_contents(dump, &contents, &len, NULL));
+        g_assert_cmpuint(len, ==, hlen + 32 * 16 * 3);
+        g_assert_cmpint(memcmp(contents, hdr, hlen), ==, 0);
+        px = (const uint8_t *)contents + hlen;
+        /* Left panel pixel (0, 0). */
+        g_assert_cmpuint(px[0], ==, 0x11);
+        g_assert_cmpuint(px[1], ==, 0x22);
+        g_assert_cmpuint(px[2], ==, 0x33);
+        /* Right panel pixel (16, 0). */
+        g_assert_cmpuint(px[16 * 3 + 0], ==, 0x44);
+        g_assert_cmpuint(px[16 * 3 + 1], ==, 0x55);
+        g_assert_cmpuint(px[16 * 3 + 2], ==, 0x66);
+        g_unlink(dump);
+    }
+
+    /* Incremental update of panel 1 updates only the right half of head 2. */
+    qtest_writel(qts, mdss + 0x15014, fb2);
+    qtest_writel(qts, mdss + 0x2218, 0x88);
+    qtest_writel(qts, mdss + 0x221c, 1);
+    qtest_clock_step(qts, 20000000);
+
+    {
+        g_autofree gchar *contents = NULL;
+        gsize len = 0;
+        const uint8_t *px;
+
+        qtest_qmp_assert_success(qts,
+            "{ 'execute': 'screendump', 'arguments': "
+            "{ 'filename': %s, 'format': 'ppm', 'head': 2, "
+            "'device': 'qcdx8998' } }", dump);
+        g_assert_true(g_file_get_contents(dump, &contents, &len, NULL));
+        g_assert_cmpuint(len, ==, hlen + 32 * 16 * 3);
+        px = (const uint8_t *)contents + hlen;
+        g_assert_cmpuint(px[0], ==, 0x11);
+        g_assert_cmpuint(px[1], ==, 0x22);
+        g_assert_cmpuint(px[2], ==, 0x33);
+        g_assert_cmpuint(px[16 * 3 + 0], ==, 0x77);
+        g_assert_cmpuint(px[16 * 3 + 1], ==, 0x88);
+        g_assert_cmpuint(px[16 * 3 + 2], ==, 0x99);
+        g_unlink(dump);
+    }
+
+    qtest_quit(qts);
+}
+
+static void test_bypass_blit(void)
+{
+    QTestState *qts = start_oemsk();
+    const uint64_t source = RING_IOVA + 0x10000;
+    const uint64_t destination = RING_IOVA + 0x20000;
+    const uint64_t source_ram = 0x43000000, dest_ram = 0x43010000;
+    const uint64_t fence_ram = 0x43020000;
+    const uint64_t fence = SHADOW_IOVA & ~UINT64_C(0xfff);
+    const uint32_t init[] = { 0xb, 0, 0, 0 };
+    uint32_t event[] = { 0x1e, (uint32_t)fence, fence >> 32, 0x2222 };
+    uint8_t src_buf[256 * 16], dst_buf[256 * 16], actual[256 * 16];
+    uint32_t words[128], n = 0;
+
+    set_context(qts, 0, HUPCF | CFIE);
+    set_ring(qts);
+    qtest_writeq(qts, L3 + 5 * 8, RING_RAM | AF | 3);
+    qtest_writeq(qts, L3, fence_ram | AF | 3);
+    qtest_writeq(qts, L3 + 21 * 8, source_ram | AF | 3);
+    qtest_writeq(qts, L3 + 37 * 8, dest_ram | AF | 3);
+
+    for (unsigned i = 0; i < sizeof(src_buf); i++) {
+        src_buf[i] = (i * 29 + 7) & 0xff;
+    }
+    memset(dst_buf, 0x5a, sizeof(dst_buf));
+    qtest_memwrite(qts, source_ram, src_buf, sizeof(src_buf));
+    qtest_memwrite(qts, dest_ram, dst_buf, sizeof(dst_buf));
+    qtest_writel(qts, fence_ram, 0);
+
+    rect_packet(words, &n, 0x48, init, G_N_ELEMENTS(init));
+    rect_register(words, &n, 0xe140, 0x20000); /* BYPASS */
+    rect_register(words, &n, 0xe141, 0);
+    rect_register(words, &n, 0xe142, 0);
+    rect_register(words, &n, 0xe143, 0);
+    rect_register(words, &n, 0xe152, 0x30);    /* RGBA8_UNORM linear */
+    rect_register(words, &n, 0xe153, 4);       /* pitch = 256 bytes (64 px) */
+    rect_register(words, &n, 0xe154, sizeof(src_buf) / 64);
+    rect_register(words, &n, 0xe155, (uint32_t)source);
+    rect_register(words, &n, 0xe156, source >> 32);
+    rect_register(words, &n, 0xe210, 0);       /* MRT0 */
+    rect_register(words, &n, 0xe211, (4U << 16) | 16U);   /* min (16, 4) */
+    rect_register(words, &n, 0xe212, (11U << 16) | 47U);  /* max (47, 11) */
+    rect_register(words, &n, 0xe213, 4);       /* linear blit without flag */
+    rect_register(words, &n, 0xe214, (uint32_t)destination);
+    rect_register(words, &n, 0xe215, destination >> 32);
+    rect_register(words, &n, 0xe216, 4);
+    rect_register(words, &n, 0xe217, sizeof(dst_buf) / 64);
+    rect_register(words, &n, 0xe21c, 0);       /* RB_CLEAR_CNTL = 0 */
+    rect_packet(words, &n, 0x46, event, G_N_ELEMENTS(event));
+
+    qtest_writel(qts, GPU + 0x20c8, 1);
+    qtest_writel(qts, GPU + 0x2018, 0);
+    qtest_writel(qts, GPU + 0x201c, 0);
+    for (unsigned i = 0; i < n; i++) {
+        qtest_writel(qts, RING_RAM + i * 4, words[i]);
+    }
+    qtest_writel(qts, GPU + 0x201c, n);
+    qtest_writel(qts, GPU + 0x20c8, 0);
+
+    g_assert_cmphex(qtest_readl(qts, GPU + 0x2018), ==, n);
+    g_assert_cmphex(qtest_readl(qts, fence_ram), ==, 0x2222);
+
+    qtest_memread(qts, dest_ram, actual, sizeof(actual));
+    for (unsigned y = 0; y < 16; y++) {
+        for (unsigned x = 0; x < 64; x++) {
+            unsigned off = y * 256 + x * 4;
+            bool inside = x >= 16 && x <= 47 && y >= 4 && y <= 11;
+            const uint8_t *exp = inside ? src_buf + off : dst_buf + off;
+
+            g_assert_cmpint(memcmp(actual + off, exp, 4), ==, 0);
+        }
+    }
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1160,5 +1715,11 @@ int main(int argc, char **argv)
     qtest_add_func("/oemsk/draw-state-execution", test_draw_state_execution);
     qtest_add_func("/oemsk/mdss-autorefresh-scanout",
                    test_mdss_autorefresh_scanout);
+    qtest_add_func("/oemsk/vsc-hardware-binning", test_vsc_hardware_binning);
+    qtest_add_func("/oemsk/register-predicate", test_register_predicate);
+    qtest_add_func("/oemsk/gmem-restore", test_gmem_restore);
+    qtest_add_func("/oemsk/gmem-a8-tiled", test_gmem_a8_tiled);
+    qtest_add_func("/oemsk/mdss-merged-view", test_mdss_merged_view);
+    qtest_add_func("/oemsk/bypass-blit", test_bypass_blit);
     return g_test_run();
 }

@@ -108,6 +108,111 @@ Machine-specific options
 
 The following machine-specific options are supported:
 
+winrt
+  Enable the experimental AArch32 Windows RT platform with ``winrt=on``.
+  The default is ``off``. This local experiment is based on GH Cao's
+  Windows RT port for QEMU 6.2.
+
+  This mode requires TCG, one AArch32 CPU, GICv2, ``secure=off`` and
+  ``virtualization=off``. It retains the CPU Security Extensions,
+  adds platform EHCI and SDHCI controllers, and describes them in ACPI
+  instead of exposing the PCI hierarchy to the guest OS by default. PCI
+  remains available to the firmware. See ``winrt-pci`` below for guests
+  with PCI support.
+
+  EHCI is at ``0x090e0000`` (SPI 11), and SDHCI at ``0x090f0000``
+  (SPI 12). These addresses differ from the reference port to avoid
+  the PCI hotplug register block added since QEMU 6.2. Use a matching
+  ARM32 ``ArmVirtQemuWinRt`` firmware. Connect the boot disk using
+  ``-drive if=sd,...``; its virtual size must meet the SD card model's
+  power-of-two size requirement.
+
+  The reference WinRT firmware must keep its firmware/NVRAM NOR banks
+  out of the OS disk list. Advertising their 256 KiB erase blocks through
+  Block I/O makes the 8288 loader grow its sector cache; the observed
+  cache then overlaps the HAL file buffer. The local reference firmware
+  defaults ``WINRT_NOR_BLOCK_IO`` to ``FALSE`` and retains FVB for variable
+  services. Its build script accepts ``-ExposeNorFlashBlockIo`` only for
+  a diagnostic comparison with the previous behavior.
+
+  The firmware's ``WINRT_SD_IO_ALIGN`` option remains a diagnostic setting,
+  defaulting to ``0`` (original SD driver policy). Keep the default for
+  normal WinRT boots; increasing alignment is not the HAL fix.
+
+  For the Windows RT 8288 experiment, use a clock before the build's
+  expiration date, for example::
+
+    -rtc base=2011-12-31T12:00:00,clock=vm
+
+  The guest can retain a later date based on its previous startup metadata.
+
+winrt-pci
+  Expose the PCI hierarchy in ACPI alongside the Windows RT platform
+  devices. This requires ``winrt=on`` and defaults to ``off`` for
+  compatibility with older Windows RT guests that lack PCI support.
+
+  Windows Mobile guests with an ARM PCI bus driver can use this option
+  to enumerate the PCI display adapter. With matching EDID-capable
+  firmware, this lets Windows read the panel dimensions and select its
+  display scale. For example, a 1080x1920 phone panel can be described
+  with ``-device VGA,xres=1080,yres=1920,width-mm=75,height-mm=133``.
+
+winrt-qcdx-probe
+  Enable the local MSM8x60 graphics initialization experiment. Defaults to
+  ``off``. Requires ``winrt=on``, ``winrt-qcom-timer=on``, ``gic-version=2``,
+  ``winrt-pci=off``, ``winrt-legacy-ram=off``, and 64 to 2944 MiB RAM.
+
+  This probe supplies native MMIO and graphics memory windows, device IDs,
+  and an ARMv7 short-descriptor translation subset. The A2xx command
+  interpreter preserves nested indirect-buffer progress, implements RAM
+  fences and interrupts, and waits for genuine memory/register predicates.
+  Unsupported commands remain pending without completing subsequent fences.
+
+  Experimental software drawing supports auto-indexed, axis-aligned RECTLIST
+  draws and bounded 16-bit indexed triangle lists with straight-line
+  EXEC/EXEC_END shaders. Floating-point/RGBA8 vertex fetches, mini-fetch index
+  reuse, a small vector/scalar ALU subset, viewport and window transforms,
+  D3D integer and OGL half-integer pixel centers,
+  nearest/bilinear RGBA8 texture sampling, and additive blending with common
+  factors are implemented. Render targets may be linear/tiled system RAM or
+  the 512 KiB A220 GMEM. Rectangle resolves copy GMEM into linear/tiled RGBA8
+  system RAM. Depth/stencil, homogeneous clipping, shader loops/predication,
+  additional formats and general blend operations are not implemented. This
+  is not a complete Adreno GPU. Original phone start tiles have rendered in
+  a local diagnostic boot; this does not establish general application,
+  input or stability support.
+
+  A separate diagnostic, enabled with
+  ``-global qcom-mdp4-probe.upload-endian-workaround=on``, bypasses RGBA8
+  texture ``8IN16`` byte swapping. Observed QCDX CPU-upload descriptors request
+  this conversion even though their staging bytes already have the expected
+  order. Bypassing it fixes corrupted color and alpha in the local test.
+  The underlying hardware/driver contract remains unresolved. This workaround
+  defaults to ``off``; all descriptor endian modes are honored without it.
+
+  The MDP4 RGB1/mixer-0/LCDC path scans out a linear RGBA8 buffer through its
+  own SMMU context. It appears as the ``qcdx`` graphical console after the
+  driver configures the plane, with real frame/overlay interrupt status.
+  Enable the ``qcom_mdp4_probe_*`` trace events to inspect driver accesses,
+  completed draws and the first unsupported drawing state. Migration of this
+  experimental device is not supported.
+
+  The variable flash bank moves to ``0xf8000000`` to avoid the vendor
+  miniport's hard-coded MMCC address. Matching WinRT firmware must reserve
+  the video pool described by the ``qemu,winrt-qcdx-carveout`` FDT property.
+
+winrt-qcdx-ssdt
+  A path to one original-machine SSDT containing SMMU/GPU resources and panel
+  configuration for ``winrt-qcdx-probe=on``. The header, size and checksum
+  are validated before it is added to the ACPI tables. Original panel data
+  is supplied separately by the local experiment.
+
+winrt-sdhci-dma
+  Enable SDHCI DMA in the Windows RT platform. The default is ``on``,
+  matching the reference v3 port. Set ``off`` to advertise PIO-only
+  transfers, matching the intermediate reference port. This option
+  affects the controller only when ``winrt=on``.
+
 secure
   Set ``on``/``off`` to enable/disable emulating a guest CPU which implements the
   Arm Security Extensions (TrustZone). The default is ``off``.

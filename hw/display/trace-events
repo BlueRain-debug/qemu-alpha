@@ -22,6 +22,10 @@ qcom8998_cp_packet(unsigned rptr, unsigned wptr, uint32_t header, const char *re
 qcom8998_cp_ib(unsigned level, uint64_t base, unsigned rptr, unsigned words, uint32_t header, const char *result) "level=%u base=0x%"PRIx64" rptr=0x%x words=0x%x header=0x%08x %s"
 qcom8998_cp_draw_state(unsigned group, uint32_t control, uint64_t address) "group=%u control=0x%08x address=0x%"PRIx64
 qcom8998_cp_load_state(unsigned block, unsigned type, unsigned destination, unsigned units, unsigned unit_words, uint64_t address, uint32_t first, uint32_t last) "block=%u type=%u destination=%u units=%u unit_words=%u address=0x%"PRIx64" first=0x%08x last=0x%08x"
+qcom8998_cp_load_state_request(unsigned count, uint32_t control, uint32_t address_lo, uint32_t address_hi) "count=%u control=0x%08x address_lo=0x%08x address_hi=0x%08x"
+qcom8998_cp_reg_test(unsigned reg, unsigned bit, uint32_t value, bool passed) "reg=0x%x bit=%u value=0x%08x passed=%d"
+qcom8998_cp_yield(int64_t usec) "usec=%" PRId64
+qcom8998_gmem_restore(uint64_t offset, uint64_t source, uint32_t minimum, uint32_t maximum) "gmem=0x%" PRIx64 " source=0x%" PRIx64 " min=0x%08x max=0x%08x"
 qcom8998_ccu_clear(unsigned target, uint64_t base, unsigned x, unsigned y, unsigned width, unsigned height, uint32_t color) "target=%u base=0x%"PRIx64" rect=%u,%u %ux%u color=0x%08x"
 qcom8998_gpmu_reset(uint32_t value, unsigned dwords, uint32_t entry, unsigned bytes, bool ready) "value=0x%x image=%u dwords entry=0x%x mailbox=%u bytes ready=%d"
 qcom8998_mdss_transfer_done(unsigned ctl, unsigned panel, unsigned width, unsigned height, uint32_t color) "ctl=%u panel=%u %ux%u border=0x%06x"
@@ -261,5 +265,6 @@ qcom8998_cp_wait(uint64_t address, uint32_t value, uint32_t reference, uint32_t 
 qcom8998_cp_rectangle(unsigned x, unsigned y, unsigned width, unsigned height, uint32_t color) "rect=%u,%u %ux%u color=0x%08x"
 qcom8998_gmem_transfer(bool clear, unsigned target, unsigned offset, uint64_t destination, unsigned minimum, unsigned maximum) "clear=%d MRT%u GMEM=0x%x destination=0x%"PRIx64" min=0x%x max=0x%x"
 qcom8998_cp_triangles(unsigned indices, unsigned pixels) "indices=%u pixels=%u"
+qcom8998_cp_draw_time(bool begin, uint32_t control, unsigned vertices, int64_t usec) "begin=%d control=0x%x vertices=%u usec=%" PRId64
 qcom8998_cp_draw_reject(const char *reason, uint64_t first, uint64_t second) "%s first=0x%"PRIx64" second=0x%"PRIx64
 qcom8998_cp_texture_rectangle(unsigned x, unsigned y, unsigned width, unsigned height, uint64_t address) "xy=%u,%u size=%ux%u texture=0x%" PRIx64

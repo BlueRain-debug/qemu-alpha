@@ -34,6 +34,10 @@ typedef struct RAMFBCfg RAMFBCfg;
 
 struct RAMFBState {
     DisplaySurface *ds;
+    MemoryRegion *mr;
+    ram_addr_t offset;
+    hwaddr size;
+    uint32_t stride, row_bytes;
     uint32_t width, height;
     struct RAMFBCfg cfg;
 };
@@ -99,6 +103,18 @@ static void ramfb_fw_cfg_write(void *dev, off_t offset, size_t len)
         return;
     }
 
+    if (s->mr) {
+        memory_region_set_log(s->mr, false, DIRTY_MEMORY_VGA);
+        memory_region_unref(s->mr);
+    }
+    s->mr = memory_region_from_host(surface_data(surface), &s->offset);
+    if (s->mr) {
+        memory_region_ref(s->mr);
+        memory_region_set_log(s->mr, true, DIRTY_MEMORY_VGA);
+    }
+    s->stride = surface_stride(surface);
+    s->row_bytes = width * PIXMAN_FORMAT_BPP(format) / 8;
+    s->size = (hwaddr)s->stride * (height - 1) + s->row_bytes;
     s->width = width;
     s->height = height;
     qemu_free_displaysurface(s->ds);
@@ -107,6 +123,9 @@ static void ramfb_fw_cfg_write(void *dev, off_t offset, size_t len)
 
 void ramfb_display_update(QemuConsole *con, RAMFBState *s)
 {
+    bool full = s->ds != NULL;
+    unsigned first = s->height, last = 0;
+
     if (!s->width || !s->height) {
         return;
     }
@@ -116,8 +135,26 @@ void ramfb_display_update(QemuConsole *con, RAMFBState *s)
         s->ds = NULL;
     }
 
-    /* simple full screen update */
-    qemu_console_update_full(con);
+    if (s->mr) {
+        g_autofree DirtyBitmapSnapshot *snap =
+            memory_region_snapshot_and_clear_dirty(s->mr, s->offset, s->size,
+                                                    DIRTY_MEMORY_VGA);
+
+        for (unsigned y = 0; y < s->height; y++) {
+            if (full || memory_region_snapshot_get_dirty(s->mr, snap,
+                        s->offset + (hwaddr)y * s->stride, s->row_bytes)) {
+                first = MIN(first, y);
+                last = y + 1;
+            }
+        }
+    } else {
+        first = 0;
+        last = s->height;
+    }
+    /* Avoid scaling the entire boot framebuffer for a small spinner update. */
+    if (last > first) {
+        qemu_console_update(con, 0, first, s->width, last - first);
+    }
 }
 
 static int ramfb_post_load(void *opaque, int version_id)
