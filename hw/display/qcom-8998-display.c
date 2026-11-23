@@ -2599,8 +2599,7 @@ static bool qcom8998_gmem_layout(Qcom8998Display *s, unsigned target,
         (minimum & 0xffff) < ox || (minimum >> 16) < oy ||
         (maximum & 0xffff) >= ox + *width ||
         (maximum >> 16) >= oy + height ||
-        (regs[mrt] & ~(ADRENO_RB_COLOR_SWAP_MASK | 0xffU)) != (2U << 8) ||
-        (regs[ADRENO_RB_RENDER_CNTL] & (BIT(16 + target) | BIT(24 + target)))) {
+        (regs[mrt] & ~(ADRENO_RB_COLOR_SWAP_MASK | 0xffU)) != (2U << 8)) {
         return false;
     }
     offset = qcom8998_reg_pair(regs, (mrt + 3) * 4);
@@ -2679,10 +2678,12 @@ static bool qcom8998_gmem_resolve(Qcom8998Display *s, unsigned target,
 {
     const uint32_t *regs = s->bank[BANK_ADRENO].regs;
     unsigned offset, width, fmt, cpp, mrt, swap, tile;
+    bool ubwc;
     unsigned x1 = minimum & 0xffff, y1 = minimum >> 16;
     unsigned x2 = maximum & 0xffff, y2 = maximum >> 16;
     unsigned ox = regs[0xe1d0] & 0xffff, oy = regs[0xe1d0] >> 16;
-    uint64_t destination, pitch, layer, last;
+    uint64_t destination, pitch, layer, pixel_layer, last;
+    uint64_t flag_addr = 0, flag_pitch = 0, flag_size = 0;
     const uint8_t *gmem;
 
     if (!qcom8998_gmem_layout(s, target, minimum, maximum, &offset, &width,
@@ -2692,7 +2693,9 @@ static bool qcom8998_gmem_resolve(Qcom8998Display *s, unsigned target,
         return false;
     }
     tile = regs[ADRENO_RB_RESOLVE_CNTL] & 3;
-    if (tile && (tile != 3 || (cpp != 1 && cpp != 4))) {
+    ubwc = !!(regs[ADRENO_RB_RESOLVE_CNTL] & BIT(3));
+    if ((tile && (tile != 3 || (cpp != 1 && cpp != 4))) ||
+        (ubwc && (tile != 3 || cpp != 4))) {
         trace_qcom8998_cp_draw_reject("gmem_resolve tile",
             regs[ADRENO_RB_RESOLVE_CNTL], fmt);
         return false;
@@ -2702,12 +2705,40 @@ static bool qcom8998_gmem_resolve(Qcom8998Display *s, unsigned target,
     destination = qcom8998_reg_pair(regs, ADRENO_RB_BLIT_DST * 4);
     pitch = (uint64_t)regs[ADRENO_RB_BLIT_DST_PITCH] << 6;
     layer = (uint64_t)regs[ADRENO_RB_BLIT_DST_ARRAY_PITCH] << 6;
+    pixel_layer = layer;
+    if (ubwc) {
+        unsigned fb = 0xe243 + target * 4;
+        uint64_t flag_array_pitch = (uint64_t)regs[fb + 3] << 6;
+
+        flag_addr = qcom8998_reg_pair(regs, fb * 4);
+        flag_pitch = (uint64_t)regs[fb + 2] << 6;
+        if (flag_addr < destination &&
+            (layer ? (destination - flag_addr < layer)
+                   : (!flag_array_pitch ||
+                      destination - flag_addr <= flag_array_pitch))) {
+            flag_size = destination - flag_addr;
+            if (layer) {
+                pixel_layer = layer - flag_size;
+            }
+        } else {
+            flag_size = flag_array_pitch;
+        }
+        if ((flag_addr & 4095) || !flag_pitch || (flag_pitch & 63) ||
+            flag_pitch < DIV_ROUND_UP(pitch / cpp, 16) ||
+            !flag_size || flag_size > ADRENO_CLEAR_MAX_BYTES ||
+            flag_addr > UINT64_MAX - flag_size ||
+            (uint64_t)(y2 / 4) * flag_pitch + (x2 / 16) >= flag_size) {
+            trace_qcom8998_cp_draw_reject("gmem_resolve ubwc", flag_pitch,
+                                          flag_size);
+            return false;
+        }
+    }
     last = y2 * pitch + (uint64_t)(x2 + 1) * cpp;
     gmem = (const uint8_t *)s->gmem + offset;
     /* Zero layer stride is valid for a single layer, as used by QCDX. */
     if ((destination & 3) || pitch < (uint64_t)(x2 + 1) * cpp ||
-        (layer && last > layer) || destination > UINT64_MAX - last) {
-        trace_qcom8998_cp_draw_reject("gmem_resolve dst", pitch, layer);
+        (pixel_layer && last > pixel_layer) || destination > UINT64_MAX - last) {
+        trace_qcom8998_cp_draw_reject("gmem_resolve dst", pitch, pixel_layer);
         return false;
     }
     if (tile == 3 || cpp != 4) {
@@ -2725,7 +2756,7 @@ static bool qcom8998_gmem_resolve(Qcom8998Display *s, unsigned target,
             unsigned align_h = cpp == 1 ? 32 : 16;
 
             if ((destination & 4095) || (pitch % align_w) ||
-                (layer && (layer % (pitch * align_h)))) {
+                (pixel_layer && (pixel_layer % (pitch * align_h)))) {
                 trace_qcom8998_cp_draw_reject("gmem_resolve align",
                                               destination, pitch);
                 return false;
@@ -2733,6 +2764,34 @@ static bool qcom8998_gmem_resolve(Qcom8998Display *s, unsigned target,
             qcom8998_tile5_3_params(pitch, cpp, hbb, &mt_stride, &bank_mask);
         }
         qcom8998_page_cache_init(&write_cache, write_pages);
+        if (ubwc) {
+            for (unsigned by = y1 / 4; by <= y2 / 4; by++) {
+                for (unsigned bx = x1 / 16; bx <= x2 / 16; bx++) {
+                    uint64_t faddr = flag_addr + (uint64_t)by * flag_pitch + bx;
+                    uint8_t *fpage = qcom8998_stage_write_page(s, &write_cache,
+                                                               faddr);
+                    bool full = bx * 16 >= x1 && (bx + 1) * 16 - 1 <= x2 &&
+                                by * 4 >= y1 && (by + 1) * 4 - 1 <= y2;
+
+                    if (!fpage) {
+                        return false;
+                    }
+                    if (!full && fpage[faddr & 4095] == 0x00) {
+                        uint64_t baddr = destination +
+                            qcom8998_tile5_3_block_offset_fast(
+                                bx, by, mt_stride, bank_mask, hbb);
+                        uint8_t *bpage = qcom8998_stage_write_page(
+                            s, &write_cache, baddr);
+
+                        if (!bpage) {
+                            return false;
+                        }
+                        memset(bpage + (baddr & 4095), 0, 256);
+                    }
+                    fpage[faddr & 4095] = 0xff;
+                }
+            }
+        }
         if (tile == 3) {
             for (unsigned y = y1; y <= y2; y++) {
                 unsigned row = (y - oy) * width;
@@ -2868,7 +2927,9 @@ static bool qcom8998_gmem_restore(Qcom8998Display *s, unsigned target,
     unsigned x1 = minimum & 0xffff, y1 = minimum >> 16;
     unsigned x2 = maximum & 0xffff, y2 = maximum >> 16;
     unsigned mrt, fmt, tile, swap, cpp;
-    uint64_t offset, source, pitch, layer, last;
+    bool src_ubwc;
+    uint64_t offset, source, pitch, layer, pixel_layer, last;
+    uint64_t flag_addr = 0, flag_pitch = 0, flag_size = 0;
     unsigned copy_width;
     g_autofree uint8_t *pending = NULL;
 
@@ -2879,19 +2940,22 @@ static bool qcom8998_gmem_restore(Qcom8998Display *s, unsigned target,
     fmt = regs[mrt] & 0xff;
     tile = extract32(regs[mrt], 8, 2);
     swap = extract32(regs[mrt], 13, 2);
+    src_ubwc = !!(regs[ADRENO_RB_RENDER_CNTL] & BIT(16 + target));
     cpp = qcom8998_rb_format_cpp(fmt);
     offset = qcom8998_reg_pair(regs, ADRENO_RB_BLIT_DST * 4);
     source = qcom8998_reg_pair(regs, (mrt + 3) * 4);
     pitch = (uint64_t)regs[mrt + 1] << 6;
     layer = (uint64_t)regs[mrt + 2] << 6;
+    pixel_layer = layer;
     last = (uint64_t)y2 * pitch + ((uint64_t)x2 + 1) * cpp;
 
     if (!width || !height || !cpp || (cpp == 1 && swap) ||
         (tile && tile != 3) || (tile == 3 && cpp != 1 && cpp != 4) ||
+        (src_ubwc && (tile != 3 || cpp != 4)) ||
+        (!src_ubwc && (regs[ADRENO_RB_RENDER_CNTL] & BIT(24 + target))) ||
         (regs[ADRENO_RB_CNTL] & ~(0x1feffU | ADRENO_RB_BYPASS)) ||
         regs[ADRENO_RB_RAS_MSAA_CNTL] || regs[ADRENO_RB_DEST_MSAA_CNTL] ||
         (regs[mrt] & ~(ADRENO_RB_COLOR_SWAP_MASK | 0x300U | 0xffU)) ||
-        (regs[ADRENO_RB_RENDER_CNTL] & (BIT(16 + target) | BIT(24 + target))) ||
         ox + width > 0x10000 || oy + height > 0x10000 ||
         x1 > x2 || y1 > y2 || x1 < ox || y1 < oy ||
         x2 >= ox + width || y2 >= oy + height ||
@@ -2903,9 +2967,40 @@ static bool qcom8998_gmem_restore(Qcom8998Display *s, unsigned target,
          (uint64_t)regs[ADRENO_RB_BLIT_DST_ARRAY_PITCH] * 64 <
              (uint64_t)width * height * cpp) ||
         (source & 3) || pitch < ((uint64_t)x2 + 1) * cpp ||
-        (layer && last > layer) || source > UINT64_MAX - last) {
+        source > UINT64_MAX - last) {
         trace_qcom8998_cp_draw_reject("gmem_restore", regs[mrt],
                                       regs[ADRENO_RB_RENDER_CNTL]);
+        return false;
+    }
+    if (src_ubwc) {
+        unsigned fb = 0xe243 + target * 4;
+        uint64_t flag_array_pitch = (uint64_t)regs[fb + 3] << 6;
+
+        flag_addr = qcom8998_reg_pair(regs, fb * 4);
+        flag_pitch = (uint64_t)regs[fb + 2] << 6;
+        if (flag_addr < source &&
+            (layer ? (source - flag_addr < layer)
+                   : (!flag_array_pitch ||
+                      source - flag_addr <= flag_array_pitch))) {
+            flag_size = source - flag_addr;
+            if (layer) {
+                pixel_layer = layer - flag_size;
+            }
+        } else {
+            flag_size = flag_array_pitch;
+        }
+        if ((flag_addr & 4095) || !flag_pitch || (flag_pitch & 63) ||
+            flag_pitch < DIV_ROUND_UP(pitch / cpp, 16) ||
+            !flag_size || flag_size > ADRENO_CLEAR_MAX_BYTES ||
+            flag_addr > UINT64_MAX - flag_size ||
+            (uint64_t)(y2 / 4) * flag_pitch + (x2 / 16) >= flag_size) {
+            trace_qcom8998_cp_draw_reject("gmem_restore ubwc", flag_pitch,
+                                          flag_size);
+            return false;
+        }
+    }
+    if (pixel_layer && last > pixel_layer) {
+        trace_qcom8998_cp_draw_reject("gmem_restore layer", last, pixel_layer);
         return false;
     }
     copy_width = x2 - x1 + 1;
@@ -2923,7 +3018,7 @@ static bool qcom8998_gmem_restore(Qcom8998Display *s, unsigned target,
         Qcom8998PageCache src_cache;
 
         if ((source & 4095) || (pitch % align_w) ||
-            (layer && (layer % (pitch * align_h)))) {
+            (pixel_layer && (pixel_layer % (pitch * align_h)))) {
             trace_qcom8998_cp_draw_reject("gmem_restore align", source, pitch);
             return false;
         }
@@ -2937,33 +3032,58 @@ static bool qcom8998_gmem_restore(Qcom8998Display *s, unsigned target,
             while (x <= x2) {
                 unsigned bx = x / bw;
                 unsigned x_end = MIN(x2 + 1, (bx + 1) * bw);
-                uint64_t baddr = source +
-                    qcom8998_tile5_3_block_offset_fast(bx, yb, mt_stride,
-                                                       bank_mask, hbb);
-                const uint8_t *ppage = qcom8998_texture_page(s, &src_cache,
-                                                             baddr);
-                const uint8_t *blk;
 
-                if (!ppage) {
-                    return false;
-                }
-                blk = ppage + (baddr & 4095);
-                if (cpp == 1) {
-                    for (unsigned xx = x; xx < x_end; xx++) {
-                        unsigned pi = qcom8998_tile5_3_pixel_index(
-                            xx - bx * bw, ly);
+                if (src_ubwc) {
+                    uint64_t faddr = flag_addr + (uint64_t)yb * flag_pitch + bx;
+                    const uint8_t *fpage = qcom8998_texture_page(s, &src_cache,
+                                                                 faddr);
+                    uint8_t flag;
 
-                        dst_row[xx - x1] = blk[pi];
+                    if (!fpage) {
+                        return false;
                     }
-                } else {
-                    uint32_t *dst32 = (uint32_t *)dst_row;
+                    flag = fpage[faddr & 4095];
+                    if (flag == 0x00) {
+                        memset(dst_row + (size_t)(x - x1) * cpp, 0,
+                               (size_t)(x_end - x) * cpp);
+                        x = x_end;
+                        continue;
+                    }
+                    if (flag != 0xff) {
+                        trace_qcom8998_cp_draw_reject("gmem_restore ubwc flag",
+                                                      flag, (yb << 16) | bx);
+                        return false;
+                    }
+                }
+                {
+                    uint64_t baddr = source +
+                        qcom8998_tile5_3_block_offset_fast(bx, yb, mt_stride,
+                                                           bank_mask, hbb);
+                    const uint8_t *ppage = qcom8998_texture_page(s, &src_cache,
+                                                                 baddr);
+                    const uint8_t *blk;
 
-                    for (unsigned xx = x; xx < x_end; xx++) {
-                        unsigned pi = qcom8998_tile5_3_pixel_index(
-                            xx - bx * bw, ly);
+                    if (!ppage) {
+                        return false;
+                    }
+                    blk = ppage + (baddr & 4095);
+                    if (cpp == 1) {
+                        for (unsigned xx = x; xx < x_end; xx++) {
+                            unsigned pi = qcom8998_tile5_3_pixel_index(
+                                xx - bx * bw, ly);
 
-                        dst32[xx - x1] = qcom8998_color_unswap(
-                            ldl_le_p(blk + pi * 4), swap);
+                            dst_row[xx - x1] = blk[pi];
+                        }
+                    } else {
+                        uint32_t *dst32 = (uint32_t *)dst_row;
+
+                        for (unsigned xx = x; xx < x_end; xx++) {
+                            unsigned pi = qcom8998_tile5_3_pixel_index(
+                                xx - bx * bw, ly);
+
+                            dst32[xx - x1] = qcom8998_color_unswap(
+                                ldl_le_p(blk + pi * 4), swap);
+                        }
                     }
                 }
                 x = x_end;
@@ -3041,7 +3161,7 @@ static bool qcom8998_fill_rect(Qcom8998Display *s, unsigned target,
          fmt != 0x0f) ||
         (regs[mrt] & ~(ADRENO_RB_COLOR_SWAP_MASK | 0x300U | 0xffU)) ||
         (tile && tile != 3) ||
-        (regs[ADRENO_RB_RENDER_CNTL] & BIT(24 + target))) {
+        (!ubwc && (regs[ADRENO_RB_RENDER_CNTL] & BIT(24 + target)))) {
         return false;
     }
     cpp = fmt == ADRENO_RB_RGBA8_UNORM ? 4 : (fmt == 0x0f ? 2 : 1);
@@ -3257,7 +3377,7 @@ static bool qcom8998_bypass_blit(Qcom8998Display *s, unsigned target,
         (src_tile == 3 && cpp != 1 && cpp != 4) ||
         (dst_tile == 3 && cpp != 1 && cpp != 4) ||
         (src_ubwc && (src_tile != 3 || cpp != 4)) ||
-        (regs[ADRENO_RB_RENDER_CNTL] & BIT(24 + target))) {
+        (!src_ubwc && (regs[ADRENO_RB_RENDER_CNTL] & BIT(24 + target)))) {
         trace_qcom8998_cp_draw_reject("bypass_blit fmt", regs[mrt],
                                       regs[ADRENO_RB_RENDER_CNTL]);
         return false;
@@ -3518,14 +3638,16 @@ static bool qcom8998_ccu_clear(Qcom8998Display *s)
     if (regs[ADRENO_RB_CNTL] != ADRENO_RB_BYPASS) {
         if ((regs[ADRENO_RB_RESOLVE_CNTL] == 0 ||
              regs[ADRENO_RB_RESOLVE_CNTL] == 4 ||
-             regs[ADRENO_RB_RESOLVE_CNTL] == 7) &&
+             regs[ADRENO_RB_RESOLVE_CNTL] == 7 ||
+             regs[ADRENO_RB_RESOLVE_CNTL] == 0xf) &&
             regs[ADRENO_RB_CLEAR_CNTL] ==
                 (ADRENO_RB_FAST_CLEAR | ADRENO_RB_CLEAR_ALL_COMPONENTS)) {
             /* FAST_CLEAR also overrides the previous tile's store direction. */
             return qcom8998_gmem_clear(s, target, minimum, maximum);
         }
         if ((regs[ADRENO_RB_RESOLVE_CNTL] == 4 ||
-             regs[ADRENO_RB_RESOLVE_CNTL] == 7) &&
+             regs[ADRENO_RB_RESOLVE_CNTL] == 7 ||
+             regs[ADRENO_RB_RESOLVE_CNTL] == 0xf) &&
             !regs[ADRENO_RB_CLEAR_CNTL]) {
             if (!qcom8998_gmem_resolve(s, target, minimum, maximum)) {
                 return false;
@@ -4585,6 +4707,9 @@ static bool qcom8998_fs_prefetch(Qcom8998Display *s,
     return true;
 }
 
+static bool qcom8998_vfd_read(Qcom8998Display *s, Qcom8998PageCache *cache,
+                              uint64_t iova, void *buf, size_t size);
+
 static bool qcom8998_ir3_cat5_tex(Qcom8998Display *s, unsigned block,
                                   Qcom8998ShaderRegs *r, uint64_t instruction)
 {
@@ -4614,6 +4739,7 @@ static bool qcom8998_ir3_cat5_tex(Qcom8998Display *s, unsigned block,
 
     /* Supported: isam (0), isaml (1), isamm (2), sam (3), samb (4), saml (5). */
     if (opc > 5 || (instruction & (BIT_ULL(48) | BIT_ULL(51)))) {
+        trace_qcom8998_cp_draw_reject("cat5 opc", opc, instruction);
         return false;
     }
     if (block == 12 && r->tex_info && tex_idx < r->tex_info_count &&
@@ -4622,6 +4748,9 @@ static bool qcom8998_ir3_cat5_tex(Qcom8998Display *s, unsigned block,
     } else {
         if (!textures || tex_idx >= textures->len ||
             !g_array_index(textures, Qcom8998StateUnit, tex_idx).valid) {
+            trace_qcom8998_cp_draw_reject("cat5 tex missing",
+                                          ((uint64_t)tex_block << 32) | tex_idx,
+                                          textures ? textures->len : 0);
             return false;
         }
         tex = g_array_index(textures, Qcom8998StateUnit, tex_idx).words;
@@ -4629,6 +4758,8 @@ static bool qcom8998_ir3_cat5_tex(Qcom8998Display *s, unsigned block,
     if (opc >= 3) {
         if (!samplers || samp_idx >= samplers->len ||
             !g_array_index(samplers, Qcom8998StateUnit, samp_idx).valid) {
+            trace_qcom8998_cp_draw_reject("cat5 samp missing", samp_idx,
+                                          samplers ? samplers->len : 0);
             return false;
         }
         samp = g_array_index(samplers, Qcom8998StateUnit, samp_idx).words;
@@ -4643,10 +4774,12 @@ static bool qcom8998_ir3_cat5_tex(Qcom8998Display *s, unsigned block,
     uint32_t u_raw = 0, v_raw = 0;
 
     if (!qcom8998_ir3_read_reg(r, src1, full_src, &u_raw)) {
+        trace_qcom8998_cp_draw_reject("cat5 src1", src1, full_src);
         return false;
     }
     if (tex_type != 0 && tex_type != 4) { /* 2D */
         if (!qcom8998_ir3_read_reg(r, src1 + 1, full_src, &v_raw)) {
+            trace_qcom8998_cp_draw_reject("cat5 src1+1", src1 + 1, tex_type);
             return false;
         }
     }
@@ -4660,33 +4793,147 @@ static bool qcom8998_ir3_cat5_tex(Qcom8998Display *s, unsigned block,
             uint64_t base = info ? info->base :
                 deposit64(tex[4], 32, 17, tex[5] & 0x1ffff);
             unsigned fmt = info ? info->fmt : extract32(tex[0], 22, 8);
-            unsigned cpp = (fmt == 2 || fmt == 3 || fmt == 5) ? 1 : 4;
-            uint32_t w = 0;
+            unsigned swap = info ? info->swap : extract32(tex[0], 30, 2);
+            unsigned cpp;
+            uint8_t raw_bytes[16] = { 0 };
+            float fcomps[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+            uint32_t icomps[4] = { 0, 0, 0, 1 };
 
-            if (ix < 0 || !qcom8998_texture_word(s, pages,
-                    base + (uint64_t)ix * cpp, cpp, &w)) {
+            if (fmt >= 0x02 && fmt <= 0x06) {
+                cpp = 1;
+            } else if ((fmt >= 0x0f && fmt <= 0x12) ||
+                       (fmt >= 0x15 && fmt <= 0x19)) {
+                cpp = 2;
+            } else if (fmt == 0x30 || fmt == 0x32 || fmt == 0x33 ||
+                       fmt == 0x34 || (fmt >= 0x43 && fmt <= 0x47) ||
+                       (fmt >= 0x48 && fmt <= 0x4c)) {
+                cpp = 4;
+            } else if ((fmt >= 0x60 && fmt <= 0x64) ||
+                       (fmt >= 0x65 && fmt <= 0x69)) {
+                cpp = 8;
+            } else if (fmt >= 0x72 && fmt <= 0x76) {
+                cpp = 12;
+            } else if (fmt >= 0x7f && fmt <= 0x82) {
+                cpp = 16;
+            } else {
+                trace_qcom8998_cp_draw_reject("cat5 buf fmt", fmt,
+                                              tex ? tex[0] : 0);
                 return false;
             }
-            if (fmt == 2 || fmt == 3) {
-                res[0] = (float)(w & 0xff) * (1.0f / 255.0f);
-                raw_res[0] = qcom8998_f_to_u32(res[0]);
-            } else if (fmt == 5) {
-                is_int = true;
-                raw_res[0] = w & 0xff;
+            uint32_t buf_elems = info ? (info->width | (info->height << 15)) :
+                                 (extract32(tex[1], 0, 15) |
+                                  (extract32(tex[1], 15, 15) << 15));
+
+            if (ix < 0 || (buf_elems && (uint32_t)ix >= buf_elems)) {
+                res[0] = res[1] = res[2] = res[3] = 0.0f;
+                raw_res[0] = raw_res[1] = raw_res[2] = raw_res[3] = 0;
             } else {
-                is_int = !is_float_dst;
-                raw_res[0] = w;
-                res[0] = qcom8998_u32_to_f(w);
+                if (!qcom8998_vfd_read(s, pages, base + (uint64_t)ix * cpp,
+                                       raw_bytes, cpp)) {
+                    trace_qcom8998_cp_draw_reject("cat5 buf",
+                        ((uint64_t)fmt << 32) | (uint32_t)ix, base);
+                    return false;
+                }
+                if (fmt == 0x02) { /* A8_UNORM */
+                    fcomps[3] = raw_bytes[0] * (1.0f / 255.0f);
+                } else if ((fmt >= 0x03 && fmt <= 0x06) ||
+                           (fmt >= 0x0f && fmt <= 0x12) ||
+                           fmt == 0x30 || fmt == 0x32 ||
+                           fmt == 0x33 || fmt == 0x34) {
+                    unsigned n = cpp;
+                    unsigned kind;
+
+                    if (cpp == 4) {
+                        uint32_t c = qcom8998_color_unswap(ldl_le_p(raw_bytes),
+                                                           swap);
+                        stl_le_p(raw_bytes, c);
+                        kind = fmt == 0x30 ? 0 : fmt == 0x32 ? 1 :
+                               fmt == 0x33 ? 2 : 3;
+                    } else {
+                        kind = fmt >= 0x0f ? fmt - 0x0f : fmt - 0x03;
+                    }
+                    is_int = kind >= 2;
+                    for (unsigned c = 0; c < n; c++) {
+                        if (kind == 0) {
+                            fcomps[c] = raw_bytes[c] * (1.0f / 255.0f);
+                        } else if (kind == 1) {
+                            int8_t sb = (int8_t)raw_bytes[c];
+                            fcomps[c] = sb == INT8_MIN ? -1.0f : sb / 127.0f;
+                        } else if (kind == 2) {
+                            icomps[c] = raw_bytes[c];
+                        } else {
+                            icomps[c] = (uint32_t)(int32_t)(int8_t)raw_bytes[c];
+                        }
+                    }
+                } else if ((fmt >= 0x15 && fmt <= 0x19) ||
+                           (fmt >= 0x43 && fmt <= 0x47) ||
+                           (fmt >= 0x60 && fmt <= 0x64)) {
+                    unsigned n = cpp / 2;
+                    unsigned kind = fmt >= 0x60 ? fmt - 0x60 :
+                                    fmt >= 0x43 ? fmt - 0x43 : fmt - 0x15;
+
+                    is_int = kind >= 3;
+                    for (unsigned c = 0; c < n; c++) {
+                        uint16_t raw = lduw_le_p(raw_bytes + c * 2);
+
+                        if (kind == 3) {
+                            icomps[c] = raw;
+                        } else if (kind == 4) {
+                            icomps[c] = (uint32_t)(int32_t)(int16_t)raw;
+                        } else if (kind == 2) {
+                            fcomps[c] = qcom8998_u32_to_f(
+                                            qcom8998_f16_to_f32(raw));
+                        } else if (kind == 0) {
+                            fcomps[c] = raw * (1.0f / 65535.0f);
+                        } else {
+                            int16_t sv = (int16_t)raw;
+                            fcomps[c] = sv == INT16_MIN ? -1.0f :
+                                        sv / 32767.0f;
+                        }
+                    }
+                } else {
+                    unsigned n = cpp / 4;
+                    bool flt = fmt == 0x4a || fmt == 0x67 || fmt == 0x74 ||
+                               fmt == 0x7f || fmt == 0x82;
+
+                    is_int = !flt;
+                    for (unsigned c = 0; c < n; c++) {
+                        uint32_t raw = ldl_le_p(raw_bytes + c * 4);
+
+                        if (flt) {
+                            fcomps[c] = qcom8998_u32_to_f(raw);
+                        } else {
+                            icomps[c] = raw;
+                        }
+                    }
+                }
+                for (unsigned c = 0; c < 4; c++) {
+                    unsigned sw = info ? info->swizzle[c] :
+                                         extract32(tex[0], 4 + c * 3, 3);
+
+                    if (is_int) {
+                        raw_res[c] = sw < 4 ? icomps[sw] : (sw == 5 ? 1 : 0);
+                        res[c] = qcom8998_u32_to_f(raw_res[c]);
+                    } else {
+                        res[c] = sw < 4 ? fcomps[sw] : (sw == 5 ? 1.0f : 0.0f);
+                        raw_res[c] = qcom8998_f_to_u32(res[c]);
+                    }
+                }
             }
         } else {
             if (!info) {
                 if (!qcom8998_tex_prepare(s, tex, &local_info)) {
+                    trace_qcom8998_cp_draw_reject("cat5 tex_prepare",
+                                                  tex[0], tex[2]);
                     return false;
                 }
                 info = &local_info;
             }
             if (!qcom8998_tex_fetch_texel(s, pages, info, ix, iy, false,
                                           res, raw_res, &is_int)) {
+                trace_qcom8998_cp_draw_reject("cat5 fetch_texel",
+                    ((uint64_t)info->fmt << 32) | (uint32_t)ix,
+                    ((uint64_t)info->tex_type << 32) | (uint32_t)iy);
                 return false;
             }
         }
@@ -5458,10 +5705,15 @@ static bool qcom8998_cp_rectangle(Qcom8998Display *s, unsigned count,
     unsigned rects[128][4];
     unsigned active_rects = 0;
     static const unsigned scissor[] = { 0xe0aa, 0xe0ca, 0xe0ea };
+    /*
+     * 0xe408 (VFD_INDEX_OFFSET) and 0xe409 (VFD_INSTANCE_START_OFFSET) may
+     * retain stale values from prior draws; with VFD_CONTROL_0 (0xe400) == 0,
+     * auto-indexed DI_PT_RECTLIST draws do not use VFD fetch offsets.
+     */
     static const unsigned disabled[] = {
         0xe001, 0xe002, 0xe003, 0xe090, 0xe0a2, 0xe0a3,
         0xe0a4, 0xe100, 0xe142, 0xe143, 0xe1c0,
-        0xe2a1, 0xe385, 0xe400, 0xe408, 0xe409,
+        0xe2a1, 0xe385, 0xe400,
         0xe5db, 0xe704, 0xe705,
     };
 
@@ -5475,11 +5727,13 @@ static bool qcom8998_cp_rectangle(Qcom8998Display *s, unsigned count,
         payload[2] > ARRAY_SIZE(rects) * 2 ||
         s->render_mode[0] != ADRENO_RENDER_BYPASS ||
         regs[ADRENO_RB_CNTL] != ADRENO_RB_BYPASS ||
-        (regs[ADRENO_RB_RENDER_CNTL] & ~(BIT(8) | BIT(16))) ||
+        (regs[ADRENO_RB_RENDER_CNTL] &
+         ~(BIT(8) | BIT(16) |
+           ((regs[ADRENO_RB_RENDER_CNTL] & BIT(16)) ? BIT(24) : 0))) ||
         (regs[0xe0a0] & ~BIT(8)) ||
         (regs[0xe0a1] && regs[0xe0a1] != 0x20) ||
         (regs[0xe1a8] & BIT(8)) ||
-        (regs[0xe1b1] & (BIT(0) | BIT(1) | BIT(6))) ||
+        ((regs[0xe1b2] & 7) && (regs[0xe1b1] & (BIT(0) | BIT(1) | BIT(6)))) ||
         regs[0xe000] != 0x181 || regs[0xe146] != 1 || regs[0xe147] != 0xf ||
         regs[0xe150] != 0x780 || regs[0xe1a9] != 0xffff0000 ||
         !(regs[0xe584] & 1) || !(regs[0xe585] & 1) ||
@@ -5584,9 +5838,39 @@ static bool qcom8998_cp_rectangle(Qcom8998Display *s, unsigned count,
 typedef struct Qcom8998RasterVertex {
     int x, y; /* D3D 16.8 positions, bounded to +/-4096 pixels here. */
     float inv_w;
+    bool clipped;
     uint32_t varyings[64];
     uint64_t varying_mask;
 } Qcom8998RasterVertex;
+
+static bool qcom8998_vfd_read(Qcom8998Display *s, Qcom8998PageCache *cache,
+                              uint64_t iova, void *buf, size_t size)
+{
+    uint8_t *out = buf;
+
+    while (size) {
+        uint64_t page_off = iova & ((1U << SMMU_4K_SHIFT) - 1);
+        size_t chunk = MIN(size, (1U << SMMU_4K_SHIFT) - page_off);
+
+        if (cache) {
+            const uint8_t *data = qcom8998_texture_page(s, cache, iova);
+            if (!data) {
+                return false;
+            }
+            memcpy(out, data + page_off, chunk);
+        } else {
+            hwaddr pa;
+            if (!qcom8998_cp_translate(s, iova, false, &pa) ||
+                !qcom8998_ram_access(pa, out, chunk, false)) {
+                return false;
+            }
+        }
+        iova += chunk;
+        out += chunk;
+        size -= chunk;
+    }
+    return true;
+}
 
 static bool qcom8998_vertex_fetch(Qcom8998Display *s, unsigned index,
                                   unsigned instance, Qcom8998ShaderRegs *r)
@@ -5636,18 +5920,21 @@ static bool qcom8998_vertex_fetch(Qcom8998Display *s, unsigned index,
             (dest & ~0xfffU) || out > ADRENO_SHADER_GPRS - 4) {
             return false;
         }
-        if (format == 0x7f || format == 0x74 || format == 0x67 ||
-            format == 0x4a) {
-            components = format == 0x7f ? 4 : format == 0x74 ? 3 :
-                         format == 0x67 ? 2 : 1;
+        if (format == 0x82 || format == 0x7f || format == 0x74 ||
+            format == 0x67 || format == 0x4a) {
+            components = (format == 0x82 || format == 0x7f) ? 4 :
+                         format == 0x74 ? 3 : format == 0x67 ? 2 : 1;
             bytes = components * 4;
-        } else if (format == 0x4b || format == 0x4c ||
+        } else if (format == 0x48 || format == 0x49 ||
+                   format == 0x4b || format == 0x4c ||
+                   format == 0x65 || format == 0x66 ||
                    format == 0x68 || format == 0x69 ||
+                   format == 0x72 || format == 0x73 ||
                    format == 0x75 || format == 0x76 ||
                    format == 0x80 || format == 0x81) {
-            components = (format == 0x4b || format == 0x4c) ? 1 :
-                         (format == 0x68 || format == 0x69) ? 2 :
-                         (format == 0x75 || format == 0x76) ? 3 : 4;
+            components = (format <= 0x4c) ? 1 :
+                         (format <= 0x69) ? 2 :
+                         (format <= 0x76) ? 3 : 4;
             bytes = components * 4;
             is_float = false;
             value[3] = 1;
@@ -5673,6 +5960,27 @@ static bool qcom8998_vertex_fetch(Qcom8998Display *s, unsigned index,
             if (!is_float) {
                 value[3] = 1;
             }
+        } else if (format >= 0x03 && format <= 0x06) {
+            components = 1;
+            bytes = 1;
+            is_float = format <= 0x04;
+            if (!is_float) {
+                value[3] = 1;
+            }
+        } else if (format >= 0x0f && format <= 0x12) {
+            components = 2;
+            bytes = 2;
+            is_float = format <= 0x10;
+            if (!is_float) {
+                value[3] = 1;
+            }
+        } else if (format >= 0x15 && format <= 0x19) {
+            components = 1;
+            bytes = 2;
+            is_float = format <= 0x17;
+            if (!is_float) {
+                value[3] = 1;
+            }
         } else {
             trace_qcom8998_cp_draw_reject("vfd format", format, decode);
             return false;
@@ -5682,76 +5990,95 @@ static bool qcom8998_vertex_fetch(Qcom8998Display *s, unsigned index,
                    (index + regs[0xe408]);
         address = qcom8998_reg_pair(regs, fetch * 4);
         position = (uint64_t)elem_idx * regs[fetch + 3] + offset;
-        if ((address & 3) || (position & 3) ||
-            position + bytes > regs[fetch + 2] ||
+        if (position + bytes > regs[fetch + 2] ||
             address > UINT64_MAX - position - bytes) {
+            trace_qcom8998_cp_draw_reject("vfd bounds", position + bytes,
+                                          regs[fetch + 2]);
             return false;
         }
         address += position;
-        if (format == 0x30 || format == 0x32 ||
+        if ((format >= 0x03 && format <= 0x06) ||
+            (format >= 0x0f && format <= 0x12) ||
+            format == 0x30 || format == 0x32 ||
             format == 0x33 || format == 0x34) {
-            uint32_t packed;
+            uint8_t raw_bytes[4] = { 0 };
+            unsigned kind;
 
-            if (!qcom8998_cp_word(s, address, &packed, false)) {
+            if (!qcom8998_vfd_read(s, r->tex_pages, address, raw_bytes,
+                                   bytes)) {
+                trace_qcom8998_cp_draw_reject("vfd read8", address, bytes);
                 return false;
             }
-            packed = le32_to_cpu(qcom8998_color_swap(packed,
-                                                     (decode >> 28) & 3));
-            for (unsigned c = 0; c < 4; c++) {
-                uint8_t b = extract32(packed, c * 8, 8);
+            if (bytes == 4) {
+                uint32_t packed = qcom8998_color_swap(ldl_le_p(raw_bytes),
+                                                      (decode >> 28) & 3);
+                stl_le_p(raw_bytes, packed);
+                kind = format == 0x30 ? 0 : format == 0x32 ? 1 :
+                       format == 0x33 ? 2 : 3;
+            } else {
+                kind = format >= 0x0f ? format - 0x0f : format - 0x03;
+            }
+            for (unsigned c = 0; c < components; c++) {
+                uint8_t b = raw_bytes[c];
 
-                if (format == 0x30) {
+                if (kind == 0) {
                     value[c] = float32_div(uint32_to_float32(b, &fp),
                                            0x437f0000, &fp);
-                } else if (format == 0x32) {
+                } else if (kind == 1) {
                     int8_t sb = (int8_t)b;
                     value[c] = sb == INT8_MIN ? 0xbf800000 :
                         float32_div(int32_to_float32(sb, &fp),
                                     0x42fe0000, &fp);
-                } else if (format == 0x33) {
+                } else if (kind == 2) {
                     value[c] = b;
                 } else {
                     value[c] = (uint32_t)(int32_t)(int8_t)b;
                 }
             }
-        } else if ((format >= 0x43 && format <= 0x47) ||
+        } else if ((format >= 0x15 && format <= 0x19) ||
+                   (format >= 0x43 && format <= 0x47) ||
                    (format >= 0x60 && format <= 0x64)) {
-            unsigned base_fmt = format >= 0x60 ? format - 0x60 : format - 0x43;
+            uint8_t raw_bytes[8] = { 0 };
+            unsigned base_fmt = format >= 0x60 ? format - 0x60 :
+                                format >= 0x43 ? format - 0x43 :
+                                format - 0x15;
 
-            for (unsigned w = 0; w < components / 2; w++) {
-                uint32_t packed;
+            if (!qcom8998_vfd_read(s, r->tex_pages, address, raw_bytes,
+                                   bytes)) {
+                trace_qcom8998_cp_draw_reject("vfd read8", address, bytes);
+                return false;
+            }
+            for (unsigned ci = 0; ci < components; ci++) {
+                uint16_t raw = lduw_le_p(raw_bytes + ci * 2);
 
-                if (!qcom8998_cp_word(s, address + w * 4, &packed, false)) {
-                    return false;
-                }
-                for (unsigned c = 0; c < 2; c++) {
-                    uint16_t raw = extract32(packed, c * 16, 16);
-                    unsigned ci = w * 2 + c;
-
-                    if (base_fmt == 3) { /* UINT */
-                        value[ci] = raw;
-                    } else if (base_fmt == 4) { /* SINT */
-                        value[ci] = (uint32_t)(int32_t)(int16_t)raw;
-                    } else if (base_fmt == 2) { /* FLOAT */
-                        value[ci] = qcom8998_f16_to_f32(raw);
-                    } else if (base_fmt == 0) { /* UNORM */
-                        value[ci] = float32_div(uint32_to_float32(raw, &fp),
-                                                0x477fff00, &fp);
-                    } else { /* SNORM */
-                        int16_t sv = (int16_t)raw;
-                        value[ci] = sv == INT16_MIN ? 0xbf800000 :
-                            float32_div(int32_to_float32(sv, &fp),
-                                        0x46fffe00, &fp);
-                    }
+                if (base_fmt == 3) { /* UINT */
+                    value[ci] = raw;
+                } else if (base_fmt == 4) { /* SINT */
+                    value[ci] = (uint32_t)(int32_t)(int16_t)raw;
+                } else if (base_fmt == 2) { /* FLOAT */
+                    value[ci] = qcom8998_f16_to_f32(raw);
+                } else if (base_fmt == 0) { /* UNORM */
+                    value[ci] = float32_div(uint32_to_float32(raw, &fp),
+                                            0x477fff00, &fp);
+                } else { /* SNORM */
+                    int16_t sv = (int16_t)raw;
+                    value[ci] = sv == INT16_MIN ? 0xbf800000 :
+                        float32_div(int32_to_float32(sv, &fp),
+                                    0x46fffe00, &fp);
                 }
             }
         } else {
+            uint8_t raw_bytes[16];
+
+            if (!qcom8998_vfd_read(s, r->tex_pages, address, raw_bytes,
+                                   bytes)) {
+                trace_qcom8998_cp_draw_reject("vfd read", address, bytes);
+                return false;
+            }
             for (unsigned c = 0; c < components; c++) {
-                if ((r->tex_pages ?
-                     !qcom8998_texture_word(s, r->tex_pages, address + c * 4,
-                                            4, &value[c]) :
-                     !qcom8998_cp_word(s, address + c * 4, &value[c], false)) ||
-                    (is_float && !qcom8998_shader_finite(value[c]))) {
+                value[c] = ldl_le_p(raw_bytes + c * 4);
+                if (is_float && !qcom8998_shader_finite(value[c])) {
+                    trace_qcom8998_cp_draw_reject("vfd nan", format, value[c]);
                     return false;
                 }
             }
@@ -5791,14 +6118,15 @@ static bool qcom8998_vertex_position(Qcom8998Display *s,
     memset(v, 0, sizeof(*v));
     for (unsigned c = 0; c < 4; c++) {
         if (!qcom8998_bit_test(r->full_valid, position + c)) {
+            trace_qcom8998_cp_draw_reject("vs pos valid", position + c, 0);
             return false;
         }
     }
     w = qcom8998_u32_to_f(r->full[position + 3]);
     if (!isfinite(w) || w == 0.0f) {
-        trace_qcom8998_cp_draw_reject("clip Z/W", r->full[position + 2],
-                                      r->full[position + 3]);
-        return false;
+        /* D3D11 discards primitives with NaN/Inf/zero-W vertex positions. */
+        v->clipped = true;
+        return true;
     }
     inv_w = 1.0f / w;
     v->inv_w = inv_w;
@@ -5812,14 +6140,22 @@ static bool qcom8998_vertex_position(Qcom8998Display *s,
         uint32_t coordinate;
         int fixed;
 
-        if (!qcom8998_shader_finite(ndc) ||
-            !qcom8998_shader_finite(offset) ||
+        if (!qcom8998_shader_finite(offset) ||
             !qcom8998_shader_finite(scale)) {
+            trace_qcom8998_cp_draw_reject("vs vp", c, offset);
             return false;
         }
+        if (!qcom8998_shader_finite(ndc)) {
+            v->clipped = true;
+            return true;
+        }
         coordinate = float32_add(float32_mul(ndc, scale, &fp), offset, &fp);
-        if (!qcom8998_shader_finite(coordinate) ||
-            (coordinate & 0x7fffffff) > 0x46800000) {
+        if (!qcom8998_shader_finite(coordinate)) {
+            v->clipped = true;
+            return true;
+        }
+        if ((coordinate & 0x7fffffff) > 0x46800000) {
+            trace_qcom8998_cp_draw_reject("vs coord", c, coordinate);
             return false;
         }
         /* D3D11 requires eight fractional bits and nearest-even snap. */
@@ -5842,6 +6178,9 @@ static bool qcom8998_vertex_position(Qcom8998Display *s,
             if (mask & BIT(b)) {
                 if (regid + b >= ADRENO_SHADER_GPRS || loc >= 64 ||
                     !qcom8998_bit_test(r->full_valid, regid + b)) {
+                    trace_qcom8998_cp_draw_reject("vs varying",
+                        ((uint64_t)(regid + b) << 32) | loc,
+                        qcom8998_bit_test(r->half_valid, regid + b));
                     return false;
                 }
                 v->varyings[loc] = r->full[regid + b];
@@ -5940,6 +6279,7 @@ static bool qcom8998_fragment_eval(Qcom8998Display *s,
         if (!valid) {
             if (fmt == 0x30 || (fmt == 0x02 && c == 3) ||
                 (fmt == 0x03 && c == 0) || (fmt == 0x0f && c < 2)) {
+                trace_qcom8998_cp_draw_reject("fs out valid", output + c, fmt);
                 return false;
             }
             bits = 0;
@@ -5996,6 +6336,8 @@ static inline bool qcom8998_fragment_blend(const Qcom8998BlendState *bs,
             !qcom8998_unorm8(qcom8998_f_to_u32(src[1]), &c1) ||
             !qcom8998_unorm8(qcom8998_f_to_u32(src[2]), &c2) ||
             !qcom8998_unorm8(qcom8998_f_to_u32(src[3]), &c3)) {
+            trace_qcom8998_cp_draw_reject("blend unorm0",
+                qcom8998_f_to_u32(src[0]), qcom8998_f_to_u32(src[3]));
             return false;
         }
         *color = c0 | (c1 << 8) | (c2 << 16) | (c3 << 24);
@@ -6012,6 +6354,8 @@ static inline bool qcom8998_fragment_blend(const Qcom8998BlendState *bs,
             !qcom8998_unorm8(qcom8998_f_to_u32(v1), &c1) ||
             !qcom8998_unorm8(qcom8998_f_to_u32(v2), &c2) ||
             !qcom8998_unorm8(qcom8998_f_to_u32(v3), &c3)) {
+            trace_qcom8998_cp_draw_reject("blend unorm1",
+                qcom8998_f_to_u32(v0), qcom8998_f_to_u32(v3));
             return false;
         }
         *color = c0 | (c1 << 8) | (c2 << 16) | (c3 << 24);
@@ -6047,6 +6391,8 @@ static inline bool qcom8998_fragment_blend(const Qcom8998BlendState *bs,
                                              dst[c] * f_dst);
             }
             if (!qcom8998_unorm8(qcom8998_f_to_u32(value), &component)) {
+                trace_qcom8998_cp_draw_reject("blend unorm2", c,
+                    qcom8998_f_to_u32(value));
                 return false;
             }
             *color |= component << (c * 8);
@@ -6265,10 +6611,11 @@ static bool qcom8998_cp_textured_rectangle(Qcom8998Display *s, unsigned count,
     g_autofree unsigned *texel_x = NULL;
     g_autofree unsigned *texel_y = NULL;
     static const unsigned scissor[] = { 0xe0aa, 0xe0ca, 0xe0ea };
+    /* Stale 0xe408/0xe409 VFD offsets are unused when VFD_CONTROL_0 == 0. */
     static const unsigned disabled[] = {
         0xe001, 0xe002, 0xe003, 0xe090, 0xe0a2, 0xe0a3, 0xe0a4,
         0xe100, 0xe142, 0xe143, 0xe1c0, 0xe2a1,
-        0xe385, 0xe400, 0xe408, 0xe409, 0xe5c9, 0xe704, 0xe705,
+        0xe385, 0xe400, 0xe5c9, 0xe704, 0xe705,
     };
 
     /*
@@ -6281,12 +6628,14 @@ static bool qcom8998_cp_textured_rectangle(Qcom8998Display *s, unsigned count,
         payload[1] != 1 || payload[2] != 2 ||
         s->render_mode[0] != ADRENO_RENDER_BYPASS ||
         regs[ADRENO_RB_CNTL] != ADRENO_RB_BYPASS ||
-        (regs[ADRENO_RB_RENDER_CNTL] & ~(BIT(8) | BIT(16))) ||
+        (regs[ADRENO_RB_RENDER_CNTL] &
+         ~(BIT(8) | BIT(16) |
+           ((regs[ADRENO_RB_RENDER_CNTL] & BIT(16)) ? BIT(24) : 0))) ||
         (ubwc && (r8 || tile != 3)) ||
         regs[0xe000] != 0x181 || (regs[0xe0a0] & ~BIT(8)) ||
         (regs[0xe0a1] && regs[0xe0a1] != 0x20) ||
         (regs[0xe1a8] & BIT(8)) ||
-        (regs[0xe1b1] & (BIT(0) | BIT(1) | BIT(6))) ||
+        ((regs[0xe1b2] & 7) && (regs[0xe1b1] & (BIT(0) | BIT(1) | BIT(6)))) ||
         regs[0xe146] != 1 || regs[0xe147] != 0xf ||
         regs[0xe150] != 0x780 || regs[0xe1a9] != 0xffff0000 ||
         !(regs[0xe584] & 1) || !(regs[0xe585] & 1) ||
@@ -6660,7 +7009,6 @@ static bool qcom8998_cp_triangles(Qcom8998Display *s, unsigned count,
     unsigned cpp = fmt == 0x30 ? 4 : (fmt == 0x0f ? 2 : 1);
     unsigned tile = extract32(regs[ADRENO_RB_MRT_BUF_INFO], 8, 2);
     unsigned dst_swap = extract32(regs[ADRENO_RB_MRT_BUF_INFO], 13, 2);
-    bool ubwc = !!(regs[ADRENO_RB_RENDER_CNTL] & BIT(16));
     uint64_t indices = 0, end = 0;
     uint64_t pitch = 0, layer = 0, pixel_layer = 0, dest = 0;
     uint64_t flag_addr = 0, flag_pitch = 0, flag_size = 0;
@@ -6671,6 +7019,7 @@ static bool qcom8998_cp_triangles(Qcom8998Display *s, unsigned count,
     bool read_dst = blend || comp_mask != 0xf;
     bool sysmem = regs[ADRENO_RB_CNTL] == ADRENO_RB_BYPASS;
     bool tiled_sysmem = sysmem && tile == 3;
+    bool ubwc = sysmem && !!(regs[ADRENO_RB_RENDER_CNTL] & BIT(16));
     bool restart_en = !!(regs[0xe384] & BIT(8));
     uint32_t restart_idx = idx_size == 2 ? regs[0xe38c] :
                                            (regs[0xe38c] & 0xffff);
@@ -6724,9 +7073,11 @@ static bool qcom8998_cp_triangles(Qcom8998Display *s, unsigned count,
         (regs[0xe0a0] & ~(BIT(3) | BIT(8))) ||
         (regs[0xe0a1] && regs[0xe0a1] != 0x20) ||
         regs[0xe0a2] || regs[0xe0a3] || (regs[0xe1a8] & BIT(8)) ||
-        (regs[0xe1b1] & (BIT(0) | BIT(1) | BIT(6))) || regs[0xe1c0] ||
+        ((regs[0xe1b2] & 7) && (regs[0xe1b1] & (BIT(0) | BIT(1) | BIT(6)))) || regs[0xe1c0] ||
         regs[0xe100] || regs[0xe2a1] || regs[0xe385] ||
-        (regs[0xe141] & ~(BIT(3) | BIT(8) | BIT(16))) ||
+        (regs[0xe141] & ~(BIT(3) | BIT(8) | BIT(16) |
+                          (ubwc ? BIT(24) : 0) |
+                          (sysmem ? 0 : 0xffff0000U))) ||
         (ubwc && (!tiled_sysmem || cpp != 4)) ||
         regs[0xe146] != 1 || regs[0xe147] != 0xf ||
         !(regs[0xe584] & 1) || !(regs[0xe585] & 1) ||
@@ -6737,10 +7088,12 @@ static bool qcom8998_cp_triangles(Qcom8998Display *s, unsigned count,
         (regs[0xe5db] & ~0x1fU) || (regs[0xe5db] & 7) > 4 ||
         (regs[0xe384] & BIT(9)) || regs[0xe1b0] ||
         !(regs[0xe590] & BIT(2)) || !(regs[0xe5c0] & BIT(2)) ||
-        /* QCDX uses both low-bit configurations 1 and 3 for the VS object. */
-        (qcom8998_reg_pair(regs, 0xe5ac * 4) & ~2ULL) !=
-            (s->shader_address[8] | 1) ||
-        qcom8998_reg_pair(regs, 0xe5c3 * 4) != (s->shader_address[12] | 1)) {
+        /* QCDX encodes low-bit cache/burst flags (1..3) in VS/FS objects. */
+        (qcom8998_reg_pair(regs, 0xe5ac * 4) & ~3ULL) != s->shader_address[8] ||
+        !(qcom8998_reg_pair(regs, 0xe5ac * 4) & 3) ||
+        (qcom8998_reg_pair(regs, 0xe5c3 * 4) & ~3ULL) !=
+            s->shader_address[12] ||
+        !(qcom8998_reg_pair(regs, 0xe5c3 * 4) & 3)) {
         trace_qcom8998_cp_draw_reject("draw configuration", regs[0xe140],
                                       regs[0xe5d3]);
         return false;
@@ -6807,6 +7160,8 @@ static bool qcom8998_cp_triangles(Qcom8998Display *s, unsigned count,
             !qcom8998_gmem_layout(s, 0, regs[0xe1d0],
             (ox + width - 1) | ((oy + height - 1) << 16), &base, &width,
             &gmem_fmt, &gmem_cpp) || gmem_fmt != fmt || gmem_cpp != cpp) {
+            trace_qcom8998_cp_draw_reject("tri gmem layout",
+                regs[ADRENO_RB_CNTL], regs[0xe1d0]);
             return false;
         }
     }
@@ -6910,6 +7265,8 @@ static bool qcom8998_cp_triangles(Qcom8998Display *s, unsigned count,
 
                         if (!qcom8998_texture_word(s, &tex_cache, addr & ~3ULL,
                                                    4, &packed)) {
+                            trace_qcom8998_cp_draw_reject("tri idx read",
+                                addr, idx_size);
                             return false;
                         }
                         tri_idx[v] = idx_size == 2 ? packed :
@@ -6986,6 +7343,9 @@ static bool qcom8998_cp_triangles(Qcom8998Display *s, unsigned count,
                     return false;
                 }
             }
+            if (vertex[0].clipped || vertex[1].clipped || vertex[2].clipped) {
+                continue;
+            }
             area = qcom8998_edge(&vertex[0], &vertex[1],
                                  vertex[2].x, vertex[2].y);
             if (!area) {
@@ -7030,6 +7390,8 @@ static bool qcom8998_cp_triangles(Qcom8998Display *s, unsigned count,
                         for (unsigned v = 0; v < 3; v++) {
                             if (!qcom8998_shader_finite(
                                     vertex[v].varyings[slot])) {
+                                trace_qcom8998_cp_draw_reject("tri varying NaN",
+                                    slot, vertex[v].varyings[slot]);
                                 return false;
                             }
                         }
@@ -7186,6 +7548,8 @@ static bool qcom8998_cp_triangles(Qcom8998Display *s, unsigned count,
                                 uint8_t old_flag;
 
                                 if (foff >= flag_size) {
+                                    trace_qcom8998_cp_draw_reject("tri foff",
+                                        foff, flag_size);
                                     return false;
                                 }
                                 fpage = qcom8998_stage_write_page(s,
@@ -7222,6 +7586,8 @@ static bool qcom8998_cp_triangles(Qcom8998Display *s, unsigned count,
                         ppage = qcom8998_stage_write_page(s, &write_cache,
                                                           paddr);
                         if (!ppage) {
+                            trace_qcom8998_cp_draw_reject("tri write page",
+                                paddr, dest);
                             return false;
                         }
                         if (read_dst) {

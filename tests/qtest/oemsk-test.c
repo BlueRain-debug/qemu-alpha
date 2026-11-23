@@ -558,6 +558,8 @@ static void test_rectangle(void)
         { 0xe152, 0x30 }, { 0xe153, 1 }, { 0xe154, 8 },
         { 0xe155, 0x43000000 }, { 0xe1a9, 0xffff0000 },
         { 0xe401, 0xfcfc03 }, { 0xe584, 1 }, { 0xe585, 1 },
+        /* Stale VFD offsets from prior draws are unused when 0xe400 == 0. */
+        { 0xe408, 0xe4 }, { 0xe409, 0x12 },
         { 0xe592, 1 }, { 0xe593, 0xf04 }, { 0xe5ac, 1 },
         { 0xe5c3, 1 }, { 0xe5ca, 1 }, { 0xe5d3, 0x30 },
         { 0xe5dc, 0x23c00004 }, /* Inactive prefetch command may be stale. */
@@ -745,7 +747,8 @@ static void test_gmem_resolve(void)
         rect_register(words, &n, 0xe62, 0);
         /* A 64x32 logical bin; fast clear ignores a stale sysmem pitch. */
         rect_register(words, &n, 0xe140, 0x202);
-        rect_register(words, &n, 0xe141, trial == 4 ? 1U << 16 : 0);
+        rect_register(words, &n, 0xe141,
+                      trial == 4 ? (1U << 16) | (1U << 24) : 0);
         rect_register(words, &n, 0xe142, trial == 3 ? 1 : 0);
         rect_register(words, &n, 0xe143, 0);
         rect_register(words, &n, 0xe152, trial == 5 ? 0x2330 : 0x2230);
@@ -764,7 +767,8 @@ static void test_gmem_resolve(void)
         /* Resolve a partial rectangle into rows with 64 bytes of padding. */
         rect_register(words, &n, 0xe211, trial == 7 ? 0x10012 : 0x10002);
         rect_register(words, &n, 0xe212, trial == 7 ? 0x1e004d : 0x1e003d);
-        rect_register(words, &n, 0xe213, trial == 6 ? 5 : 4);
+        rect_register(words, &n, 0xe213,
+                      trial == 6 ? 5 : trial == 4 ? 0xf : 4);
         rect_register(words, &n, 0xe214, (uint32_t)destination);
         rect_register(words, &n, 0xe215, destination >> 32);
         rect_register(words, &n, 0xe216, 5);
@@ -792,10 +796,10 @@ static void test_gmem_resolve(void)
         g_assert_cmphex(qtest_readl(qts, GPU + 0xe00 * 4), ==, 0x80);
         if (trial && trial != 7) {
             g_assert_cmphex(qtest_readl(qts, GPU + 0x2018), ==,
-                           trial == 1 || trial == 6 ?
+                           trial == 1 || trial == 4 || trial == 6 ?
                            resolve_start : clear_start);
             g_assert_cmphex(qtest_readl(qts, fence), ==,
-                           trial == 1 || trial == 6 ? 0x1111 : 0);
+                           trial == 1 || trial == 4 || trial == 6 ? 0x1111 : 0);
             qtest_memread(qts, pixels, actual, sizeof(actual));
             g_assert_cmpmem(actual, sizeof(actual), expected, sizeof(expected));
         }
@@ -860,6 +864,8 @@ static void test_texture_rectangle(void)
         { 0xe152, 0x30 }, { 0xe153, 1 }, { 0xe154, 8 },
         { 0xe155, 0x43000000 }, { 0xe1a9, 0xffff0000 },
         { 0xe401, 0xfcfc03 }, { 0xe584, 1 }, { 0xe585, 1 },
+        /* Stale VFD offsets from prior draws are unused when 0xe400 == 0. */
+        { 0xe408, 0xe4 }, { 0xe409, 0x12 },
         { 0xe592, 2 }, { 0xe593, 0x0f030307 }, { 0xe5a3, 4 },
         { 0xe5ac, 1 }, { 0xe5c3, 1 }, { 0xe5ca, 1 },
         { 0xe5d3, 0x30 }, { 0xe5db, 0x19 }, { 0xe5dc, 0x23c00004 },
