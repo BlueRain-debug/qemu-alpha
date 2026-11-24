@@ -9,9 +9,11 @@ devices. It does not instantiate MSM8998's display, RPM, SPMI or SCM model.
 Use TCG, an AArch64 CPU, GICv2, ACPI and disabled EL2/EL3. Up to eight CPUs
 and a 16 MiB variable flash are supported. Migration is not supported.
 
-This is early device bring-up, not a completed SDM845 system. Native Adreno
-630, GMU, DPU 4.0 and dual-panel output are not implemented or exposed by
-the default ACPI table. ``ramfb`` remains the boot framebuffer.
+This is an experimental SDM845 bring-up board. With the opt-in native power,
+SMMU, PIL and GPU SSDT plus Command DB, it supports unpatched ``qcdxkm845.sys``
+display takeover, DPU 4.0 dual-panel ``1350x1800`` (and merged ``2700x1800``)
+scanout, and bounded Adreno 630 direct-render IR3 rasterization. ``ramfb``
+remains the early boot framebuffer.
 
 Resource layout
 ---------------
@@ -49,9 +51,23 @@ Implemented native frontends are:
   This is not a physical revision readback; other BCM status/counter
   registers remain unmapped.
 * Two SMMUv2 frontends at ``0x15000000`` and ``0x05040000``. AArch64
-  stage-1 4 KiB page walks, ATOS, fault registers and IRQ aggregation are
-  implemented. Unsupported translation formats fail. The native GPU DMA
-  client is not implemented, so that end-to-end fault path is unverified.
+  stage-1 4 KiB page walks (both TTBR0 and ``TCR2.SEP`` sign-extended TTBR1
+  upper ranges), ATOS, fault registers, per-process ``CP_SMMU_TABLE_UPDATE``
+  switches and IRQ aggregation are implemented.
+* 256 KiB SDM845 IMEM RAM at ``0x14680000`` for PIL/subsystem handoff.
+* Isolated ``qcom845-display`` frontend (``hw/display/qcom-845-display.c`` and
+  ``hw/display/qcom-845-render.c``) mapping MDSS/DPU 4.0 (``0x0ae00000``),
+  DP PHY (``0x088e0000``), Adreno 630 (``0x05000000``), GMU_CX (``0x05060000``),
+  CX_MISC (``0x05099000``), GPU PDC sequencer/regs (``0x0b280000``/``0x0b480000``),
+  and Venus 4.4 wrapper ID (``0x0aa00000``). It implements DPU 4.0 CTL/DSI/MDP
+  interrupts, 60 Hz VSYNC, three graphic consoles (``head=0``/``head=1`` at
+  ``1350x1800`` and merged ``head=2`` at ``2700x1800``) scanned out via APPS
+  SMMU SID ``0x880``, Adreno 630 CP ring/IB/fence/IRQ execution, and a bounded
+  direct-render IR3 software rasterizer (``cat0``-``cat6`` including A6xx
+  bindless ``cat5``/``cat6``, VFD, ``DI_PT_RECTLIST``, ``DI_PT_TRILIST``/
+  ``TRIFAN``/``TRISTRIP``, alpha blending, and linear A8/R8/RG8/RGBA8/BGRA8
+  SYSMEM targets). GMEM binning, UBWC tiling, Venus video execution, and real
+  GMU firmware execution are not implemented.
 * TSENS v2 SROT/TM pairs at ``0x0c222000``/``0x0c263000`` and
   ``0x0c223000``/``0x0c265000``. Thirteen/eight sensors report constant
   25 degrees C. Signed thresholds, latched alarms, masks, clear registers
@@ -145,18 +161,20 @@ firmware identity, GCC control and OSM selection. Passing these checks does
 not establish native Windows
 display takeover or successful initialization of every 845 driver.
 
-Local 17047 checkpoint (2026-11-24)
+Local 17047 checkpoint (2026-11-25)
 ---------------------------------
 
-The AArch64 build and all 22 OEMSK850 qtests passed. The existing 20 MSM8998
-qtests also passed during this bring-up. A native power-SSDT/CmdDB boot,
-using the original OS disk with ``snapshot=on``, observed successful SPMI
-and PMIC preparation/D0 entry, PEP PrepareHardware, TREE EvtAddDevice, and
-SCM DriverEntry/PrepareHardware/D0Entry. These observations used debugger
-breakpoints without patching guest driver data or binaries.
+The AArch64 build passes all 24 OEMSK850 qtests (including SMMUv2 TTBR1,
+``CP_SMMU_TABLE_UPDATE``, ``CP_COND_EXEC``, DPU 4.0 VSYNC/DSI IRQs, and
+``/oemsk850/a630-direct-render``) and all 20 existing MSM8998 ``oemsk`` qtests
+with strict machine isolation.
 
-That boot loaded ABD and SMMU and created ``smss.exe``, but then waited for
-the unimplemented ``gcc_hlos1_vote_gpu_smmu_gds`` power status at GCC
-``+0x7d02c``. Successful SMMU device start and the complete foundation
-milestone are therefore still unverified. No native Adreno/DPU display
-takeover or dual-screen UI is established by this checkpoint.
+A live ``10.0.17047.1034`` FactoryOS boot via ``scripts/run-oemsk850.ps1``
+with ``snapshot=on`` and the opt-in ``power-smmu-gpu.aml`` (exposing PEP, ABD,
+SMMU, PILC and GPU0) plus ``cmddb-repro.bin`` passed unpatched
+``qcdxkm845.sys`` ``DxgkDdiStartDevice`` and ``DxgkDdiQueryChildRelations``
+with zero bugchecks, zero SMMU faults, and zero GPU SW resets. All 41 initial
+``dwm.exe`` / ``ComposableShell`` direct-render draws completed with zero
+rejects, lighting up both native ``1350x1800`` panels (and merged
+``2700x1800`` view) with the dual-screen wallpaper and anti-aliased
+DirectWrite text overlays.
