@@ -895,6 +895,138 @@ static void test_display_frontend(void)
     qtest_quit(qts);
 }
 
+static uint32_t pm4_type4(uint32_t reg, uint32_t cnt)
+{
+    return (4U << 28) | ((reg & 0x3ffffU) << 8) | (cnt & 0x7fU);
+}
+
+static uint32_t pm4_type7(uint32_t op, uint32_t cnt)
+{
+    return (7U << 28) | ((op & 0x7fU) << 16) | (cnt & 0x7fffU);
+}
+
+static void test_a630_direct_render(void)
+{
+    QTestState *qts = start_board();
+    const uint64_t rb   = 0x41400000;
+    const uint64_t dsg  = 0x41401000; /* Deferred CP_SET_DRAW_STATE IB */
+    const uint64_t vs   = 0x41402000;
+    const uint64_t fs   = 0x41403000;
+    const uint64_t vb   = 0x41404000;
+    const uint64_t btbl = 0x41405000; /* Bindless UBO descriptor table */
+    const uint64_t ubo  = 0x41406000; /* UBO payload (RGBA float color) */
+    const uint64_t rt   = 0x41410000; /* 16x16 linear BGRA8 render target */
+
+    /* Bypass GPU SMMU so ring/shaders/buffers use direct physical addresses. */
+    qtest_writel(qts, GPU_SMMU, 1);
+
+    /* Clear 16x16 render target (pitch = 64 bytes = 16 pixels). */
+    for (unsigned i = 0; i < 16 * 16; i++) {
+        qtest_writel(qts, rt + i * 4, 0);
+    }
+
+    /* Vertex buffer: 3 vertices covering lower-left triangle of 16x16 target. */
+    const uint32_t verts[6] = {
+        0xbf800000, 0xbf800000, /* (-1, -1) -> (0, 16) */
+        0x3f800000, 0xbf800000, /* ( 1, -1) -> (16, 16) */
+        0xbf800000, 0x3f800000, /* (-1,  1) -> (0, 0) */
+    };
+    for (unsigned i = 0; i < 6; i++) {
+        qtest_writel(qts, vb + i * 4, verts[i]);
+    }
+
+    /* UBO color = (R=0.8, G=0.4, B=0.2, A=1.0) -> BGRA8 0xffcc6633. */
+    qtest_writel(qts, ubo + 0, 0x3f4ccccd);  /* 0.8f */
+    qtest_writel(qts, ubo + 4, 0x3ecccccd);  /* 0.4f */
+    qtest_writel(qts, ubo + 8, 0x3e4ccccd);  /* 0.2f */
+    qtest_writel(qts, ubo + 12, 0x3f800000); /* 1.0f */
+
+    /* Bindless UBO descriptor 0 at btbl (16-byte stride). */
+    qtest_writel(qts, btbl + 0, (uint32_t)ubo);
+    qtest_writel(qts, btbl + 4, (uint32_t)(ubo >> 32) | (1U << 17));
+
+    /*
+     * VS: VFD loads (x,y,0,1) into r0.xyzw; ldc loads vec4 color from
+     * bindless base 3 slot 0 offset 0 into r1.xyzw; end.
+     */
+    qtest_writel(qts, vs + 0, 0x00c7b106); /* ldc.u32.4.imm.base3 r1.x, 0, 0 */
+    qtest_writel(qts, vs + 4, 0xc0260004);
+    qtest_writel(qts, vs + 8, 0x00000000); /* end */
+    qtest_writel(qts, vs + 12, 0x03000000);
+
+    /* FS: bary.f (ei)(rpt3)r0.x, 4; end. */
+    qtest_writel(qts, fs + 0, 0x00002004);
+    qtest_writel(qts, fs + 4, 0x47308b00);
+    qtest_writel(qts, fs + 8, 0x00000000);
+    qtest_writel(qts, fs + 12, 0x03000000);
+
+    /* Deferred draw state group: viewport, scissor, MRT0, VFD, VS/FS, bindless. */
+    uint32_t p = 0;
+#define EMIT(base, val) qtest_writel(qts, (base) + (p++) * 4, (val))
+    EMIT(dsg, pm4_type4(0x8000, 1)); EMIT(dsg, 0x60);       /* GRAS_CL_CNTL */
+    EMIT(dsg, pm4_type4(0x8010, 4));
+    EMIT(dsg, 0x41000000); /* XOFFSET = 8.0 */
+    EMIT(dsg, 0x41000000); /* XSCALE  = 8.0 */
+    EMIT(dsg, 0x41000000); /* YOFFSET = 8.0 */
+    EMIT(dsg, 0xc1000000); /* YSCALE  = -8.0 */
+    EMIT(dsg, pm4_type4(0x80f0, 2));
+    EMIT(dsg, 0x00000000); EMIT(dsg, 0x000f000f);           /* 16x16 scissor */
+    EMIT(dsg, pm4_type4(0x8820, 7));
+    EMIT(dsg, 0x00000780); /* MRT0_CONTROL: mask=0xf, no blend */
+    EMIT(dsg, 0x00000000); /* BLEND_CONTROL */
+    EMIT(dsg, 0x00002030); /* BUF_INFO: RGBA8 linear + WZYX (BGRA) swap */
+    EMIT(dsg, 0x00000001); /* PITCH: 1 * 64 = 64 bytes */
+    EMIT(dsg, 0x00000010); /* ARRAY_PITCH: 16 * 64 = 1024 bytes */
+    EMIT(dsg, (uint32_t)rt);
+    EMIT(dsg, (uint32_t)(rt >> 32));
+    EMIT(dsg, pm4_type4(0xa000, 2));
+    EMIT(dsg, 0x00000101); /* VFD_CONTROL_0: 1 fetch, 1 decode */
+    EMIT(dsg, 0xfcfcfcfc); /* VFD_CONTROL_1 */
+    EMIT(dsg, pm4_type4(0xa010, 4));
+    EMIT(dsg, (uint32_t)vb); EMIT(dsg, (uint32_t)(vb >> 32));
+    EMIT(dsg, 24); EMIT(dsg, 8);                            /* 3 * 8B */
+    EMIT(dsg, pm4_type4(0xa090, 1)); EMIT(dsg, 0x46700000); /* R32G32_FLOAT */
+    EMIT(dsg, pm4_type4(0xa0d0, 1)); EMIT(dsg, 0x0000000f); /* r0.xyzw */
+    EMIT(dsg, pm4_type4(0xa802, 2));
+    EMIT(dsg, 0x00000002); /* SP_VS_OUT_CNT = 2 */
+    EMIT(dsg, 0x0f040f00); /* out0: r0.xyzw, out1: r1.xyzw */
+    EMIT(dsg, pm4_type4(0xa813, 1)); EMIT(dsg, 0x00000400); /* loc0=0, loc1=4 */
+    EMIT(dsg, pm4_type4(0xa81c, 2));
+    EMIT(dsg, (uint32_t)vs); EMIT(dsg, (uint32_t)(vs >> 32));
+    EMIT(dsg, pm4_type4(0xa983, 2));
+    EMIT(dsg, (uint32_t)fs); EMIT(dsg, (uint32_t)(fs >> 32));
+    EMIT(dsg, pm4_type4(0xa98e, 1)); EMIT(dsg, 0x00000000); /* FS out r0.xyzw */
+    EMIT(dsg, pm4_type4(0xab16, 2));
+    EMIT(dsg, (uint32_t)btbl | 1U); /* SP_GFX_BINDLESS_BASE[3], 16B */
+    EMIT(dsg, (uint32_t)(btbl >> 32));
+    uint32_t dsg_dw = p;
+
+    /* Ring buffer: CP_SET_MARKER + CP_SET_DRAW_STATE + CP_DRAW_INDX_OFFSET. */
+    p = 0;
+    EMIT(rb, pm4_type7(0x65, 1)); EMIT(rb, 1); /* RM6_DIRECT_RENDER */
+    EMIT(rb, pm4_type7(0x43, 3));
+    EMIT(rb, (1U << 24) | dsg_dw);             /* group 1, deferred */
+    EMIT(rb, (uint32_t)dsg);
+    EMIT(rb, (uint32_t)(dsg >> 32));
+    EMIT(rb, pm4_type7(0x38, 3));
+    EMIT(rb, 0x00000084);                      /* DI_PT_TRILIST, auto-index */
+    EMIT(rb, 1);                               /* 1 instance */
+    EMIT(rb, 3);                               /* 3 vertices */
+#undef EMIT
+
+    qtest_writel(qts, 0x05002008, 0x0d);
+    qtest_writel(qts, 0x05002000, rb);
+    qtest_writel(qts, 0x05002004, 0);
+    qtest_writel(qts, 0x0500201c, p);
+
+    /* Inside lower-left triangle: (2, 12) must be BGRA8 0xffcc6633. */
+    g_assert_cmphex(qtest_readl(qts, rt + (12 * 16 + 2) * 4), ==, 0xffcc6633);
+    /* Outside triangle (upper-right): (12, 2) must remain 0x00000000. */
+    g_assert_cmphex(qtest_readl(qts, rt + (2 * 16 + 12) * 4), ==, 0x00000000);
+
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -921,5 +1053,6 @@ int main(int argc, char **argv)
     qtest_add_func("/oemsk850/tlmm", test_tlmm);
     qtest_add_func("/oemsk850/multimedia-clock-control", test_mmcc);
     qtest_add_func("/oemsk850/display-frontend", test_display_frontend);
+    qtest_add_func("/oemsk850/a630-direct-render", test_a630_direct_render);
     return g_test_run();
 }

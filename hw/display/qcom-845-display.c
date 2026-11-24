@@ -7,20 +7,14 @@
  * Strictly independent from MSM8998 (qcom-8998-display.c).
  */
 #include "qemu/osdep.h"
-#include "hw/display/qcom-845-display.h"
+#include "hw/display/qcom-845-display-internal.h"
 #include "hw/core/irq.h"
-#include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "qemu/bswap.h"
-#include "qemu/log.h"
 #include "qemu/module.h"
-#include "qemu/timer.h"
 #include "system/address-spaces.h"
-#include "ui/console.h"
 #include "trace.h"
-
-OBJECT_DECLARE_SIMPLE_TYPE(Qcom845Display, QCOM845_DISPLAY)
 
 /* Native SDM845 GPU0 MMIO windows from 17047 ACPI _CRS (excluding GPU_CC). */
 #define QCOM845_MDSS_BASE        0x0ae00000
@@ -107,18 +101,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(Qcom845Display, QCOM845_DISPLAY)
 #define VENUS4_WRAPPER_HW_VERSION 0xe0000
 #define VENUS4_HW_VERSION_44      0x40440000U
 
-enum Qcom845BankId {
-    BANK845_MDSS = 0,
-    BANK845_DP_PHY,
-    BANK845_ADRENO,
-    BANK845_GMU_CX,
-    BANK845_CX_MISC,
-    BANK845_PDC_SEQ,
-    BANK845_PDC_REGS,
-    BANK845_VENUS,
-    BANK845_COUNT,
-};
-
 typedef struct Qcom845BankDesc {
     const char *name;
     hwaddr base;
@@ -136,32 +118,8 @@ static const Qcom845BankDesc qcom845_bank_descs[BANK845_COUNT] = {
     [BANK845_VENUS]    = { "venus",    QCOM845_VENUS_BASE,    QCOM845_VENUS_SIZE },
 };
 
-typedef struct Qcom845DisplayBank {
-    Qcom845Display *parent;
-    enum Qcom845BankId id;
-    MemoryRegion mmio;
-    uint32_t *regs;
-    uint32_t reg_count;
-} Qcom845DisplayBank;
-
-struct Qcom845Display {
-    SysBusDevice parent_obj;
-    Qcom845Smmu *apps_smmu;
-    Qcom845Smmu *gpu_smmu;
-    Qcom845DisplayBank banks[BANK845_COUNT];
-    qemu_irq vsync_irq;
-    qemu_irq gfx_irq;
-    qemu_irq vidc_irq;
-    qemu_irq vidc_wd_irq;
-    QEMUTimer *vsync_timer;
-    QemuConsole *con[3]; /* 0: head 0, 1: head 1, 2: dual 2700x1800 */
-    uint32_t *panel_fb[2];
-    bool panel_dirty[2];
-    bool sspp_dirty;
-};
-
 static void qcom845_update_vsync_irq(Qcom845Display *s);
-static bool qcom845_gfx_update(void *opaque);
+static void qcom845_gfx_update(Qcom845Display *s);
 
 static bool qcom845_mdss_read_bytes(Qcom845Display *s, uint64_t iova,
                                     void *buf, size_t len, hwaddr *first_pa)
@@ -359,11 +317,8 @@ static void qcom845_update_vsync_timer(Qcom845Display *s)
     }
 }
 
-static bool qcom845_gfx_update(void *opaque)
+static void qcom845_gfx_update(Qcom845Display *s)
 {
-    Qcom845Display *s = opaque;
-    bool updated = false;
-
     for (unsigned head = 0; head < 2; head++) {
         if (!s->con[head] || !s->panel_dirty[head]) {
             continue;
@@ -380,7 +335,6 @@ static bool qcom845_gfx_update(void *opaque)
             }
             qemu_console_update(s->con[head], 0, 0, DPU4_PANEL_WIDTH,
                                 DPU4_PANEL_HEIGHT);
-            updated = true;
         }
     }
     if (s->con[2] && (s->panel_dirty[0] || s->panel_dirty[1])) {
@@ -399,12 +353,10 @@ static bool qcom845_gfx_update(void *opaque)
             }
             qemu_console_update(s->con[2], 0, 0, DPU4_PANEL_WIDTH * 2,
                                 DPU4_PANEL_HEIGHT);
-            updated = true;
         }
     }
     s->panel_dirty[0] = false;
     s->panel_dirty[1] = false;
-    return updated;
 }
 
 static void qcom845_gfx_invalidate(void *opaque)
@@ -413,10 +365,10 @@ static void qcom845_gfx_invalidate(void *opaque)
 
     s->panel_dirty[0] = true;
     s->panel_dirty[1] = true;
+    qcom845_gfx_update(s);
 }
 
 static const GraphicHwOps qcom845_gfx_ops = {
-    .gfx_update = qcom845_gfx_update,
     .invalidate = qcom845_gfx_invalidate,
 };
 
@@ -451,7 +403,7 @@ static void qcom845_update_gfx_irq(Qcom845Display *s)
     qemu_set_irq(s->gfx_irq, (status & mask) != 0);
 }
 
-static bool qcom845_gpu_read32(Qcom845Display *s, uint64_t iova, uint32_t *out)
+bool qcom845_gpu_read32(Qcom845Display *s, uint64_t iova, uint32_t *out)
 {
     hwaddr pa = iova;
     uint32_t val = 0;
@@ -468,7 +420,7 @@ static bool qcom845_gpu_read32(Qcom845Display *s, uint64_t iova, uint32_t *out)
     return true;
 }
 
-static bool qcom845_gpu_write32(Qcom845Display *s, uint64_t iova, uint32_t val)
+bool qcom845_gpu_write32(Qcom845Display *s, uint64_t iova, uint32_t val)
 {
     hwaddr pa = iova;
     uint32_t le = cpu_to_le32(val);
@@ -600,6 +552,76 @@ static void qcom845_cp_exec_stream(Qcom845Display *s, uint64_t base,
                         pos += w[5];
                     }
                 }
+            } else if (op == 0x65 && n >= 1) {
+                /* CP_SET_MARKER */
+                s->cp_marker = w[0] & 0x1ff;
+            } else if (op == 0x43 && n >= 3) {
+                /* CP_SET_DRAW_STATE: triples of (hdr, addr_lo, addr_hi) */
+                for (uint32_t i = 0; i + 2 < n && pos + i + 2 < count; i += 3) {
+                    uint32_t shdr = 0, slo = 0, shi = 0;
+                    qcom845_gpu_read32(s, base + (uint64_t)((start + pos + i) & ring_mask) * 4, &shdr);
+                    qcom845_gpu_read32(s, base + (uint64_t)((start + pos + i + 1) & ring_mask) * 4, &slo);
+                    qcom845_gpu_read32(s, base + (uint64_t)((start + pos + i + 2) & ring_mask) * 4, &shi);
+                    uint32_t gid = (shdr >> 24) & 0x1f;
+                    bool disable_all = (shdr & BIT(20)) != 0;
+                    bool disable = (shdr & BIT(19)) != 0;
+                    bool load_imm = (shdr & BIT(21)) != 0;
+                    uint32_t cnt = shdr & 0xffff;
+                    uint64_t saddr = slo | ((uint64_t)shi << 32);
+
+                    if (disable_all) {
+                        for (unsigned g = 0; g < A6XX_MAX_DRAW_STATES; g++) {
+                            s->draw_states[g].enabled = false;
+                            s->draw_states[g].dirty = false;
+                        }
+                    } else if (gid < A6XX_MAX_DRAW_STATES) {
+                        s->draw_states[gid].addr = saddr;
+                        s->draw_states[gid].dwords = cnt;
+                        s->draw_states[gid].enabled = !disable && cnt > 0 && saddr != 0;
+                        s->draw_states[gid].dirty = s->draw_states[gid].enabled;
+                        if (load_imm && s->draw_states[gid].enabled) {
+                            s->draw_states[gid].dirty = false;
+                            qcom845_cp_exec_stream(s, saddr, 0, cnt,
+                                                   UINT32_MAX, depth + 1);
+                        }
+                    }
+                }
+            } else if (op == 0x38 && n >= 3) {
+                /* CP_DRAW_INDX_OFFSET: flush pending draw state groups first. */
+                for (unsigned g = 0; g < A6XX_MAX_DRAW_STATES; g++) {
+                    if (s->draw_states[g].enabled && s->draw_states[g].dirty) {
+                        s->draw_states[g].dirty = false;
+                        qcom845_cp_exec_stream(s, s->draw_states[g].addr, 0,
+                                               s->draw_states[g].dwords,
+                                               UINT32_MAX, depth + 1);
+                    }
+                }
+                uint64_t mrt0 = adreno->regs[0x8825] |
+                                ((uint64_t)adreno->regs[0x8826] << 32);
+                uint32_t mrt0_info = adreno->regs[0x8822];
+                uint32_t mrt0_pitch = adreno->regs[0x8823] * 64;
+                uint32_t sc_tl = adreno->regs[0x80f0];
+                uint32_t sc_br = adreno->regs[0x80f1];
+                uint64_t sc = sc_tl | ((uint64_t)sc_br << 32);
+                uint64_t vfd0 = adreno->regs[0xa010] |
+                                ((uint64_t)adreno->regs[0xa011] << 32);
+                uint64_t fs_obj = adreno->regs[0xa983] |
+                                  ((uint64_t)adreno->regs[0xa984] << 32);
+                trace_qcom845_cp_draw(s->cp_marker, w[0], w[1], w[2],
+                                      mrt0, mrt0_info, mrt0_pitch,
+                                      sc, vfd0, fs_obj);
+                {
+                    uint32_t dw[7] = { 0 };
+                    for (uint32_t i = 0; i < n && i < ARRAY_SIZE(dw); i++) {
+                        dw[i] = w[i];
+                    }
+                    if (qcom845_render_draw(s, n, dw)) {
+                        s->sspp_dirty = true;
+                    }
+                }
+            } else if ((op == 0x32 || op == 0x34) && n >= 3) {
+                /* CP_LOAD_STATE6_GEOM / CP_LOAD_STATE6_FRAG */
+                qcom845_render_load_state6(s, base, start, ring_mask, pos, n, w);
             } else if (op == 0x53 && n >= 2) {
                 /* CP_SMMU_TABLE_UPDATE: update GPU_SMMU CB0 TTBR0 (+0x8020). */
                 if (s->gpu_smmu) {
@@ -852,6 +874,10 @@ static void qcom845_display_reset(DeviceState *dev)
     s->banks[BANK845_MDSS].regs[DPU4_MDP_HW_VERSION / 4] = DPU4_HW_VERSION_401;
     s->banks[BANK845_VENUS].regs[VENUS4_WRAPPER_HW_VERSION / 4] =
         VENUS4_HW_VERSION_44;
+    s->cp_marker = 0;
+    s->cp_reg_trace_count = 0;
+    memset(s->draw_states, 0, sizeof(s->draw_states));
+    qcom845_render_reset(s);
     qemu_set_irq(s->vsync_irq, 0);
     qemu_set_irq(s->gfx_irq, 0);
     qemu_set_irq(s->vidc_irq, 0);
@@ -910,6 +936,7 @@ static void qcom845_display_finalize(Object *obj)
     for (unsigned i = 0; i < BANK845_COUNT; i++) {
         g_free(s->banks[i].regs);
     }
+    qcom845_render_finalize(s);
 }
 
 static const VMStateDescription qcom845_display_vmstate = {

@@ -274,4 +274,8 @@ qcom845_display_read(const char *bank, uint64_t offset, uint32_t val) "%s +0x%"P
 qcom845_display_write(const char *bank, uint64_t offset, uint32_t val) "%s +0x%"PRIx64" <- 0x%08x"
 qcom845_cp_ring(uint32_t rptr, uint32_t wptr, uint64_t base, uint32_t dwords) "rptr=0x%x wptr=0x%x base=0x%"PRIx64" dwords=0x%x"
 qcom845_cp_pkt(uint32_t opcode, uint32_t count, uint32_t w0, uint32_t w1) "op=0x%02x cnt=%u w0=0x%08x w1=0x%08x"
+qcom845_cp_reg(uint32_t reg, uint32_t val) "reg=0x%04x <- 0x%08x"
+qcom845_cp_draw(uint32_t marker, uint32_t w0, uint32_t w1, uint32_t w2, uint64_t mrt0, uint32_t mrt0_info, uint32_t mrt0_pitch, uint64_t sc, uint64_t vfd0, uint64_t fs_obj) "mk=0x%x w0=0x%x inst=%u cnt=%u mrt0=0x%"PRIx64" info=0x%x pitch=%u sc=0x%"PRIx64" vfd0=0x%"PRIx64" fs=0x%"PRIx64
+qcom845_render_done(uint64_t mrt0, uint32_t fmt, uint32_t pixels) "mrt0=0x%"PRIx64" fmt=0x%x pixels=%u"
+qcom845_render_reject(const char *reason, uint64_t a, uint64_t b) "%s a=0x%"PRIx64" b=0x%"PRIx64
 qcom845_scanout(unsigned head, uint64_t iova, uint64_t pa, uint32_t w, uint32_t h, uint32_t stride, uint32_t nonblack) "head=%u iova=0x%"PRIx64" pa=0x%"PRIx64" %ux%u stride=%u nonblack=%u"

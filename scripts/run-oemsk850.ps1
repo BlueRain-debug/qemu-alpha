@@ -111,6 +111,7 @@ $vmArgs = @(
 if ($TraceDisplay) {
     $vmArgs += @('-trace', 'enable=qcom845_display_*',
                  '-trace', 'enable=qcom845_cp_*',
+                 '-trace', 'enable=qcom845_render_*',
                  '-trace', 'enable=qcom845_scanout',
                  '-trace', 'enable=qcom845_smmu_fault')
 }
