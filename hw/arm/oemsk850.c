@@ -9,6 +9,7 @@
 #include "hw/acpi/aml-build.h"
 #include "hw/arm/virt.h"
 #include "hw/arm/oemsk850.h"
+#include "hw/display/qcom-845-display.h"
 #include "hw/intc/arm_gic.h"
 #include "hw/core/sysbus.h"
 #include "qapi/error.h"
@@ -152,10 +153,15 @@ static void oemsk850_create_devices(VirtMachineState *vms)
     qcom845_rpmh_create(vms->gic);
     qcom845_tsens_create(vms->gic);
     qcom845_aoss_create(vms->gic);
-    qcom845_smmu_create(vms->gic, 0x15000000, 0x80000,
-                        ARRAY_SIZE(apps_irqs), 128, 97, apps_irqs);
-    qcom845_smmu_create(vms->gic, 0x05040000, 0x10000,
-                        ARRAY_SIZE(gpu_irqs), 16, 261, gpu_irqs);
+    Qcom845Smmu *apps_smmu, *gpu_smmu;
+
+    apps_smmu = qcom845_smmu_create(vms->gic, 0x15000000, 0x80000,
+                                    64, 128, 97, ARRAY_SIZE(apps_irqs),
+                                    apps_irqs);
+    gpu_smmu = qcom845_smmu_create(vms->gic, 0x05040000, 0x10000,
+                                   ARRAY_SIZE(gpu_irqs), 16, 261,
+                                   ARRAY_SIZE(gpu_irqs), gpu_irqs);
+    qcom845_display_create(vms->gic, apps_smmu, gpu_smmu);
 }
 
 static Aml *oemsk850_acpi_device(const char *name, const char *hid,

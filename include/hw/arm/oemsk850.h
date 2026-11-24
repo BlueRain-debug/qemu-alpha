@@ -32,6 +32,7 @@ typedef struct Qcom845Smmu Qcom845Smmu;
 Qcom845Smmu *qcom845_smmu_create(DeviceState *gic, hwaddr base,
                                 hwaddr size, unsigned contexts,
                                 unsigned streams, unsigned global_intid,
+                                unsigned num_irqs,
                                 const unsigned *context_intids);
 bool qcom845_smmu_translate(Qcom845Smmu *s, uint16_t sid, uint64_t iova,
                             bool write, hwaddr *physical);

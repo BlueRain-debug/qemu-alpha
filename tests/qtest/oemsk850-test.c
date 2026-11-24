@@ -67,6 +67,7 @@ static void test_isolation(void)
     g_assert_true(has_device(qts, "child<qcom845-cmddb>"));
     g_assert_true(has_device(qts, "child<qcom845-gcc>"));
     g_assert_true(has_device(qts, "child<qcom845-osm>"));
+    g_assert_true(has_device(qts, "child<qcom845-display>"));
     g_assert_false(has_device(qts, "child<qcom8998-scm>"));
     g_assert_false(has_device(qts, "child<qcom8998-rpm>"));
     g_assert_false(has_device(qts, "child<qcom8998-spmi>"));
@@ -220,8 +221,10 @@ static void test_smmu_fault_irq(void)
     QTestState *qts = start_board();
 
     intercept_gic(qts);
+    g_assert_cmphex((qtest_readl(qts, GPU_SMMU + 0x20) >> 16) & 255, ==, 1);
+    g_assert_cmphex((qtest_readl(qts, 0x15000020) >> 16) & 255, ==, 1);
     g_assert_cmphex(qtest_readl(qts, GPU_SMMU + 0x24) & 255, ==, 8);
-    g_assert_cmphex(qtest_readl(qts, 0x15000024) & 255, ==, 34);
+    g_assert_cmphex(qtest_readl(qts, 0x15000024) & 255, ==, 64);
     qtest_writel(qts, GPU_CB(0), 1U << 6);
     qtest_writel(qts, GPU_CB(1), 1U << 6);
     qtest_writel(qts, GPU_CB(0) + 0x5c, 2);
@@ -590,9 +593,17 @@ static void test_gcc_clock_control(void)
     g_assert_cmphex(qtest_readl(qts, gcc + 0x13000) >> 30, ==, 3);
     qtest_writel(qts, gcc + 0x76000, UINT32_MAX);
     g_assert_cmphex(qtest_readl(qts, gcc + 0x76000) >> 30, ==, 0);
+    /* HLOS1 GPU SMMU vote GDSC (+0x7d02c) and clock (+0x7d000). */
+    g_assert_cmphex(qtest_readl(qts, gcc + 0x7d02c), ==, 1);
+    qtest_writel(qts, gcc + 0x7d02c, 0);
+    g_assert_cmphex(qtest_readl(qts, gcc + 0x7d02c) >> 31, ==, 1);
+    g_assert_cmphex(qtest_readl(qts, gcc + 0x7d000) >> 31, ==, 1);
+    qtest_writel(qts, gcc + 0x7d000, 1);
+    g_assert_cmphex(qtest_readl(qts, gcc + 0x7d000) >> 31, ==, 0);
     qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
     g_assert_cmphex(qtest_readl(qts, gcc + 0x17034), ==, 0);
     g_assert_cmphex(qtest_readl(qts, gcc + 0xf004) & 1, ==, 1);
+    g_assert_cmphex(qtest_readl(qts, gcc + 0x7d02c), ==, 1);
     qtest_quit(qts);
 }
 
@@ -755,6 +766,105 @@ static void test_mmcc(void)
     qtest_quit(qts);
 }
 
+static void test_display_frontend(void)
+{
+    QTestState *qts = start_board();
+
+    intercept_gic(qts);
+
+    /* IMEM SRAM (0x14680000, 256 KiB) supports byte/dword/qword & resets. */
+    qtest_writeb(qts, 0x146bf94c, 0x5a);
+    g_assert_cmphex(qtest_readb(qts, 0x146bf94c), ==, 0x5a);
+    qtest_writeq(qts, 0x146bf000, UINT64_C(0x1122334455667788));
+    g_assert_cmphex(qtest_readq(qts, 0x146bf000), ==,
+                    UINT64_C(0x1122334455667788));
+
+    /* DPU 4.0 MDSS/MDP & Venus 4.4 version defaults + read-only protection. */
+    g_assert_cmphex(qtest_readl(qts, 0x0ae00000), ==, 0x40000001);
+    g_assert_cmphex(qtest_readl(qts, 0x0ae01000), ==, 0x40000001);
+    g_assert_cmphex(qtest_readl(qts, 0x0aae0000), ==, 0x40440000);
+    qtest_writel(qts, 0x0ae00000, 0xdeadbeef);
+    qtest_writel(qts, 0x0aae0000, 0xdeadbeef);
+    g_assert_cmphex(qtest_readl(qts, 0x0ae00000), ==, 0x40000001);
+    g_assert_cmphex(qtest_readl(qts, 0x0aae0000), ==, 0x40440000);
+
+    /* DPU 4.0 CTL0 SW_RESET self-clears and CTL0_START raises VSYNC IRQ. */
+    qtest_writel(qts, 0x0ae02030, 1);
+    g_assert_cmphex(qtest_readl(qts, 0x0ae02030), ==, 0);
+    qtest_writel(qts, 0x0ae01010, 1U << 8);
+    qtest_writel(qts, 0x0ae0201c, 1);
+    g_assert_cmphex(qtest_readl(qts, 0x0ae00010) & 1, ==, 1);
+    g_assert_true(qtest_get_irq(qts, 0x73 - 32));
+    qtest_writel(qts, 0x0ae01018, 1U << 8);
+    g_assert_false(qtest_get_irq(qts, 0x73 - 32));
+
+    /* DSI0 DMA SW trigger raises DSI0 IRQ bit and clears via W1C. */
+    qtest_writel(qts, 0x0ae94110, 1U << 1);
+    qtest_writel(qts, 0x0ae94090, 1);
+    g_assert_cmphex(qtest_readl(qts, 0x0ae00010) & (1U << 4), ==, 1U << 4);
+    g_assert_true(qtest_get_irq(qts, 0x73 - 32));
+    qtest_writel(qts, 0x0ae94110, 1U | (1U << 1));
+    g_assert_false(qtest_get_irq(qts, 0x73 - 32));
+
+    /* GPU RSC TCS0 idle status, 64-bit MMIO reads, and Adreno/PDC backing. */
+    g_assert_cmphex(qtest_readl(qts, 0x0508dd18), ==, 1);
+    qtest_writel(qts, 0x05002000, 0x08005000);
+    qtest_writel(qts, 0x05002004, 0x00000008);
+    g_assert_cmphex(qtest_readq(qts, 0x05002000), ==, UINT64_C(0x808005000));
+    qtest_writel(qts, 0x0506a000, 0x55aa1122);
+    g_assert_cmphex(qtest_readl(qts, 0x0506a000), ==, 0x55aa1122);
+    qtest_writel(qts, 0x0b280000, 0x11223344);
+    g_assert_cmphex(qtest_readl(qts, 0x0b280000), ==, 0x11223344);
+    qtest_writel(qts, 0x0b480000, 0x87654321);
+    g_assert_cmphex(qtest_readl(qts, 0x0b480000), ==, 0x87654321);
+
+    /* Adreno 630 CP ring execution & GFX IRQ (mask +0xe0, AO +0x2ec54, clr +0xdc). */
+    const uint64_t rb = 0x41200000, fence_pa = 0x41201000, rptr_pa = 0x41201018;
+    qtest_writel(qts, rb + 0, 0x70468004); /* CP_EVENT_WRITE (4 dwords) */
+    qtest_writel(qts, rb + 4, 0x00000004); /* CACHE_FLUSH_TS */
+    qtest_writel(qts, rb + 8, fence_pa);
+    qtest_writel(qts, rb + 12, 0);
+    qtest_writel(qts, rb + 16, 0xdeadcafe);
+    qtest_writel(qts, 0x050000e0, (1U << 14) | (1U << 15));
+    qtest_writel(qts, 0x05002008, 0x0d);
+    qtest_writel(qts, 0x05002000, rb);
+    qtest_writel(qts, 0x05002004, 0);
+    qtest_writel(qts, 0x05002010, rptr_pa);
+    qtest_writel(qts, 0x05002014, 0);
+    qtest_writel(qts, 0x0500201c, 5);
+    g_assert_cmphex(qtest_readl(qts, 0x05002018), ==, 5);
+    g_assert_cmphex(qtest_readl(qts, rptr_pa), ==, 5);
+    g_assert_cmphex(qtest_readl(qts, fence_pa), ==, 0xdeadcafe);
+    g_assert_cmphex(qtest_readl(qts, 0x0508ec54), ==, 1U << 15);
+    g_assert_cmphex(qtest_readl(qts, 0x05000804), ==, 1U << 15);
+    g_assert_true(qtest_get_irq(qts, 0x14c - 32));
+    qtest_writel(qts, 0x050000dc, 1U << 15);
+    g_assert_cmphex(qtest_readl(qts, 0x0508ec54), ==, 0);
+    g_assert_false(qtest_get_irq(qts, 0x14c - 32));
+
+    /* SMMUv2 TCR2 SEP=36bit + TTBR1 upper-range ATOS translation. */
+    const uint64_t l1 = 0x41300000, l2 = l1 + 0x1000, l3 = l1 + 0x2000;
+    const uint64_t iova = UINT64_C(0x808005000), target = 0x42100000;
+    qtest_writeq(qts, l1 + (((iova >> 30) & 31) * 8), l2 | 3);
+    qtest_writeq(qts, l2 + (((iova >> 21) & 511) * 8), l3 | 3);
+    qtest_writeq(qts, l3 + (((iova >> 12) & 511) * 8), target | (1U << 10) | 3);
+    qtest_writel(qts, GPU_SMMU + 0x1800, 1);
+    qtest_writel(qts, GPU_CB(0) + 0x10, 1U << 15); /* SEP = 36-bit */
+    qtest_writel(qts, GPU_CB(0) + 0x30, (2U << 30) | (29U << 16) | 29U);
+    qtest_writeq(qts, GPU_CB(0) + 0x28, l1);
+    qtest_writel(qts, GPU_CB(0), 1);
+    qtest_writeq(qts, GPU_CB(0) + 0x800, iova);
+    g_assert_cmphex(qtest_readq(qts, GPU_CB(0) + 0x50), ==, target);
+
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    g_assert_cmphex(qtest_readl(qts, 0x0ae00000), ==, 0x40000001);
+    g_assert_cmphex(qtest_readl(qts, 0x0aae0000), ==, 0x40440000);
+    g_assert_cmphex(qtest_readb(qts, 0x146bf94c), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, 0x050000e0), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, 0x0506a000), ==, 0);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -780,5 +890,6 @@ int main(int argc, char **argv)
     qtest_add_func("/oemsk850/display-clock-control", test_dispcc);
     qtest_add_func("/oemsk850/tlmm", test_tlmm);
     qtest_add_func("/oemsk850/multimedia-clock-control", test_mmcc);
+    qtest_add_func("/oemsk850/display-frontend", test_display_frontend);
     return g_test_run();
 }

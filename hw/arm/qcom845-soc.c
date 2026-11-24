@@ -26,10 +26,13 @@ typedef struct Soc845Region {
 struct Qcom845Soc {
     SysBusDevice parent_obj;
     Soc845Region regions[3];
+    MemoryRegion imem;
 };
 
 static const hwaddr soc845_bases[] = { 0x01fc8000, 0x03998000, 0x00780000 };
 static const hwaddr soc845_sizes[] = { 0x1000, 0x1000, 0x7000 };
+#define QCOM845_IMEM_BASE 0x14680000
+#define QCOM845_IMEM_SIZE 0x40000
 
 static uint64_t soc845_read(void *opaque, hwaddr offset, unsigned size)
 {
@@ -69,6 +72,19 @@ static void soc845_init(Object *obj)
                               &s->regions[i], TYPE_QCOM845_SOC, soc845_sizes[i]);
         sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->regions[i].mmio);
     }
+    memory_region_init_ram(&s->imem, obj, "qcom845.imem", QCOM845_IMEM_SIZE,
+                           &error_fatal);
+    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->imem);
+}
+
+static void soc845_reset(DeviceState *dev)
+{
+    Qcom845Soc *s = QCOM845_SOC(dev);
+    void *ptr = memory_region_get_ram_ptr(&s->imem);
+
+    if (ptr) {
+        memset(ptr, 0, QCOM845_IMEM_SIZE);
+    }
 }
 
 static const VMStateDescription soc845_vmstate = {
@@ -80,7 +96,8 @@ static void soc845_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->desc = "SDM845 2.1 identity and virtual unprogrammed QFPROM";
+    device_class_set_legacy_reset(dc, soc845_reset);
+    dc->desc = "SDM845 2.1 identity, IMEM and virtual unprogrammed QFPROM";
     dc->vmsd = &soc845_vmstate;
     dc->user_creatable = false;
 }
@@ -107,4 +124,5 @@ void qcom845_soc_create(void)
     for (unsigned i = 0; i < ARRAY_SIZE(soc845_bases); i++) {
         sysbus_mmio_map(dev, i, soc845_bases[i]);
     }
+    sysbus_mmio_map(dev, ARRAY_SIZE(soc845_bases), QCOM845_IMEM_BASE);
 }

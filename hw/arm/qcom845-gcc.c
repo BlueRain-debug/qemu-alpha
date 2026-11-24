@@ -68,7 +68,7 @@ static uint64_t gcc845_read(void *opaque, hwaddr offset, unsigned size)
         unsigned base = gcc845_pll_bases[i];
 
         if (offset == base) {
-            bool running = (value & 6) == 6 &&
+            bool running = (value & BIT(2)) &&
                            s->regs[(base + 0x2c) / 4] == 1;
 
             value &= ~(BIT(31) | BIT(30));
@@ -101,7 +101,7 @@ static void gcc845_write(void *opaque, hwaddr offset, uint64_t value,
     }
     for (unsigned i = 0; i < ARRAY_SIZE(gcc845_pll_bases); i++) {
         if (offset == gcc845_pll_bases[i]) {
-            value &= ~(BIT(31) | BIT(30));
+            value &= ~(BIT(31) | BIT(30) | BIT(22));
         }
     }
     s->regs[offset / 4] = value;

@@ -61,6 +61,7 @@ config OEMSK850
     default y
     depends on AARCH64 && TCG
     select ARM_VIRT
+    select QCOM_845_DISPLAY
 
 config CUBIEBOARD
     bool

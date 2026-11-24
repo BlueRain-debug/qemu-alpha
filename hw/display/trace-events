@@ -268,3 +268,10 @@ qcom8998_cp_triangles(unsigned indices, unsigned pixels) "indices=%u pixels=%u"
 qcom8998_cp_draw_time(bool begin, uint32_t control, unsigned vertices, int64_t usec) "begin=%d control=0x%x vertices=%u usec=%" PRId64
 qcom8998_cp_draw_reject(const char *reason, uint64_t first, uint64_t second) "%s first=0x%"PRIx64" second=0x%"PRIx64
 qcom8998_cp_texture_rectangle(unsigned x, unsigned y, unsigned width, unsigned height, uint64_t address) "xy=%u,%u size=%ux%u texture=0x%" PRIx64
+
+# qcom-845-display.c
+qcom845_display_read(const char *bank, uint64_t offset, uint32_t val) "%s +0x%"PRIx64" -> 0x%08x"
+qcom845_display_write(const char *bank, uint64_t offset, uint32_t val) "%s +0x%"PRIx64" <- 0x%08x"
+qcom845_cp_ring(uint32_t rptr, uint32_t wptr, uint64_t base, uint32_t dwords) "rptr=0x%x wptr=0x%x base=0x%"PRIx64" dwords=0x%x"
+qcom845_cp_pkt(uint32_t opcode, uint32_t count, uint32_t w0, uint32_t w1) "op=0x%02x cnt=%u w0=0x%08x w1=0x%08x"
+qcom845_scanout(unsigned head, uint64_t iova, uint64_t pa, uint32_t w, uint32_t h, uint32_t stride, uint32_t nonblack) "head=%u iova=0x%"PRIx64" pa=0x%"PRIx64" %ux%u stride=%u nonblack=%u"

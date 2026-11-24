@@ -15,6 +15,7 @@ param(
     [ValidateRange(1, 65535)][int]$TelnetPort = 5925,
     [switch]$Headless,
     [switch]$WaitForDebugger,
+    [switch]$TraceDisplay,
     [ValidateSet('vhdx', 'qcow2')][string]$OsFormat = 'vhdx'
 )
 
@@ -106,6 +107,13 @@ $vmArgs = @(
     '-gdb', "tcp:127.0.0.1:${GdbPort}",
     '-action', 'reboot=shutdown,shutdown=pause'
 )
+
+if ($TraceDisplay) {
+    $vmArgs += @('-trace', 'enable=qcom845_display_*',
+                 '-trace', 'enable=qcom845_cp_*',
+                 '-trace', 'enable=qcom845_scanout',
+                 '-trace', 'enable=qcom845_smmu_fault')
+}
 
 if ($WaitForDebugger) {
     $vmArgs += '-S'

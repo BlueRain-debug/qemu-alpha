@@ -94,7 +94,7 @@ static uint64_t mmcc845_read(void *opaque, hwaddr offset, unsigned size)
     }
     if (mmcc845_contains(config->plls, config->pll_count, offset)) {
         value &= ~(BIT(31) | BIT(30));
-        if ((value & 6) == 6 && bank->regs[(offset + 0x2c) / 4] == 1) {
+        if ((value & BIT(2)) && bank->regs[(offset + 0x2c) / 4] == 1) {
             value |= BIT(31);
         }
     }
@@ -111,7 +111,7 @@ static void mmcc845_write(void *opaque, hwaddr offset, uint64_t value,
         value &= ~1U; /* Immediate RCG UPDATE completion. */
     }
     if (mmcc845_contains(config->plls, config->pll_count, offset)) {
-        value &= ~(BIT(31) | BIT(30));
+        value &= ~(BIT(31) | BIT(30) | BIT(22));
     }
     bank->regs[offset / 4] = value;
 }

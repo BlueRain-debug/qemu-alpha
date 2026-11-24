@@ -37,6 +37,7 @@ struct Qcom845Smmu {
     hwaddr bytes;
     hwaddr cb_base;
     unsigned contexts;
+    unsigned num_irqs;
     unsigned streams;
     uint32_t *registers;
     qemu_irq global_irq;
@@ -54,7 +55,7 @@ static void smmu845_irq(Qcom845Smmu *s)
                                (BIT(31) | 0x1ff)) &&
                               (s->registers[0] & BIT(2)));
     /* Aggregate before changing a shared line: no spurious low/high pulse. */
-    for (unsigned irq = 0; irq < s->contexts; irq++) {
+    for (unsigned irq = 0; irq < s->num_irqs; irq++) {
         bool pending = false;
 
         for (unsigned cb = 0; cb < s->contexts; cb++) {
@@ -95,12 +96,16 @@ static bool smmu845_walk(Qcom845Smmu *s, unsigned cb, uint64_t iova,
 {
     unsigned base = s->cb_base + cb * 0x1000;
     uint32_t control = s->registers[base / 4];
+    uint32_t tcr2 = s->registers[(base + 0x10) / 4];
     uint32_t tcr = s->registers[(base + 0x30) / 4];
     uint32_t cbar = s->registers[(0x1000 + cb * 4) / 4];
-    unsigned va_bits = 64 - (tcr & 0x3f);
-    unsigned levels;
+    bool upper;
+    unsigned va_bits;
+    uint64_t va_mask;
     uint64_t table;
     bool table_ro = false;
+    static const unsigned sep_bits[8] = { 32, 36, 40, 42, 44, 48, 0, 64 };
+    unsigned sep = sep_bits[(tcr2 >> 15) & 7];
 
     *fault = FSR_UUT;
     if (!(control & 1)) {
@@ -109,23 +114,46 @@ static bool smmu845_walk(Qcom845Smmu *s, unsigned cb, uint64_t iova,
     }
     if (((cbar >> 16) & 3) != 1 ||
         !(s->registers[(0x1800 + cb * 4) / 4] & 1) ||
-        (tcr & (3U << 14)) || (tcr & BIT(7)) || va_bits < 16 || va_bits > 48) {
+        sep == 0) {
+        return false;
+    }
+    if (sep < 64) {
+        if (iova >> sep) {
+            *fault = FSR_TF;
+            return false;
+        }
+        if (sep > 32) {
+            iova = sextract64(iova, 0, sep);
+        }
+    }
+    upper = (iova >> 63) != 0;
+    if (tcr & (upper ? BIT(23) : BIT(7))) {
+        *fault = FSR_TF;
+        return false;
+    }
+    if (upper ? (((tcr >> 30) & 3) != 2) : (((tcr >> 14) & 3) != 0)) {
+        return false;
+    }
+    va_bits = 64 - ((tcr >> (upper ? 16 : 0)) & 0x3f);
+    if (va_bits < 16 || va_bits > 48) {
         return false;
     }
     *fault = FSR_TF;
-    if (iova >> va_bits) {
-        return false; /* This subset does not translate the upper TTBR1 range. */
+    va_mask = MAKE_64BIT_MASK(0, va_bits);
+    if ((iova & ~va_mask) != (upper ? ~va_mask : 0)) {
+        return false;
     }
-    levels = (va_bits - 12 + 8) / 9;
-    if (smmu845_reg64(s, base + 0x20) & UINT64_C(0x0000ff0000000000)) {
+    table = smmu845_reg64(s, base + (upper ? 0x28 : 0x20));
+    if (table & UINT64_C(0x0000ff0000000000)) {
         *fault = FSR_ASF;
         return false;
     }
-    table = smmu845_reg64(s, base + 0x20) & ADDRESS_MASK;
-    for (unsigned level = 4 - levels; level <= 3; level++) {
+    table &= ADDRESS_MASK;
+    for (unsigned shift = 12 + 9 * ((va_bits - 12 - 1) / 9); ; shift -= 9) {
         uint64_t descriptor;
-        unsigned shift = 12 + (3 - level) * 9;
-        uint64_t at = table + ((iova >> shift) & 511) * 8;
+        unsigned bits = MIN(9U, va_bits - shift);
+        uint64_t at = (table & ~MAKE_64BIT_MASK(0, bits + 3)) +
+                      extract64(iova, shift, bits) * 8;
 
         if (!smmu845_descriptor(at, &descriptor)) {
             *fault = FSR_EF;
@@ -138,12 +166,12 @@ static bool smmu845_walk(Qcom845Smmu *s, unsigned cb, uint64_t iova,
             *fault = FSR_ASF;
             return false;
         }
-        if ((descriptor & 3) == 3 && level != 3) {
+        if ((descriptor & 3) == 3 && shift > 12) {
             table_ro |= (descriptor & BIT_ULL(62)) != 0;
             table = descriptor & ADDRESS_MASK;
             continue;
         }
-        if ((level == 0) || ((descriptor & 3) != (level == 3 ? 3 : 1))) {
+        if ((shift == 39) || ((descriptor & 3) != (shift == 12 ? 3 : 1))) {
             return false;
         }
         if (descriptor & ADDRESS_MASK & ((UINT64_C(1) << shift) - 1)) {
@@ -244,7 +272,7 @@ static uint64_t smmu845_read(void *opaque, hwaddr offset, unsigned size)
 
     switch (offset) {
     case 0x20:
-        value = BIT(30) | BIT(27) | (s->contexts << 16) | (15U << 9) | s->streams;
+        value = BIT(30) | BIT(27) | (1U << 16) | (15U << 9) | s->streams;
         break;
     case 0x24:
         value = ((ctz64(s->cb_base) - 13) << 28) | s->contexts;
@@ -316,7 +344,8 @@ static void smmu845_reset(DeviceState *dev)
     memset(s->registers, 0, s->bytes);
     s->registers[0] = 1; /* CLIENTPD */
     for (unsigned cb = 0; cb < s->contexts; cb++) {
-        s->registers[(0x1000 + cb * 4) / 4] = (cb << 24) | (1U << 16);
+        s->registers[(0x1000 + cb * 4) / 4] =
+            ((cb % s->num_irqs) << 24) | (1U << 16);
     }
     smmu845_irq(s);
 }
@@ -358,15 +387,18 @@ type_init(smmu845_register_types)
 Qcom845Smmu *qcom845_smmu_create(DeviceState *gic, hwaddr base,
                                 hwaddr size, unsigned contexts,
                                 unsigned streams, unsigned global_intid,
+                                unsigned num_irqs,
                                 const unsigned *context_intids)
 {
     Qcom845Smmu *s = QCOM845_SMMU(qdev_new(TYPE_QCOM845_SMMU));
     SysBusDevice *dev = SYS_BUS_DEVICE(s);
 
     assert(contexts > 0 && contexts <= MAX_CONTEXTS && streams <= MAX_STREAMS);
+    assert(num_irqs > 0 && num_irqs <= contexts);
     s->bytes = size;
     s->cb_base = size / 2;
     s->contexts = contexts;
+    s->num_irqs = num_irqs;
     s->streams = streams;
     assert(s->cb_base + contexts * 0x1000 <= size);
     s->registers = g_new0(uint32_t, size / 4);
@@ -374,14 +406,15 @@ Qcom845Smmu *qcom845_smmu_create(DeviceState *gic, hwaddr base,
                           TYPE_QCOM845_SMMU, size);
     sysbus_init_mmio(dev, &s->mmio);
     sysbus_init_irq(dev, &s->global_irq);
-    for (unsigned cb = 0; cb < contexts; cb++) {
-        sysbus_init_irq(dev, &s->context_irq[cb]);
+    for (unsigned i = 0; i < num_irqs; i++) {
+        sysbus_init_irq(dev, &s->context_irq[i]);
     }
     sysbus_realize_and_unref(dev, &error_fatal);
     sysbus_mmio_map(dev, 0, base);
     sysbus_connect_irq(dev, 0, qdev_get_gpio_in(gic, global_intid - 32));
-    for (unsigned cb = 0; cb < contexts; cb++) {
-        sysbus_connect_irq(dev, cb + 1, qdev_get_gpio_in(gic, context_intids[cb] - 32));
+    for (unsigned i = 0; i < num_irqs; i++) {
+        sysbus_connect_irq(dev, i + 1,
+                           qdev_get_gpio_in(gic, context_intids[i] - 32));
     }
     return s;
 }
