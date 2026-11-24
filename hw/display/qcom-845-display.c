@@ -94,6 +94,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Qcom845Display, QCOM845_DISPLAY)
 #define A6XX_CP_RB_RPTR          (0x806 * 4)
 #define A6XX_CP_RB_WPTR          (0x807 * 4)
 #define A6XX_CP_SQE_CNTL         (0x808 * 4)
+#define A6XX_INT_CP_RB_SW        BIT(13)
 #define A6XX_INT_CP_SW           BIT(14)
 #define A6XX_INT_CACHE_FLUSH_TS  BIT(15)
 
@@ -515,6 +516,11 @@ static void qcom845_cp_exec_stream(Qcom845Display *s, uint64_t base,
                 }
                 if (reg + i < adreno->reg_count) {
                     adreno->regs[reg + i] = v;
+                } else if (reg + i >= 0x10000 && reg + i < 0x14000 &&
+                           s->gpu_smmu) {
+                    /* GPU_SMMU (0x05040000..0x0504ffff) in Adreno dword space. */
+                    qcom845_smmu_write32(s->gpu_smmu,
+                                         (hwaddr)(reg + i - 0x10000) * 4, v);
                 }
             }
         } else if (type == 7) {
@@ -572,12 +578,36 @@ static void qcom845_cp_exec_stream(Qcom845Display *s, uint64_t base,
                                            depth + 1);
                 }
             } else if (op == 0x40 && n >= 1) {
-                /* CP_INTERRUPT */
-                adreno->regs[A6XX_RBBM_INT_0_STATUS / 4] |= A6XX_INT_CP_SW;
+                /*
+                 * CP_INTERRUPT: bits [31:29] map to RBBM_INT_0_STATUS [15:13]
+                 * (0x20000000 -> BIT(13) used by qcdxkm845 preempt/sync path).
+                 */
+                uint32_t mask = (w[0] >> 16) &
+                                (A6XX_INT_CP_RB_SW | A6XX_INT_CP_SW |
+                                 A6XX_INT_CACHE_FLUSH_TS);
+                adreno->regs[A6XX_RBBM_INT_0_STATUS / 4] |=
+                    mask ? mask : A6XX_INT_CP_SW;
                 qcom845_update_gfx_irq(s);
+            } else if (op == 0x44 && n >= 6) {
+                /* CP_COND_EXEC: skip w[5] dwords if !enabled or ref < ts. */
+                uint64_t bool_addr = w[0] | ((uint64_t)w[1] << 32);
+                uint64_t ts_addr = w[2] | ((uint64_t)w[3] << 32);
+                uint32_t enabled = 0, ts = 0;
+
+                if (qcom845_gpu_read32(s, bool_addr, &enabled) &&
+                    qcom845_gpu_read32(s, ts_addr, &ts)) {
+                    if (!enabled || (uint32_t)(w[4] - ts) >= BIT(31)) {
+                        pos += w[5];
+                    }
+                }
+            } else if (op == 0x53 && n >= 2) {
+                /* CP_SMMU_TABLE_UPDATE: update GPU_SMMU CB0 TTBR0 (+0x8020). */
+                if (s->gpu_smmu) {
+                    qcom845_smmu_write32(s->gpu_smmu, 0x8020, w[0]);
+                    qcom845_smmu_write32(s->gpu_smmu, 0x8024, w[1]);
+                }
             } else if (op == 0x46 && n >= 1) {
                 /* CP_EVENT_WRITE */
-                uint32_t ev = w[0] & 0xff;
                 bool irq = (w[0] & BIT(31)) != 0;
 
                 if (n >= 4) {
@@ -587,7 +617,7 @@ static void qcom845_cp_exec_stream(Qcom845Display *s, uint64_t base,
                         qcom845_gpu_write32(s, dst + 4, w[4]);
                     }
                 }
-                if (irq || ev == 0x04 || ev == 0x16) {
+                if (irq) {
                     adreno->regs[A6XX_RBBM_INT_0_STATUS / 4] |=
                         A6XX_INT_CACHE_FLUSH_TS;
                     qcom845_update_gfx_irq(s);

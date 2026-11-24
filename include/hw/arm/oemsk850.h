@@ -36,5 +36,6 @@ Qcom845Smmu *qcom845_smmu_create(DeviceState *gic, hwaddr base,
                                 const unsigned *context_intids);
 bool qcom845_smmu_translate(Qcom845Smmu *s, uint16_t sid, uint64_t iova,
                             bool write, hwaddr *physical);
+void qcom845_smmu_write32(Qcom845Smmu *s, hwaddr offset, uint32_t value);
 
 #endif

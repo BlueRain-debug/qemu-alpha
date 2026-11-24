@@ -821,28 +821,30 @@ static void test_display_frontend(void)
     /* Adreno 630 CP ring execution & GFX IRQ (mask +0xe0, AO +0x2ec54, clr +0xdc). */
     const uint64_t rb = 0x41200000, fence_pa = 0x41201000, rptr_pa = 0x41201018;
     qtest_writel(qts, rb + 0, 0x70468004); /* CP_EVENT_WRITE (4 dwords) */
-    qtest_writel(qts, rb + 4, 0x00000004); /* CACHE_FLUSH_TS */
+    qtest_writel(qts, rb + 4, 0x80000004); /* CACHE_FLUSH_TS | IRQ */
     qtest_writel(qts, rb + 8, fence_pa);
     qtest_writel(qts, rb + 12, 0);
     qtest_writel(qts, rb + 16, 0xdeadcafe);
-    qtest_writel(qts, 0x050000e0, (1U << 14) | (1U << 15));
+    qtest_writel(qts, rb + 20, 0x70408001); /* CP_INTERRUPT (1 dword) */
+    qtest_writel(qts, rb + 24, 0x20000000); /* -> BIT(13) */
+    qtest_writel(qts, 0x050000e0, (1U << 13) | (1U << 14) | (1U << 15));
     qtest_writel(qts, 0x05002008, 0x0d);
     qtest_writel(qts, 0x05002000, rb);
     qtest_writel(qts, 0x05002004, 0);
     qtest_writel(qts, 0x05002010, rptr_pa);
     qtest_writel(qts, 0x05002014, 0);
-    qtest_writel(qts, 0x0500201c, 5);
-    g_assert_cmphex(qtest_readl(qts, 0x05002018), ==, 5);
-    g_assert_cmphex(qtest_readl(qts, rptr_pa), ==, 5);
+    qtest_writel(qts, 0x0500201c, 7);
+    g_assert_cmphex(qtest_readl(qts, 0x05002018), ==, 7);
+    g_assert_cmphex(qtest_readl(qts, rptr_pa), ==, 7);
     g_assert_cmphex(qtest_readl(qts, fence_pa), ==, 0xdeadcafe);
-    g_assert_cmphex(qtest_readl(qts, 0x0508ec54), ==, 1U << 15);
-    g_assert_cmphex(qtest_readl(qts, 0x05000804), ==, 1U << 15);
+    g_assert_cmphex(qtest_readl(qts, 0x0508ec54), ==, (1U << 13) | (1U << 15));
+    g_assert_cmphex(qtest_readl(qts, 0x05000804), ==, (1U << 13) | (1U << 15));
     g_assert_true(qtest_get_irq(qts, 0x14c - 32));
-    qtest_writel(qts, 0x050000dc, 1U << 15);
+    qtest_writel(qts, 0x050000dc, (1U << 13) | (1U << 15));
     g_assert_cmphex(qtest_readl(qts, 0x0508ec54), ==, 0);
     g_assert_false(qtest_get_irq(qts, 0x14c - 32));
 
-    /* SMMUv2 TCR2 SEP=36bit + TTBR1 upper-range ATOS translation. */
+    /* SMMUv2 TCR2 SEP=36bit + TTBR1 upper-range ATOS + CP_SMMU_TABLE_UPDATE. */
     const uint64_t l1 = 0x41300000, l2 = l1 + 0x1000, l3 = l1 + 0x2000;
     const uint64_t iova = UINT64_C(0x808005000), target = 0x42100000;
     qtest_writeq(qts, l1 + (((iova >> 30) & 31) * 8), l2 | 3);
@@ -855,6 +857,34 @@ static void test_display_frontend(void)
     qtest_writel(qts, GPU_CB(0), 1);
     qtest_writeq(qts, GPU_CB(0) + 0x800, iova);
     g_assert_cmphex(qtest_readq(qts, GPU_CB(0) + 0x50), ==, target);
+
+    /* Verify CP_SMMU_TABLE_UPDATE (0x53) switches CB0 TTBR0 and CP_COND_EXEC skips. */
+    const uint64_t l1_low = 0x41310000;
+    const uint64_t rb2 = 0x41202000, cond_bool = 0x41203000, out_pa = 0x41203010;
+    qtest_writel(qts, GPU_SMMU, 1); /* Bypass SMMU for physical ring test */
+    qtest_writel(qts, cond_bool, 0); /* Disabled -> CP_COND_EXEC must skip 4 dwords */
+    qtest_writel(qts, out_pa, 0x11111111);
+    qtest_writel(qts, rb2 + 0, 0x70538003); /* CP_SMMU_TABLE_UPDATE (3 dwords) */
+    qtest_writel(qts, rb2 + 4, (uint32_t)l1_low);
+    qtest_writel(qts, rb2 + 8, (uint32_t)(l1_low >> 32));
+    qtest_writel(qts, rb2 + 12, 0);
+    qtest_writel(qts, rb2 + 16, 0x70448006); /* CP_COND_EXEC (6 dwords) */
+    qtest_writel(qts, rb2 + 20, cond_bool);
+    qtest_writel(qts, rb2 + 24, 0);
+    qtest_writel(qts, rb2 + 28, cond_bool);
+    qtest_writel(qts, rb2 + 32, 0);
+    qtest_writel(qts, rb2 + 36, 1);
+    qtest_writel(qts, rb2 + 40, 4); /* Skip 4 dwords (CP_MEM_WRITE below) */
+    qtest_writel(qts, rb2 + 44, 0x703d8003); /* Skipped CP_MEM_WRITE */
+    qtest_writel(qts, rb2 + 48, out_pa);
+    qtest_writel(qts, rb2 + 52, 0);
+    qtest_writel(qts, rb2 + 56, 0xbad0bad0);
+    qtest_writel(qts, 0x05002008, 0x0d);
+    qtest_writel(qts, 0x05002000, rb2);
+    qtest_writel(qts, 0x05002004, 0);
+    qtest_writel(qts, 0x0500201c, 15);
+    g_assert_cmphex(qtest_readq(qts, GPU_CB(0) + 0x20), ==, l1_low);
+    g_assert_cmphex(qtest_readl(qts, out_pa), ==, 0x11111111);
 
     qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
     g_assert_cmphex(qtest_readl(qts, 0x0ae00000), ==, 0x40000001);

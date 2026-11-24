@@ -326,6 +326,13 @@ static void smmu845_write(void *opaque, hwaddr offset, uint64_t value,
     smmu845_irq(s);
 }
 
+void qcom845_smmu_write32(Qcom845Smmu *s, hwaddr offset, uint32_t value)
+{
+    if (s && offset + 4 <= s->bytes) {
+        smmu845_write(s, offset, value, 4);
+    }
+}
+
 static const MemoryRegionOps smmu845_ops = {
     .read = smmu845_read,
     .write = smmu845_write,
