@@ -276,6 +276,7 @@ qtests_arm = \
 
 # TODO: once aarch64 TCG is fixed on ARM 32 bit host, make bios-tables-test unconditional
 qtests_aarch64 = \
+  (config_all_devices.has_key('CONFIG_OEMSK850') ? ['oemsk850-test'] : []) + \
   (config_all_devices.has_key('CONFIG_OEMSK') ? ['oemsk-test'] : []) + \
   (cpu != 'arm' and unpack_edk2_blobs ? ['bios-tables-test'] : []) +                            \
   (config_all_accel.has_key('CONFIG_TCG') and config_all_devices.has_key('CONFIG_TPM_TIS_SYSBUS') ?            \

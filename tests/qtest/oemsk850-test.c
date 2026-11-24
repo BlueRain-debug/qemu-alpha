@@ -1,0 +1,784 @@
+/* SDM845 board separation and SPMI v5 regression tests. */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+#include "qemu/osdep.h"
+#include "libqtest.h"
+#include "qemu/bswap.h"
+#include "qobject/qdict.h"
+#include "qobject/qlist.h"
+
+#define SPMI 0x0c400000
+#define OBS (SPMI + 0x02200000)
+#define CHANNEL(n) (OBS + (n) * 0x80)
+
+static bool has_device(QTestState *qts, const char *type)
+{
+    g_autoptr(QDict) reply = qtest_qmp(qts,
+        "{'execute':'qom-list','arguments':{'path':'/machine/unattached'}}");
+    QList *list = qdict_get_qlist(reply, "return");
+    QListEntry *entry;
+
+    QLIST_FOREACH_ENTRY(list, entry) {
+        QDict *item = qobject_to(QDict, qlist_entry_obj(entry));
+
+        if (!strcmp(qdict_get_str(item, "type"), type)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static QTestState *start_board(void)
+{
+    return qtest_init("-M oemsk850 -m 256M -nodefaults");
+}
+
+static void intercept_gic(QTestState *qts)
+{
+    g_autoptr(QDict) reply = qtest_qmp(qts,
+        "{'execute':'qom-list','arguments':{'path':'/machine/unattached'}}");
+    QList *list = qdict_get_qlist(reply, "return");
+    QListEntry *entry;
+
+    QLIST_FOREACH_ENTRY(list, entry) {
+        QDict *item = qobject_to(QDict, qlist_entry_obj(entry));
+
+        if (!strcmp(qdict_get_str(item, "type"), "child<arm_gic>")) {
+            g_autofree char *path = g_strdup_printf("/machine/unattached/%s",
+                                                   qdict_get_str(item, "name"));
+            qtest_irq_intercept_in(qts, path);
+            return;
+        }
+    }
+    g_assert_not_reached();
+}
+
+static void test_isolation(void)
+{
+    QTestState *qts = start_board();
+
+    g_assert_true(has_device(qts, "child<qcom845-scm>"));
+    g_assert_true(has_device(qts, "child<qcom845-spmi>"));
+    g_assert_true(has_device(qts, "child<qcom845-rpmh>"));
+    g_assert_true(has_device(qts, "child<qcom845-smmu>"));
+    g_assert_true(has_device(qts, "child<qcom845-tsens>"));
+    g_assert_true(has_device(qts, "child<qcom845-aoss>"));
+    g_assert_true(has_device(qts, "child<qcom845-soc>"));
+    g_assert_true(has_device(qts, "child<qcom845-cprh>"));
+    g_assert_true(has_device(qts, "child<qcom845-cmddb>"));
+    g_assert_true(has_device(qts, "child<qcom845-gcc>"));
+    g_assert_true(has_device(qts, "child<qcom845-osm>"));
+    g_assert_false(has_device(qts, "child<qcom8998-scm>"));
+    g_assert_false(has_device(qts, "child<qcom8998-rpm>"));
+    g_assert_false(has_device(qts, "child<qcom8998-spmi>"));
+    g_assert_false(has_device(qts, "child<qcom-8998-display>"));
+    /* 768 interrupt IDs, sufficient for native 541 plus synthetic 576..767. */
+    g_assert_cmphex(qtest_readl(qts, 0x0b000004) & 31, ==, 23);
+#ifdef CONFIG_HMP
+    {
+        g_autofree char *tree = qtest_hmp(qts, "info mtree");
+        g_autofree char *registers = qtest_hmp(qts, "info registers");
+
+        g_assert_nonnull(strstr(registers, "PC=0000000030000000"));
+        g_assert_nonnull(strstr(tree, "0000000020000000-000000002effffff"));
+        g_assert_nonnull(strstr(tree, "0000000030000000-0000000033ffffff"));
+        g_assert_nonnull(strstr(tree, "0000000034000000-0000000034ffffff"));
+        g_assert_nonnull(strstr(tree, "000000001b000000-000000001bffffff"));
+        g_assert_nonnull(strstr(tree, "000000000c400000-000000000ebfffff"));
+    }
+#endif
+    qtest_quit(qts);
+    qts = qtest_init("-M oemsk -m 256M -nodefaults");
+    g_assert_false(has_device(qts, "child<qcom845-spmi>"));
+    g_assert_false(has_device(qts, "child<qcom845-scm>"));
+    g_assert_false(has_device(qts, "child<qcom845-tsens>"));
+    g_assert_false(has_device(qts, "child<qcom845-aoss>"));
+    g_assert_false(has_device(qts, "child<qcom845-soc>"));
+    g_assert_false(has_device(qts, "child<qcom845-cprh>"));
+    g_assert_false(has_device(qts, "child<qcom845-cmddb>"));
+    g_assert_false(has_device(qts, "child<qcom845-gcc>"));
+    g_assert_false(has_device(qts, "child<qcom845-osm>"));
+    g_assert_cmphex(qtest_readl(qts, 0x0b000004) & 31, ==, 21);
+    qtest_quit(qts);
+    qts = qtest_init("-M virt,gic-version=2 -cpu max -m 256M -nodefaults");
+    g_assert_false(has_device(qts, "child<qcom845-spmi>"));
+    g_assert_false(has_device(qts, "child<qcom845-scm>"));
+    g_assert_false(has_device(qts, "child<qcom845-tsens>"));
+    g_assert_false(has_device(qts, "child<qcom845-aoss>"));
+    g_assert_false(has_device(qts, "child<qcom845-soc>"));
+    g_assert_false(has_device(qts, "child<qcom845-cprh>"));
+    g_assert_false(has_device(qts, "child<qcom845-cmddb>"));
+    g_assert_false(has_device(qts, "child<qcom845-gcc>"));
+    g_assert_false(has_device(qts, "child<qcom845-osm>"));
+    qtest_quit(qts);
+}
+
+static void test_spmi_revision(void)
+{
+    QTestState *qts = start_board();
+
+    g_assert_cmphex(qtest_readl(qts, SPMI + 0x40000), ==, 0x50000000);
+    g_assert_cmphex(qtest_readl(qts, SPMI + 0x40900), ==, 0x100);
+    g_assert_cmphex(qtest_readl(qts, SPMI + 0x40904), ==, 0x20100);
+    g_assert_cmphex(qtest_readl(qts, SPMI + 0x40908), ==, 0x40100);
+    g_assert_cmphex(qtest_readl(qts, SPMI + 0x4090c), ==, 0);
+    for (unsigned apid = 0; apid < 3; apid++) {
+        static const uint8_t subtype[] = { 0x14, 0x15, 0x18 };
+
+        qtest_writel(qts, CHANNEL(apid), (1U << 27) | (3U << 4) | 2);
+        g_assert_cmphex(qtest_readl(qts, CHANNEL(apid) + 8), ==, 1);
+        g_assert_cmphex(qtest_readl(qts, CHANNEL(apid) + 0x18), ==,
+                        (subtype[apid] << 16) | 0x5100 | (apid == 2 ? 1 : 2));
+    }
+    /* The next execution environment has a separate 64-KiB observer view. */
+    qtest_writel(qts, OBS + 0x10000, (1U << 27) | (5U << 4));
+    g_assert_cmphex(qtest_readl(qts, OBS + 0x10018), ==, 0x14);
+    qtest_quit(qts);
+}
+
+static void test_spmi_failure_reset(void)
+{
+    QTestState *qts = start_board();
+
+    /* Revision-only model must fail writes, rather than claim rail changes. */
+    qtest_writel(qts, SPMI + 0x200000, 0);
+    g_assert_cmphex(qtest_readl(qts, SPMI + 0x200008), ==, 3);
+    qtest_writel(qts, OBS, (1U << 27) | (255U << 4) | 7);
+    g_assert_cmphex(qtest_readl(qts, OBS + 8), ==, 3);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    g_assert_cmphex(qtest_readl(qts, SPMI + 0x200008), ==, 1);
+    g_assert_cmphex(qtest_readl(qts, OBS + 8), ==, 1);
+    g_assert_cmphex(qtest_readl(qts, OBS + 0x18), ==, 0);
+    qtest_quit(qts);
+}
+
+#define RSC 0x179e0000
+#define DISPLAY_RSC 0x0af20000
+#define TCS(b) ((b) + ((b) == DISPLAY_RSC ? 0x1c00 : 0xd00))
+
+static void rsc_command(QTestState *qts, uint64_t base, uint32_t message,
+                        uint32_t address, uint32_t data)
+{
+    qtest_writel(qts, TCS(base) + 0x14, 0);
+    qtest_writel(qts, TCS(base) + 0x30, message);
+    qtest_writel(qts, TCS(base) + 0x34, address);
+    qtest_writel(qts, TCS(base) + 0x38, data);
+    qtest_writel(qts, TCS(base) + 0x1c, 1);
+    qtest_writel(qts, TCS(base) + 0x14, (1U << 16) | (1U << 24));
+}
+
+static void test_rsc_votes_irq(void)
+{
+    QTestState *qts = start_board();
+
+    intercept_gic(qts);
+    g_assert_cmphex(qtest_readl(qts, RSC), ==, 0x20700);
+    g_assert_cmphex(qtest_readl(qts, RSC + 0xc), ==,
+                    (16U << 27) | (9 << 12) | (9 << 6) | 9);
+    g_assert_cmphex(qtest_readl(qts, DISPLAY_RSC + 0xc) & 63, ==, 9);
+    g_assert_cmphex(qtest_readl(qts, TCS(DISPLAY_RSC) + 0x18), ==, 1);
+    g_assert_cmphex(qtest_readl(qts, DISPLAY_RSC + 0xd18), ==, 0);
+    qtest_writel(qts, TCS(RSC), 1);
+    rsc_command(qts, RSC, 0x10108, 0x30000, 0x1234);
+    g_assert_cmphex(qtest_readl(qts, TCS(RSC) + 0x3c), ==, 0x10100);
+    g_assert_cmphex(qtest_readl(qts, TCS(RSC) + 0x40), ==, 0x1234);
+    g_assert_cmphex(qtest_readl(qts, TCS(RSC) + 4), ==, 1);
+    g_assert_true(qtest_get_irq(qts, 37 - 32));
+    qtest_writel(qts, TCS(RSC) + 8, 1);
+    g_assert_false(qtest_get_irq(qts, 37 - 32));
+    rsc_command(qts, DISPLAY_RSC, 0x108, 0x30000, 0);
+    g_assert_cmphex(qtest_readl(qts, TCS(DISPLAY_RSC) + 0x40), ==, 0x1234);
+    g_assert_false(qtest_get_irq(qts, 161 - 32));
+    qtest_writel(qts, TCS(DISPLAY_RSC), 1);
+    g_assert_true(qtest_get_irq(qts, 161 - 32));
+    qtest_writel(qts, TCS(DISPLAY_RSC) + 8, 1);
+    g_assert_false(qtest_get_irq(qts, 161 - 32));
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    rsc_command(qts, RSC, 0x108, 0x30000, 0);
+    g_assert_cmphex(qtest_readl(qts, TCS(RSC) + 0x40), ==, 0);
+    g_assert_false(qtest_get_irq(qts, 37 - 32));
+    qtest_quit(qts);
+}
+
+static void test_rsc_reject_invalid(void)
+{
+    QTestState *qts = start_board();
+
+    qtest_writel(qts, TCS(RSC), 1);
+    rsc_command(qts, RSC, 0x10108, 0x30001, 42);
+    g_assert_cmphex(qtest_readl(qts, TCS(RSC) + 4), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, TCS(RSC) + 0x3c), ==, 0);
+    rsc_command(qts, RSC, 0x10108, 0x1000000, 42);
+    g_assert_cmphex(qtest_readl(qts, TCS(RSC) + 4), ==, 0);
+    qtest_quit(qts);
+}
+
+#define GPU_SMMU 0x05040000
+#define GPU_CB(n) (GPU_SMMU + 0x8000 + (n) * 0x1000)
+
+static void test_smmu_fault_irq(void)
+{
+    QTestState *qts = start_board();
+
+    intercept_gic(qts);
+    g_assert_cmphex(qtest_readl(qts, GPU_SMMU + 0x24) & 255, ==, 8);
+    g_assert_cmphex(qtest_readl(qts, 0x15000024) & 255, ==, 34);
+    qtest_writel(qts, GPU_CB(0), 1U << 6);
+    qtest_writel(qts, GPU_CB(1), 1U << 6);
+    qtest_writel(qts, GPU_CB(0) + 0x5c, 2);
+    g_assert_true(qtest_get_irq(qts, 396 - 32));
+    g_assert_false(qtest_get_irq(qts, 397 - 32));
+    g_assert_cmphex(qtest_readl(qts, GPU_CB(1) + 0x58), ==, 0);
+    /* Share context 0's line; clearing one fault must not lower the other. */
+    qtest_writel(qts, GPU_SMMU + 0x1004, 1U << 16);
+    qtest_writel(qts, GPU_CB(1) + 0x5c, 8);
+    qtest_writel(qts, GPU_CB(0) + 0x58, 2);
+    g_assert_true(qtest_get_irq(qts, 396 - 32));
+    qtest_writel(qts, GPU_CB(1) + 0x58, 8);
+    g_assert_false(qtest_get_irq(qts, 396 - 32));
+    qtest_writel(qts, GPU_SMMU, 1U << 2);
+    qtest_writel(qts, GPU_SMMU + 0x4c, 2);
+    g_assert_true(qtest_get_irq(qts, 261 - 32));
+    qtest_writel(qts, GPU_SMMU + 0x48, 2);
+    g_assert_false(qtest_get_irq(qts, 261 - 32));
+    qtest_quit(qts);
+}
+
+static void test_smmu_atos(void)
+{
+    QTestState *qts = start_board();
+    const uint64_t root = 0x41000000, l2 = root + 0x1000, l3 = root + 0x2000;
+    const uint64_t iova = 0x12345000, target = 0x42000000;
+    const uint64_t pte = l3 + ((iova >> 12) & 511) * 8;
+
+    qtest_writeq(qts, root, l2 | 3);
+    qtest_writeq(qts, l2 + ((iova >> 21) & 511) * 8, l3 | 3);
+    qtest_writeq(qts, pte, target | (1U << 10) | 3);
+    qtest_writel(qts, GPU_SMMU + 0x1800, 1);
+    qtest_writel(qts, GPU_CB(0) + 0x30, 25);
+    qtest_writeq(qts, GPU_CB(0) + 0x20, root);
+    qtest_writel(qts, GPU_CB(0), 1 | (1U << 6));
+    qtest_writeq(qts, GPU_CB(0) + 0x800, iova);
+    g_assert_cmphex(qtest_readq(qts, GPU_CB(0) + 0x50), ==, target);
+    qtest_writeq(qts, pte, target | (1U << 10) | (1U << 7) | 3);
+    qtest_writeq(qts, GPU_CB(0) + 0x808, iova);
+    g_assert_cmphex(qtest_readq(qts, GPU_CB(0) + 0x50) & 1, ==, 1);
+    qtest_writeq(qts, GPU_CB(0) + 0x800, iova);
+    g_assert_cmphex(qtest_readq(qts, GPU_CB(0) + 0x50), ==, target);
+    qtest_writeq(qts, pte, target | 3);
+    qtest_writeq(qts, GPU_CB(0) + 0x800, iova);
+    g_assert_cmphex(qtest_readq(qts, GPU_CB(0) + 0x50) & 1, ==, 1);
+    g_assert_cmphex(qtest_readl(qts, GPU_CB(0) + 0x58), ==, 0);
+    qtest_writeq(qts, GPU_CB(0) + 0x20, root | (UINT64_C(1) << 40));
+    qtest_writeq(qts, GPU_CB(0) + 0x800, iova);
+    g_assert_cmphex(qtest_readq(qts, GPU_CB(0) + 0x50) & 1, ==, 1);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    g_assert_cmphex(qtest_readl(qts, GPU_SMMU), ==, 1);
+    g_assert_cmphex(qtest_readq(qts, GPU_CB(0) + 0x20), ==, 0);
+    qtest_quit(qts);
+}
+
+static void test_tsens_temperature(void)
+{
+    QTestState *qts = start_board();
+    const uint64_t srot[] = { 0x0c222000, 0x0c223000 };
+    const uint64_t tm[] = { 0x0c263000, 0x0c265000 };
+
+    for (unsigned i = 0; i < 2; i++) {
+        unsigned mask = i == 0 ? 0x1fff : 0xff;
+
+        g_assert_cmphex(qtest_readl(qts, srot[i]), ==, 0x20000000);
+        g_assert_cmphex((qtest_readl(qts, srot[i] + 4) >> 3) & 0xffff,
+                        ==, mask);
+        g_assert_cmphex(qtest_readl(qts, tm[i] + 0xe4), ==, 1);
+        g_assert_cmphex(qtest_readl(qts, tm[i] + 0xa0), ==, (1U << 21) | 250);
+        qtest_writel(qts, srot[i] + 4, 0);
+        g_assert_cmphex(qtest_readl(qts, tm[i] + 0xe4), ==, 0);
+        g_assert_cmphex(qtest_readl(qts, tm[i] + 0xa0), ==, 0);
+        qtest_writel(qts, srot[i] + 4, (1U << 21) | 1 | (2U << 3));
+        g_assert_cmphex(qtest_readl(qts, tm[i] + 0xa0), ==, 0);
+        g_assert_cmphex(qtest_readl(qts, tm[i] + 0xa4), ==, (1U << 21) | 250);
+        qtest_writel(qts, srot[i] + 4, 3);
+        g_assert_cmphex(qtest_readl(qts, tm[i] + 0xe4), ==, 0);
+    }
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    g_assert_cmphex(qtest_readl(qts, tm[0] + 0xe4), ==, 1);
+    g_assert_cmphex(qtest_readl(qts, tm[1] + 0xa0), ==, (1U << 21) | 250);
+    qtest_quit(qts);
+}
+
+static void test_tsens_alarm_irq(void)
+{
+    QTestState *qts = start_board();
+    const uint64_t tm[] = { 0x0c263000, 0x0c265000 };
+    const unsigned irqs[][2] = { { 538 - 32, 540 - 32 },
+                                { 539 - 32, 541 - 32 } };
+
+    intercept_gic(qts);
+    for (unsigned i = 0; i < 2; i++) {
+        /* -10C lower, +20C upper, +20C critical: only high alarms. */
+        qtest_writel(qts, tm[i] + 0x20, (200 << 12) | (4096 - 100));
+        qtest_writel(qts, tm[i] + 0x60, 200);
+        qtest_writel(qts, tm[i] + 4, 7);
+        g_assert_cmphex(qtest_readl(qts, tm[i] + 8), ==, 1U << 16);
+        g_assert_cmphex(qtest_readl(qts, tm[i] + 0x14), ==, 1);
+        g_assert_false(qtest_get_irq(qts, irqs[i][0]));
+        g_assert_false(qtest_get_irq(qts, irqs[i][1]));
+        qtest_writel(qts, tm[i] + 0x10, ~(1U << 16));
+        qtest_writel(qts, tm[i] + 0x1c, ~1U);
+        g_assert_true(qtest_get_irq(qts, irqs[i][0]));
+        g_assert_true(qtest_get_irq(qts, irqs[i][1]));
+        qtest_writel(qts, tm[i] + 0xc, 1U << 16);
+        qtest_writel(qts, tm[i] + 0x18, 1);
+        g_assert_false(qtest_get_irq(qts, irqs[i][0]));
+        g_assert_false(qtest_get_irq(qts, irqs[i][1]));
+        qtest_clock_step(qts, 4000000);
+        g_assert_cmphex(qtest_readl(qts, tm[i] + 8), ==, 0);
+        qtest_writel(qts, tm[i] + 0xc, 0);
+        qtest_writel(qts, tm[i] + 0x18, 0);
+        g_assert_true(qtest_get_irq(qts, irqs[i][0]));
+        g_assert_true(qtest_get_irq(qts, irqs[i][1]));
+        qtest_writel(qts, tm[i] + 4, 0);
+        g_assert_false(qtest_get_irq(qts, irqs[i][0]));
+        g_assert_false(qtest_get_irq(qts, irqs[i][1]));
+    }
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    g_assert_cmphex(qtest_readl(qts, tm[0] + 8), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, tm[1] + 0x14), ==, 0);
+    qtest_quit(qts);
+}
+
+#define AOSS 0x0c300000
+#define AOSS_DOORBELL 0x1799000c
+#define AOSS_UP 0x0000ffff
+#define AOSS_DOWN 0xffff0000
+
+static void aoss_open(QTestState *qts)
+{
+    qtest_writel(qts, AOSS + 0x10, AOSS_UP);
+    qtest_writel(qts, AOSS + 0x24, AOSS_UP);
+    qtest_writel(qts, AOSS_DOORBELL, 1);
+    qtest_writel(qts, AOSS + 0x2c, AOSS_UP);
+    qtest_writel(qts, AOSS_DOORBELL, 1);
+    qtest_writel(qts, AOSS + 0x18, AOSS_UP);
+    qtest_writel(qts, AOSS_DOORBELL, 1);
+}
+
+static void test_aoss_handshake(void)
+{
+    QTestState *qts = start_board();
+    const uint64_t gic = 0x0b000000;
+    const uint64_t pending = gic + 0x200 + (421 / 32) * 4;
+    const uint32_t bit = 1U << (421 % 32);
+
+    g_assert_cmphex(qtest_readl(qts, AOSS), ==, 0x4d41494c);
+    g_assert_cmphex(qtest_readl(qts, AOSS + 4), ==, 1);
+    g_assert_cmphex(qtest_readl(qts, AOSS + 0x38), ==, 0x100);
+    qtest_writel(qts, gic + 0xc00 + (421 / 16) * 4,
+                  2U << ((421 % 16) * 2));
+    qtest_writel(qts, AOSS + 0x24, AOSS_UP);
+    g_assert_cmphex(qtest_readl(qts, AOSS + 0x28), ==, AOSS_DOWN);
+    qtest_writel(qts, AOSS_DOORBELL, 1);
+    g_assert_cmphex(qtest_readl(qts, AOSS + 0x28), ==, AOSS_UP);
+    g_assert_cmphex(qtest_readl(qts, pending) & bit, ==, bit);
+    qtest_writel(qts, gic + 0x280 + (421 / 32) * 4, bit);
+    aoss_open(qts);
+    g_assert_cmphex(qtest_readl(qts, AOSS + 0x14), ==, AOSS_UP);
+    g_assert_cmphex(qtest_readl(qts, AOSS + 0x30), ==, AOSS_UP);
+    g_assert_cmphex(qtest_readl(qts, pending) & bit, ==, bit);
+    qtest_writel(qts, AOSS + 0x24, AOSS_DOWN);
+    qtest_writel(qts, AOSS_DOORBELL, 1);
+    g_assert_cmphex(qtest_readl(qts, AOSS + 0x28), ==, AOSS_DOWN);
+    g_assert_cmphex(qtest_readl(qts, AOSS + 0x30), ==, AOSS_DOWN);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    g_assert_cmphex(qtest_readl(qts, AOSS + 0x24), ==, AOSS_DOWN);
+    g_assert_cmphex(qtest_readl(qts, AOSS + 0x100), ==, 0);
+    qtest_quit(qts);
+}
+
+static void test_aoss_messages(void)
+{
+    QTestState *qts = start_board();
+    char message[64] = "{class: clock, res: qdss, val: 1}";
+    const unsigned bytes = strlen(message) + 1;
+    const uint64_t gic = 0x0b000000;
+    const uint64_t pending = gic + 0x200 + (421 / 32) * 4;
+    const uint32_t bit = 1U << (421 % 32);
+
+    qtest_writel(qts, gic + 0xc00 + (421 / 16) * 4,
+                  2U << ((421 % 16) * 2));
+    aoss_open(qts);
+    qtest_writel(qts, gic + 0x280 + (421 / 32) * 4, bit);
+    for (unsigned i = 0; i < sizeof(message); i += 4) {
+        uint32_t word = (uint8_t)message[i] | ((uint8_t)message[i + 1] << 8) |
+                        ((uint8_t)message[i + 2] << 16) |
+                        ((uint32_t)(uint8_t)message[i + 3] << 24);
+
+        qtest_writel(qts, AOSS + 0x104 + i, word);
+    }
+    /* Original Windows requests have a byte count, not a word count. */
+    g_assert_cmpuint(bytes & 3, !=, 0);
+    qtest_writel(qts, AOSS + 0x100, bytes);
+    qtest_writel(qts, AOSS_DOORBELL, 1);
+    g_assert_cmphex(qtest_readl(qts, AOSS + 0x100), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, pending) & bit, ==, bit);
+    qtest_writel(qts, gic + 0x280 + (421 / 32) * 4, bit);
+    /* Unknown or oversized messages must not be acknowledged. */
+    qtest_writel(qts, AOSS + 0x104, 0xdeadbeef);
+    qtest_writel(qts, AOSS + 0x100, 64);
+    qtest_writel(qts, AOSS_DOORBELL, 1);
+    g_assert_cmphex(qtest_readl(qts, AOSS + 0x100), ==, 64);
+    g_assert_cmphex(qtest_readl(qts, pending) & bit, ==, 0);
+    qtest_writel(qts, AOSS + 0x100, 0x1000);
+    qtest_writel(qts, AOSS_DOORBELL, 1);
+    g_assert_cmphex(qtest_readl(qts, AOSS + 0x100), ==, 0x1000);
+    qtest_writel(qts, AOSS + 0x24, 0x12345678);
+    qtest_writel(qts, AOSS_DOORBELL, 1);
+    g_assert_cmphex(qtest_readl(qts, AOSS + 0x28), ==, AOSS_UP);
+    qtest_quit(qts);
+}
+
+static void test_soc_identity(void)
+{
+    QTestState *qts = start_board();
+    uint32_t version = qtest_readl(qts, 0x01fc8000);
+
+    /* Match the driver's major/minor decoding and the board's ACPI SIDV. */
+    g_assert_cmphex((version & 255) | ((version & 0xff00) << 8), ==, 0x20001);
+    g_assert_cmphex((qtest_readl(qts, 0x03998010) >> 12) & 0xffff, ==, 0x8b);
+    qtest_writel(qts, 0x01fc8000, UINT32_MAX);
+    g_assert_cmphex(qtest_readl(qts, 0x01fc8000), ==, version);
+    /* No physical per-device calibration data is fabricated. */
+    g_assert_cmphex(qtest_readl(qts, 0x00784248), ==, 0);
+    qtest_writel(qts, 0x00784248, UINT32_MAX);
+    g_assert_cmphex(qtest_readl(qts, 0x00784248), ==, 0);
+    qtest_quit(qts);
+}
+
+static void test_bcm_revision(void)
+{
+    QTestState *qts = start_board();
+
+    g_assert_cmphex(qtest_readl(qts, 0x0bbf1708), ==, 0x10500);
+    qtest_writel(qts, 0x0bbf1708, UINT32_MAX);
+    g_assert_cmphex(qtest_readl(qts, 0x0bbf1708), ==, 0x10500);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    g_assert_cmphex(qtest_readl(qts, 0x0bbf1708), ==, 0x10500);
+    qtest_quit(qts);
+}
+
+static void test_cprh_handoff(void)
+{
+    QTestState *qts = start_board();
+    const uint64_t bases[] = { 0x17dc0000, 0x17db0000 };
+
+    for (unsigned i = 0; i < 2; i++) {
+        uint32_t control = qtest_readl(qts, bases[i] + 0x3a80);
+
+        g_assert_cmphex(qtest_readl(qts, bases[i]), ==, 0x40050000);
+        g_assert_cmphex(control & 1, ==, 1);
+        g_assert_cmpuint(((control >> 1) & 0x3ff) * ((control >> 25) & 15),
+                         ==, 400);
+        qtest_writel(qts, bases[i] + 0x3a80, 0);
+        g_assert_cmphex(qtest_readl(qts, bases[i] + 0x3a80), ==, 0);
+        qtest_writel(qts, bases[i] + 0x3a84, UINT32_MAX);
+        g_assert_cmphex(qtest_readl(qts, bases[i] + 0x3a84), ==, 0);
+    }
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    g_assert_cmphex(qtest_readl(qts, bases[0] + 0x3a80) & 1, ==, 1);
+    g_assert_cmphex(qtest_readl(qts, bases[1] + 0x3a80) & 1, ==, 1);
+    qtest_quit(qts);
+}
+
+static void test_cmddb_directory(void)
+{
+    g_autofree char *path = NULL;
+    g_autofree char *machine = NULL;
+    g_autofree char *quoted = NULL;
+    uint8_t data[0x90 + 24 + 2] = { 0 };
+    QTestState *qts = start_board();
+    int fd;
+
+    g_assert_cmphex(qtest_readl(qts, 0x0c3f000c), ==, 0);
+    qtest_quit(qts);
+    fd = g_file_open_tmp("oemsk850-cmddb-XXXXXX", &path, NULL);
+    g_assert_cmpint(fd, >=, 0);
+    close(fd);
+    stl_le_p(data, 1);
+    stl_le_p(data + 4, 0x0c0330db);
+    stw_le_p(data + 8, 3);
+    stw_le_p(data + 12, 24);
+    stw_le_p(data + 14, 1);
+    stw_le_p(data + 16, 0x1001);
+    memcpy(data + 0x90, "cx.lvl", 6);
+    stl_le_p(data + 0x90 + 16, 0x30000);
+    stw_le_p(data + 0x90 + 20, 2);
+    stw_le_p(data + 0x90 + 24, 128);
+    g_assert_true(g_file_set_contents(path, (const char *)data, sizeof(data),
+                                      NULL));
+    machine = g_strdup_printf("oemsk850,cmd-db=%s", path);
+    quoted = g_strdup_printf("\"%s\"", machine);
+    qts = qtest_initf("-M %s -m 256M -nodefaults", quoted);
+    g_assert_cmphex(qtest_readl(qts, 0x0c3f000c), ==, 0x0c3d0000);
+    g_assert_cmphex(qtest_readl(qts, 0x0c3f0010), ==, sizeof(data));
+    g_assert_cmphex(qtest_readq(qts, 0x0c3d0000), ==,
+                    UINT64_C(0x0c0330db00000001));
+    g_assert_cmphex(qtest_readw(qts, 0x0c3d0000 + 0x90 + 24), ==, 128);
+    qtest_writel(qts, 0x0c3d0000, UINT32_MAX);
+    g_assert_cmphex(qtest_readl(qts, 0x0c3d0000), ==, 1);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    g_assert_cmphex(qtest_readl(qts, 0x0c3f000c), ==, 0x0c3d0000);
+    qtest_quit(qts);
+    unlink(path);
+}
+
+static void test_native_gicd_alias(void)
+{
+    QTestState *qts = start_board();
+
+    g_assert_cmphex(qtest_readl(qts, 0x17a00004), ==,
+                    qtest_readl(qts, 0x0b000004));
+    for (unsigned offset = 0xfd0; offset < 0x1000; offset += 4) {
+        g_assert_cmphex(qtest_readl(qts, 0x17a0f000 + offset), ==,
+                        qtest_readl(qts, 0x0b000000 + offset));
+    }
+    g_assert_cmphex(qtest_readl(qts, 0x17a0ffe8) & 0xf0, ==, 0x20);
+    /* Native INTID 37 is an RSC line, not a synthetic boot interrupt. */
+    qtest_writel(qts, 0x17a00104, 1U << 5);
+    g_assert_cmphex(qtest_readl(qts, 0x0b000104) & (1U << 5), ==, 1U << 5);
+    qtest_writel(qts, 0x0b000184, 1U << 5);
+    g_assert_cmphex(qtest_readl(qts, 0x17a00104) & (1U << 5), ==, 0);
+    qtest_quit(qts);
+}
+
+static void test_gcc_clock_control(void)
+{
+    QTestState *qts = start_board();
+    const uint64_t gcc = 0x00100000;
+
+    /* GCC QUP DFS must not read a bit from the boot firmware FD. */
+    g_assert_cmphex(qtest_readl(qts, gcc + 0x17048), ==, 0);
+    qtest_writel(qts, gcc + 0x17048, 1);
+    g_assert_cmphex(qtest_readl(qts, gcc + 0x17048) & 1, ==, 0);
+    qtest_writel(qts, gcc + 0x17034, 3);
+    g_assert_cmphex(qtest_readl(qts, gcc + 0x17034), ==, 2);
+    g_assert_cmphex(qtest_readl(qts, gcc + 0x502c) & (1U << 31), ==, 1U << 31);
+    qtest_writel(qts, gcc + 0x502c, 1);
+    g_assert_cmphex(qtest_readl(qts, gcc + 0x502c) & (1U << 31), ==, 0);
+    qtest_writel(qts, gcc + 0x52004, 1);
+    g_assert_cmphex(qtest_readl(qts, gcc + 0x414c) & (1U << 31), ==, 0);
+    qtest_writel(qts, gcc + 0x52004, 0);
+    g_assert_cmphex(qtest_readl(qts, gcc + 0x414c) & (1U << 31), ==, 1U << 31);
+    g_assert_cmphex(qtest_readl(qts, gcc + 0xf004) & (1U << 31), ==, 0);
+    qtest_writel(qts, gcc + 0xf004, 0);
+    g_assert_cmphex(qtest_readl(qts, gcc + 0xf004) & (1U << 31), ==, 1U << 31);
+    g_assert_cmphex(qtest_readl(qts, gcc) & (1U << 31), ==, 1U << 31);
+    g_assert_cmphex(qtest_readl(qts, gcc) & (1U << 30), ==, 0);
+    qtest_writel(qts, gcc + 0x52000, 1);
+    g_assert_cmphex(qtest_readl(qts, gcc) & (1U << 30), ==, 1U << 30);
+    qtest_writel(qts, gcc + 0x52000, 0);
+    g_assert_cmphex(qtest_readl(qts, gcc) & (1U << 30), ==, 0);
+    qtest_writel(qts, gcc + 0x2c, 0);
+    g_assert_cmphex(qtest_readl(qts, gcc) & (1U << 31), ==, 0);
+    qtest_writel(qts, gcc + 0x2c, 1);
+    g_assert_cmphex(qtest_readl(qts, gcc) & (1U << 31), ==, 1U << 31);
+    /* GPLL6 uses vote bit 6; writing status flags must not fake a lock. */
+    qtest_writel(qts, gcc + 0x13000, (1U << 20) | 6);
+    qtest_writel(qts, gcc + 0x1302c, 1);
+    qtest_writel(qts, gcc + 0x52000, 1U << 4);
+    g_assert_cmphex(qtest_readl(qts, gcc + 0x13000) & (1U << 30), ==, 0);
+    qtest_writel(qts, gcc + 0x52000, 1U << 6);
+    g_assert_cmphex(qtest_readl(qts, gcc + 0x13000) >> 30, ==, 3);
+    qtest_writel(qts, gcc + 0x76000, UINT32_MAX);
+    g_assert_cmphex(qtest_readl(qts, gcc + 0x76000) >> 30, ==, 0);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    g_assert_cmphex(qtest_readl(qts, gcc + 0x17034), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, gcc + 0xf004) & 1, ==, 1);
+    qtest_quit(qts);
+}
+
+static void test_osm_lut(void)
+{
+    QTestState *qts = start_board();
+    const uint64_t bases[] = { 0x17d41000, 0x17d43000, 0x17d45800 };
+
+    for (unsigned i = 0; i < ARRAY_SIZE(bases); i++) {
+        uint32_t last = qtest_readl(qts, bases[i] + 0x110 + 17 * 32);
+
+        g_assert_cmphex(qtest_readl(qts, bases[i]), ==, 1);
+        g_assert_cmphex(qtest_readl(qts, bases[i] + 0x110 + 39 * 32), ==, last);
+        g_assert_cmphex(qtest_readl(qts, bases[i] + 0x110 + 14 * 32), <, last);
+        qtest_writel(qts, bases[i] + 0x110 + 17 * 32, 0);
+        g_assert_cmphex(qtest_readl(qts, bases[i] + 0x110 + 17 * 32), ==, last);
+        qtest_writel(qts, bases[i] + 0x920, 17);
+        g_assert_cmphex(qtest_readl(qts, bases[i] + 0x704), ==, last & 255);
+        qtest_writel(qts, bases[i] + 0x920, 39);
+        g_assert_cmphex(qtest_readl(qts, bases[i] + 0x704), ==, last & 255);
+        qtest_writel(qts, bases[i] + 0x920, 40);
+        qtest_writel(qts, bases[i] + 0x920, UINT32_MAX);
+        g_assert_cmphex(qtest_readl(qts, bases[i] + 0x920), ==, 39);
+        qtest_writel(qts, bases[i] + 0x924, 1);
+        g_assert_cmphex(qtest_readl(qts, bases[i] + 0x920), ==, 39);
+        g_assert_cmphex(qtest_readl(qts, bases[i] + 0x924), ==, 1);
+    }
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    g_assert_cmphex(qtest_readl(qts, bases[1] + 0x920), ==, 0);
+    qtest_quit(qts);
+}
+
+static void test_noc_qos(void)
+{
+    QTestState *qts = start_board();
+    const uint64_t bases[] = {
+        0x016e4000, 0x01704000, 0x01390000, 0x01749000, 0x01629000,
+    };
+    const unsigned offsets[] = { 8, 0x18, 0x40, 0x48 };
+    const uint32_t masks[] = { 0x79, 0x03ff07ff, 0x7703, 0x03ff07ff };
+
+    for (unsigned i = 0; i < ARRAY_SIZE(bases); i++) {
+        for (unsigned f = 0; f < ARRAY_SIZE(offsets); f++) {
+            uint64_t first = bases[i] + offsets[f];
+            uint64_t last = first + 15 * 0x1000;
+
+            g_assert_cmphex(qtest_readl(qts, first), ==, 0);
+            qtest_writel(qts, first, UINT32_MAX);
+            g_assert_cmphex(qtest_readl(qts, first), ==, masks[f]);
+            g_assert_cmphex(qtest_readl(qts, last), ==, 0);
+            qtest_writel(qts, last, 0x12345678);
+            g_assert_cmphex(qtest_readl(qts, last), ==, 0x12345678 & masks[f]);
+        }
+    }
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    for (unsigned i = 0; i < ARRAY_SIZE(bases); i++) {
+        g_assert_cmphex(qtest_readl(qts, bases[i] + 8), ==, 0);
+        g_assert_cmphex(qtest_readl(qts, bases[i] + 15 * 0x1000 + 0x48), ==, 0);
+    }
+    qtest_quit(qts);
+}
+
+static void test_dispcc(void)
+{
+    QTestState *qts = start_board();
+    const uint64_t base = 0x0af00000;
+
+    g_assert_cmphex(qtest_readl(qts, base + 0x3000) >> 31, ==, 0);
+    qtest_writel(qts, base + 0x3000, 0);
+    g_assert_cmphex(qtest_readl(qts, base + 0x3000) >> 31, ==, 1);
+    qtest_writel(qts, base + 0x4004, 1);
+    g_assert_cmphex(qtest_readl(qts, base + 0x4004) >> 31, ==, 0);
+    qtest_writel(qts, base + 0x4004, 0);
+    g_assert_cmphex(qtest_readl(qts, base + 0x4004) >> 31, ==, 1);
+    qtest_writel(qts, base + 0x208c, 0x1234);
+    qtest_writel(qts, base + 0x2088, 3);
+    g_assert_cmphex(qtest_readl(qts, base + 0x2088), ==, 2);
+    g_assert_cmphex(qtest_readl(qts, base + 0x208c), ==, 0x1234);
+    qtest_writel(qts, base, 7);
+    g_assert_cmphex(qtest_readl(qts, base) >> 31, ==, 0);
+    qtest_writel(qts, base + 0x2c, 1);
+    g_assert_cmphex(qtest_readl(qts, base) >> 31, ==, 1);
+    qtest_writel(qts, base + 0x2c, 0);
+    g_assert_cmphex(qtest_readl(qts, base) >> 31, ==, 0);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    g_assert_cmphex(qtest_readl(qts, base + 0x3000), ==, 1);
+    g_assert_cmphex(qtest_readl(qts, base + 0x208c), ==, 0);
+    qtest_quit(qts);
+}
+
+static void test_tlmm(void)
+{
+    QTestState *qts = start_board();
+    const uint64_t east = 0x0350a000; /* GPIO 10, display VSYNC mux. */
+
+    g_assert_cmphex(qtest_readl(qts, east + 0x10), ==, 1);
+    g_assert_cmphex(qtest_readl(qts, 0x0390a010), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, 0x03d0a010), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, 0x03904010), ==, 1); /* GPIO 4, north. */
+    g_assert_cmphex(qtest_readl(qts, 0x03d0c010), ==, 1); /* GPIO 12, south. */
+    g_assert_cmphex(qtest_readl(qts, 0x03995010), ==, 1); /* Last GPIO. */
+    qtest_writel(qts, 0x0390a000, UINT32_MAX);
+    g_assert_cmphex(qtest_readl(qts, east), ==, 0);
+    qtest_writel(qts, east + 4, 3);
+    g_assert_cmphex(qtest_readl(qts, east + 4), ==, 2);
+    qtest_writel(qts, east, UINT32_MAX);
+    g_assert_cmphex(qtest_readq(qts, east), ==, UINT64_C(0x3000003ff));
+    qtest_writel(qts, east + 8, UINT32_MAX);
+    g_assert_cmphex(qtest_readl(qts, east + 8), ==, 0xff);
+    qtest_writel(qts, east + 0x10, 0);
+    g_assert_cmphex(qtest_readl(qts, east + 0x10), ==, 1);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    g_assert_cmphex(qtest_readl(qts, east), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, east + 4), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, east + 8), ==, 0);
+    qtest_quit(qts);
+}
+
+static void test_mmcc(void)
+{
+    QTestState *qts = start_board();
+    const struct {
+        uint64_t base;
+        unsigned gdsc, branch, root, pll;
+    } domains[] = {
+        { 0x0ab00000, 0x8b4, 0x850, 0x7f0, 0x42c },
+        { 0x0ad00000, 0x6004, 0x606c, 0x600c, 0 },
+        { 0x05090000, 0x106c, 0x1098, 0x1120, 0x100 },
+    };
+
+    for (unsigned i = 0; i < ARRAY_SIZE(domains); i++) {
+        uint64_t base = domains[i].base;
+        uint64_t pll = base + domains[i].pll;
+        uint64_t gdsc = base + domains[i].gdsc;
+        uint64_t branch = base + domains[i].branch;
+        uint64_t root = base + domains[i].root;
+
+        g_assert_cmphex(qtest_readl(qts, gdsc), ==, 1);
+        qtest_writel(qts, gdsc, 0);
+        g_assert_cmphex(qtest_readl(qts, gdsc) >> 31, ==, 1);
+        qtest_writel(qts, branch, 1);
+        g_assert_cmphex(qtest_readl(qts, branch) >> 31, ==, 0);
+        qtest_writel(qts, branch, 0);
+        g_assert_cmphex(qtest_readl(qts, branch) >> 31, ==, 1);
+        qtest_writel(qts, root, 3);
+        g_assert_cmphex(qtest_readl(qts, root), ==, 2);
+        qtest_writel(qts, pll, UINT32_MAX);
+        g_assert_cmphex(qtest_readl(qts, pll) >> 30, ==, 0);
+        qtest_writel(qts, pll, 6);
+        qtest_writel(qts, pll + 0x2c, 1);
+        g_assert_cmphex(qtest_readl(qts, pll) >> 31, ==, 1);
+        qtest_writel(qts, pll, 0);
+        g_assert_cmphex(qtest_readl(qts, pll) >> 31, ==, 0);
+    }
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    for (unsigned i = 0; i < ARRAY_SIZE(domains); i++) {
+        g_assert_cmphex(qtest_readl(qts, domains[i].base + domains[i].gdsc),
+                        ==, 1);
+    }
+    qtest_quit(qts);
+}
+
+int main(int argc, char **argv)
+{
+    g_test_init(&argc, &argv, NULL);
+    qtest_add_func("/oemsk850/isolation", test_isolation);
+    qtest_add_func("/oemsk850/spmi-revision", test_spmi_revision);
+    qtest_add_func("/oemsk850/spmi-failure-reset", test_spmi_failure_reset);
+    qtest_add_func("/oemsk850/rsc-votes-irq", test_rsc_votes_irq);
+    qtest_add_func("/oemsk850/rsc-reject-invalid", test_rsc_reject_invalid);
+    qtest_add_func("/oemsk850/smmu-fault-irq", test_smmu_fault_irq);
+    qtest_add_func("/oemsk850/smmu-atos", test_smmu_atos);
+    qtest_add_func("/oemsk850/tsens-temperature", test_tsens_temperature);
+    qtest_add_func("/oemsk850/tsens-alarm-irq", test_tsens_alarm_irq);
+    qtest_add_func("/oemsk850/aoss-handshake", test_aoss_handshake);
+    qtest_add_func("/oemsk850/aoss-messages", test_aoss_messages);
+    qtest_add_func("/oemsk850/soc-identity", test_soc_identity);
+    qtest_add_func("/oemsk850/bcm-revision", test_bcm_revision);
+    qtest_add_func("/oemsk850/cprh-handoff", test_cprh_handoff);
+    qtest_add_func("/oemsk850/cmddb-directory", test_cmddb_directory);
+    qtest_add_func("/oemsk850/native-gicd-alias", test_native_gicd_alias);
+    qtest_add_func("/oemsk850/gcc-clock-control", test_gcc_clock_control);
+    qtest_add_func("/oemsk850/osm-lut", test_osm_lut);
+    qtest_add_func("/oemsk850/noc-qos", test_noc_qos);
+    qtest_add_func("/oemsk850/display-clock-control", test_dispcc);
+    qtest_add_func("/oemsk850/tlmm", test_tlmm);
+    qtest_add_func("/oemsk850/multimedia-clock-control", test_mmcc);
+    return g_test_run();
+}

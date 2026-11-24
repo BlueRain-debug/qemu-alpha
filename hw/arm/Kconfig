@@ -56,6 +56,12 @@ config OEMSK
     select ARM_VIRT
     select QCOM_8998_DISPLAY
 
+config OEMSK850
+    bool
+    default y
+    depends on AARCH64 && TCG
+    select ARM_VIRT
+
 config CUBIEBOARD
     bool
     default y

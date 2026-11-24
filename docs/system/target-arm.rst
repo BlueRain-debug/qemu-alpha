@@ -102,6 +102,7 @@ Board-specific documentation
    arm/stm32
    arm/virt
    arm/oemsk
+   arm/oemsk850
    arm/vmapple
    arm/xenpvh
    arm/xlnx-versal-virt
