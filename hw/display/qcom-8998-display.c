@@ -8855,6 +8855,18 @@ void qcom8998_display_acpi(Aml *scope)
         { "ZeroFlagSupportInPTE", 1 },
         { "SupportsCacheCoherency", 1 },
     };
+    /*
+     * Display engine activation policy from the OEMSK board REGR. The real
+     * board disables MDPBLT (node1) and returns its pipes to display scanout.
+     */
+    static const struct {
+        const char *name;
+        uint32_t value;
+    } display_regr[] = {
+        { "DisableMiracast", 1 },
+        { "DisableRotator", 0 },
+        { "DisableMDPBLT", 1 },
+    };
     Aml *dev = qcom8998_acpi_device("QGFX", "QCOM007C", 0);
     Aml *monitor = aml_device("MON0");
     Aml *cls = aml_package(3);
@@ -8862,9 +8874,10 @@ void qcom8998_display_acpi(Aml *scope)
     Aml *resi = aml_method("RESI", 0, AML_NOTSERIALIZED);
     Aml *resource_info = aml_package(2 + ARRAY_SIZE(resources));
     Aml *regr = aml_method("REGR", 0, AML_NOTSERIALIZED);
-    Aml *settings = aml_package(ARRAY_SIZE(adapter_settings) + 1 +
+    Aml *settings = aml_package(ARRAY_SIZE(adapter_settings) + 2 +
                                 s->disable_macro_tiled_primary);
     Aml *graphics_settings = aml_package(2);
+    Aml *display_settings = aml_package(1 + ARRAY_SIZE(display_regr));
     Aml *dcvs_settings = aml_package(2);
     Aml *dcvs_enable = aml_package(2);
 
@@ -8924,6 +8937,15 @@ void qcom8998_display_acpi(Aml *scope)
     aml_append(graphics_settings, aml_string("GRAPHICS"));
     aml_append(graphics_settings, dcvs_settings);
     aml_append(settings, graphics_settings);
+    aml_append(display_settings, aml_string("DISPLAY"));
+    for (unsigned i = 0; i < ARRAY_SIZE(display_regr); i++) {
+        Aml *entry = aml_package(2);
+
+        aml_append(entry, aml_string("%s", display_regr[i].name));
+        aml_append(entry, aml_int(display_regr[i].value));
+        aml_append(display_settings, entry);
+    }
+    aml_append(settings, display_settings);
     aml_append(regr, aml_return(settings));
     aml_append(dev, regr);
 

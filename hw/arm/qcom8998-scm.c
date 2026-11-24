@@ -4,7 +4,8 @@
  *
  * This is a limited software monitor, not execution of vendor TrustZone code.
  * Unknown services and application operations fail explicitly. The variable
- * provider is an empty, read-only namespace, and supplies no authentication.
+ * provider is an in-memory volatile namespace (cleared on reset) and supplies
+ * no authentication.
  */
 
 #include "qemu/osdep.h"
@@ -73,10 +74,25 @@
 #define QCOM_UEFI_MAX_REQUEST (64 * KiB)
 #define QCOM_UEFI_MAX_NAME_BYTES 2048
 #define QCOM_UEFI_GUID_BYTES 16
+#define QCOM_UEFI_MAX_VARS 64
+#define QCOM_UEFI_MAX_DATA_BYTES (8 * KiB)
+#define QCOM_UEFI_STORE_BYTES (64 * KiB)
+#define QCOM_EFI_SUCCESS 0U
 #define QCOM_EFI_INVALID_PARAMETER 0x80000002U
 #define QCOM_EFI_UNSUPPORTED 0x80000003U
+#define QCOM_EFI_BUFFER_TOO_SMALL 0x80000005U
 #define QCOM_EFI_WRITE_PROTECTED 0x80000008U
+#define QCOM_EFI_OUT_OF_RESOURCES 0x80000009U
 #define QCOM_EFI_NOT_FOUND 0x8000000eU
+#define QCOM_EFI_VAR_NON_VOLATILE 0x00000001U
+#define QCOM_EFI_VAR_BOOTSERVICE_ACCESS 0x00000002U
+#define QCOM_EFI_VAR_RUNTIME_ACCESS 0x00000004U
+#define QCOM_EFI_VAR_AUTHENTICATED_WRITE_ACCESS 0x00000010U
+#define QCOM_EFI_VAR_TIME_BASED_AUTH_WRITE 0x00000020U
+#define QCOM_EFI_VAR_APPEND_WRITE 0x00000040U
+#define QCOM_EFI_VAR_AUTH_MASK \
+    (QCOM_EFI_VAR_AUTHENTICATED_WRITE_ACCESS | \
+     QCOM_EFI_VAR_TIME_BASED_AUTH_WRITE)
 
 #define TYPE_QCOM8998_SCM "qcom8998-scm"
 OBJECT_DECLARE_SIMPLE_TYPE(Qcom8998Scm, QCOM8998_SCM)
@@ -109,9 +125,21 @@ typedef struct QcomPasImage {
     QcomPasSegment segments[PAS_MAX_SEGMENTS];
 } QcomPasImage;
 
+typedef struct QcomUefiVariable {
+    uint8_t *name;
+    uint32_t name_bytes;
+    uint8_t vendor[QCOM_UEFI_GUID_BYTES];
+    uint32_t attributes;
+    uint8_t *data;
+    uint32_t data_bytes;
+} QcomUefiVariable;
+
 struct Qcom8998Scm {
     SysBusDevice parent_obj;
     QcomPasImage image;
+    QcomUefiVariable uefi_vars[QCOM_UEFI_MAX_VARS];
+    unsigned uefi_var_count;
+    size_t uefi_store_used;
 };
 
 /*
@@ -435,30 +463,176 @@ static bool qcom8998_scm_arguments(ARMCPU *cpu, uint64_t *arguments)
     return true;
 }
 
-static bool qcom8998_uefi_name_valid(const uint8_t *request, size_t bytes,
-                                    uint32_t name_at, uint32_t name_bytes,
-                                    uint32_t vendor_at, uint32_t vendor_bytes,
-                                    size_t minimum)
+static void qcom8998_uefi_store_clear(Qcom8998Scm *s)
 {
-    return name_bytes >= 2 && !(name_bytes & 1) &&
-           name_bytes <= QCOM_UEFI_MAX_NAME_BYTES && name_at >= minimum &&
-           name_at <= bytes && vendor_at >= minimum &&
-           name_bytes <= bytes - name_at &&
-           vendor_bytes == QCOM_UEFI_GUID_BYTES && vendor_at <= bytes &&
-           vendor_bytes <= bytes - vendor_at &&
-           lduw_le_p(request + name_at + name_bytes - 2) == 0;
+    for (unsigned i = 0; i < s->uefi_var_count; i++) {
+        g_free(s->uefi_vars[i].name);
+        g_free(s->uefi_vars[i].data);
+    }
+    memset(s->uefi_vars, 0, sizeof(s->uefi_vars));
+    s->uefi_var_count = 0;
+    s->uefi_store_used = 0;
+}
+
+static uint32_t qcom8998_uefi_name_len(const uint8_t *request, size_t bytes,
+                                       uint32_t name_at, uint32_t name_bytes,
+                                       uint32_t vendor_at,
+                                       uint32_t vendor_bytes, size_t minimum)
+{
+    if (name_bytes < 2 || (name_bytes & 1) ||
+        name_bytes > QCOM_UEFI_MAX_NAME_BYTES || name_at < minimum ||
+        name_at > bytes || name_bytes > bytes - name_at ||
+        vendor_at < minimum || vendor_bytes != QCOM_UEFI_GUID_BYTES ||
+        vendor_at > bytes || vendor_bytes > bytes - vendor_at) {
+        return 0;
+    }
+    for (uint32_t off = 0; off < name_bytes; off += 2) {
+        if (lduw_le_p(request + name_at + off) == 0) {
+            return off + 2;
+        }
+    }
+    return 0;
+}
+
+static int qcom8998_uefi_find(const Qcom8998Scm *s, const uint8_t *name,
+                              uint32_t name_bytes, const uint8_t *vendor)
+{
+    for (unsigned i = 0; i < s->uefi_var_count; i++) {
+        const QcomUefiVariable *var = &s->uefi_vars[i];
+
+        if (var->name_bytes == name_bytes &&
+            !memcmp(var->vendor, vendor, QCOM_UEFI_GUID_BYTES) &&
+            !memcmp(var->name, name, name_bytes)) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static uint32_t qcom8998_uefi_set_variable(Qcom8998Scm *s, const uint8_t *name,
+                                           uint32_t name_bytes,
+                                           const uint8_t *vendor,
+                                           uint32_t attributes,
+                                           const uint8_t *data,
+                                           uint32_t data_bytes)
+{
+    int index;
+    bool append = (attributes & QCOM_EFI_VAR_APPEND_WRITE) != 0;
+    uint32_t stored_attrs = attributes & ~QCOM_EFI_VAR_APPEND_WRITE;
+
+    if (name_bytes <= 2) {
+        return QCOM_EFI_INVALID_PARAMETER;
+    }
+    if (attributes & QCOM_EFI_VAR_AUTH_MASK) {
+        return QCOM_EFI_UNSUPPORTED;
+    }
+
+    index = qcom8998_uefi_find(s, name, name_bytes, vendor);
+    if (!data_bytes || !stored_attrs) {
+        if (append && stored_attrs && index >= 0) {
+            return QCOM_EFI_SUCCESS;
+        }
+        if (index < 0) {
+            return QCOM_EFI_NOT_FOUND;
+        }
+        s->uefi_store_used -= s->uefi_vars[index].name_bytes +
+                              QCOM_UEFI_GUID_BYTES +
+                              s->uefi_vars[index].data_bytes;
+        g_free(s->uefi_vars[index].name);
+        g_free(s->uefi_vars[index].data);
+        if ((unsigned)index + 1 < s->uefi_var_count) {
+            memmove(&s->uefi_vars[index], &s->uefi_vars[index + 1],
+                    (s->uefi_var_count - index - 1) * sizeof(s->uefi_vars[0]));
+        }
+        s->uefi_var_count--;
+        memset(&s->uefi_vars[s->uefi_var_count], 0, sizeof(s->uefi_vars[0]));
+        return QCOM_EFI_SUCCESS;
+    }
+
+    if (!(stored_attrs & QCOM_EFI_VAR_BOOTSERVICE_ACCESS)) {
+        return QCOM_EFI_INVALID_PARAMETER;
+    }
+    if (data_bytes > QCOM_UEFI_MAX_DATA_BYTES) {
+        return QCOM_EFI_OUT_OF_RESOURCES;
+    }
+
+    if (index >= 0) {
+        QcomUefiVariable *var = &s->uefi_vars[index];
+        uint8_t *copy;
+        size_t new_data_bytes;
+        size_t base_used = s->uefi_store_used - var->data_bytes;
+
+        if (stored_attrs != var->attributes) {
+            return QCOM_EFI_INVALID_PARAMETER;
+        }
+        new_data_bytes = append ? (size_t)var->data_bytes + data_bytes :
+                                  data_bytes;
+        if (new_data_bytes > QCOM_UEFI_MAX_DATA_BYTES ||
+            new_data_bytes > QCOM_UEFI_STORE_BYTES - base_used) {
+            return QCOM_EFI_OUT_OF_RESOURCES;
+        }
+        copy = g_try_malloc(new_data_bytes);
+        if (!copy) {
+            return QCOM_EFI_OUT_OF_RESOURCES;
+        }
+        if (append) {
+            memcpy(copy, var->data, var->data_bytes);
+            memcpy(copy + var->data_bytes, data, data_bytes);
+        } else {
+            memcpy(copy, data, data_bytes);
+        }
+        g_free(var->data);
+        var->data = copy;
+        var->data_bytes = (uint32_t)new_data_bytes;
+        s->uefi_store_used = base_used + new_data_bytes;
+        return QCOM_EFI_SUCCESS;
+    }
+
+    size_t entry_bytes = (size_t)name_bytes + QCOM_UEFI_GUID_BYTES + data_bytes;
+    if (s->uefi_var_count >= QCOM_UEFI_MAX_VARS ||
+        entry_bytes > QCOM_UEFI_STORE_BYTES - s->uefi_store_used) {
+        return QCOM_EFI_OUT_OF_RESOURCES;
+    }
+
+    QcomUefiVariable *var = &s->uefi_vars[s->uefi_var_count];
+    var->name = g_try_malloc(name_bytes);
+    var->data = g_try_malloc(data_bytes);
+    if (!var->name || !var->data) {
+        g_free(var->name);
+        g_free(var->data);
+        memset(var, 0, sizeof(*var));
+        return QCOM_EFI_OUT_OF_RESOURCES;
+    }
+    memcpy(var->name, name, name_bytes);
+    var->name_bytes = name_bytes;
+    memcpy(var->vendor, vendor, QCOM_UEFI_GUID_BYTES);
+    var->attributes = stored_attrs;
+    memcpy(var->data, data, data_bytes);
+    var->data_bytes = data_bytes;
+    s->uefi_var_count++;
+    s->uefi_store_used += entry_bytes;
+    return QCOM_EFI_SUCCESS;
 }
 
 static int32_t qcom8998_qsee_uefi(ARMCPU *cpu, const uint64_t *args)
 {
+    Qcom8998Scm *s = QCOM8998_SCM(
+        object_resolve_path_type("", TYPE_QCOM8998_SCM, NULL));
     g_autofree uint8_t *request = NULL;
     uint8_t reply[QCOM_UEFI_INFO_REPLY] = { 0 };
     uint32_t command, fixed_bytes;
     uint32_t efi_status = QCOM_EFI_UNSUPPORTED;
+    size_t header_bytes = QCOM_UEFI_COMMON_REPLY;
     size_t reply_bytes = QCOM_UEFI_COMMON_REPLY;
+    const uint8_t *payload = NULL;
+    size_t payload_bytes = 0;
+    const QcomUefiVariable *next_var = NULL;
     bool valid = true;
     AddressSpace *as = cpu_get_address_space(CPU(cpu), 0);
 
+    if (!s) {
+        return QCOM_SCM_EOPNOTSUPP;
+    }
     if (args[2] < 8 || args[2] > QCOM_UEFI_MAX_REQUEST) {
         return QCOM_SCM_EINVAL;
     }
@@ -475,58 +649,170 @@ static int32_t qcom8998_qsee_uefi(ARMCPU *cpu, const uint64_t *args)
 
     switch (command) {
     case QCOM_UEFI_GET_VARIABLE:
+        {
+            const QcomUefiVariableRequest *header = (const void *)request;
+            uint32_t name_at, name_bytes, vendor_at, vendor_bytes, name_len;
+
+            header_bytes = QCOM_UEFI_GET_REPLY;
+            reply_bytes = QCOM_UEFI_GET_REPLY;
+            valid = args[2] >= QCOM_UEFI_GET_REQUEST &&
+                    fixed_bytes >= QCOM_UEFI_GET_REQUEST &&
+                    fixed_bytes <= args[2];
+            name_len = 0;
+            if (valid) {
+                name_at = ldl_le_p(&header->name_offset);
+                name_bytes = ldl_le_p(&header->name_bytes);
+                vendor_at = ldl_le_p(&header->vendor_offset);
+                vendor_bytes = ldl_le_p(&header->vendor_bytes);
+                name_len = qcom8998_uefi_name_len(request, args[2], name_at,
+                                                  name_bytes, vendor_at,
+                                                  vendor_bytes,
+                                                  QCOM_UEFI_GET_REQUEST);
+                valid = name_len != 0;
+            }
+            if (valid) {
+                uint32_t req_data_size = ldl_le_p(request + 6 * sizeof(uint32_t));
+                int index = qcom8998_uefi_find(s, request + name_at, name_len,
+                                               request + vendor_at);
+
+                if (index < 0) {
+                    efi_status = QCOM_EFI_NOT_FOUND;
+                } else {
+                    const QcomUefiVariable *var = &s->uefi_vars[index];
+
+                    stl_le_p(reply + 3 * sizeof(uint32_t), var->attributes);
+                    stl_le_p(reply + 5 * sizeof(uint32_t), var->data_bytes);
+                    if (req_data_size < var->data_bytes ||
+                        args[4] < QCOM_UEFI_GET_REPLY + var->data_bytes) {
+                        efi_status = QCOM_EFI_BUFFER_TOO_SMALL;
+                    } else {
+                        efi_status = QCOM_EFI_SUCCESS;
+                        payload = var->data;
+                        payload_bytes = var->data_bytes;
+                        reply_bytes = QCOM_UEFI_GET_REPLY + var->data_bytes;
+                    }
+                }
+            }
+        }
+        break;
     case QCOM_UEFI_SET_VARIABLE:
         {
             const QcomUefiVariableRequest *header = (const void *)request;
-            size_t minimum = command == QCOM_UEFI_GET_VARIABLE ?
-                             QCOM_UEFI_GET_REQUEST : QCOM_UEFI_SET_REQUEST;
+            uint32_t name_at, name_bytes, vendor_at, vendor_bytes, name_len;
+            uint32_t attributes = 0, data_at = 0, data_bytes = 0;
 
-            reply_bytes = command == QCOM_UEFI_GET_VARIABLE ?
-                          QCOM_UEFI_GET_REPLY : QCOM_UEFI_SET_REPLY;
-            valid = args[2] >= minimum && fixed_bytes >= minimum &&
+            header_bytes = QCOM_UEFI_SET_REPLY;
+            reply_bytes = QCOM_UEFI_SET_REPLY;
+            valid = args[2] >= QCOM_UEFI_SET_REQUEST &&
+                    fixed_bytes >= QCOM_UEFI_SET_REQUEST &&
                     fixed_bytes <= args[2];
+            name_len = 0;
             if (valid) {
-                valid = qcom8998_uefi_name_valid(request, args[2],
-                    ldl_le_p(&header->name_offset),
-                    ldl_le_p(&header->name_bytes),
-                    ldl_le_p(&header->vendor_offset),
-                    ldl_le_p(&header->vendor_bytes), minimum);
+                name_at = ldl_le_p(&header->name_offset);
+                name_bytes = ldl_le_p(&header->name_bytes);
+                vendor_at = ldl_le_p(&header->vendor_offset);
+                vendor_bytes = ldl_le_p(&header->vendor_bytes);
+                name_len = qcom8998_uefi_name_len(request, args[2], name_at,
+                                                  name_bytes, vendor_at,
+                                                  vendor_bytes,
+                                                  QCOM_UEFI_SET_REQUEST);
+                valid = name_len != 0;
             }
-            if (valid && command == QCOM_UEFI_SET_VARIABLE) {
-                uint32_t data_at = ldl_le_p(request + 7 * sizeof(uint32_t));
-                uint32_t data_bytes = ldl_le_p(request + 8 * sizeof(uint32_t));
-
+            if (valid) {
+                attributes = ldl_le_p(request + 6 * sizeof(uint32_t));
+                data_at = ldl_le_p(request + 7 * sizeof(uint32_t));
+                data_bytes = ldl_le_p(request + 8 * sizeof(uint32_t));
                 valid = data_at <= args[2] && data_bytes <= args[2] - data_at &&
-                        (!data_bytes || data_at >= minimum);
+                        (!data_bytes || data_at >= QCOM_UEFI_SET_REQUEST);
             }
-            /*
-             * This experimental provider has an empty, read-only variable
-             * namespace. Report variable errors inside a valid QSEE reply,
-             * rather than confusing them with an unsupported transport.
-             */
-            efi_status = command == QCOM_UEFI_GET_VARIABLE ?
-                         QCOM_EFI_NOT_FOUND : QCOM_EFI_WRITE_PROTECTED;
+            if (valid) {
+                efi_status = qcom8998_uefi_set_variable(
+                    s, request + name_at, name_len, request + vendor_at,
+                    attributes, request + data_at, data_bytes);
+            }
         }
         break;
     case QCOM_UEFI_NEXT_VARIABLE:
-        reply_bytes = QCOM_UEFI_NEXT_REPLY;
-        valid = args[2] >= QCOM_UEFI_NEXT_REQUEST &&
-                fixed_bytes >= QCOM_UEFI_NEXT_REQUEST && fixed_bytes <= args[2];
-        if (valid) {
-            /* GetNextVariable places GUID fields before the name fields. */
+        {
             const QcomUefiVariableRequest *header = (const void *)request;
-            valid = qcom8998_uefi_name_valid(request, args[2],
-                ldl_le_p(&header->vendor_offset),
-                ldl_le_p(&header->vendor_bytes),
-                ldl_le_p(&header->name_offset),
-                ldl_le_p(&header->name_bytes), QCOM_UEFI_NEXT_REQUEST);
+            uint32_t vendor_at, vendor_bytes, name_at, name_bytes, name_len;
+
+            header_bytes = QCOM_UEFI_NEXT_REPLY;
+            reply_bytes = QCOM_UEFI_NEXT_REPLY;
+            valid = args[2] >= QCOM_UEFI_NEXT_REQUEST &&
+                    fixed_bytes >= QCOM_UEFI_NEXT_REQUEST &&
+                    fixed_bytes <= args[2];
+            name_len = 0;
+            if (valid) {
+                /* GetNextVariable places GUID fields before the name fields. */
+                vendor_at = ldl_le_p(&header->name_offset);
+                vendor_bytes = ldl_le_p(&header->name_bytes);
+                name_at = ldl_le_p(&header->vendor_offset);
+                name_bytes = ldl_le_p(&header->vendor_bytes);
+                name_len = qcom8998_uefi_name_len(request, args[2], name_at,
+                                                  name_bytes, vendor_at,
+                                                  vendor_bytes,
+                                                  QCOM_UEFI_NEXT_REQUEST);
+                valid = name_len != 0;
+            }
+            if (valid) {
+                unsigned next_index;
+
+                if (name_len == 2) {
+                    next_index = 0;
+                } else {
+                    int index = qcom8998_uefi_find(s, request + name_at,
+                                                   name_len,
+                                                   request + vendor_at);
+                    if (index < 0) {
+                        efi_status = QCOM_EFI_INVALID_PARAMETER;
+                        break;
+                    }
+                    next_index = (unsigned)index + 1;
+                }
+                if (next_index >= s->uefi_var_count) {
+                    efi_status = QCOM_EFI_NOT_FOUND;
+                } else {
+                    const QcomUefiVariable *var = &s->uefi_vars[next_index];
+                    size_t needed = QCOM_UEFI_NEXT_REPLY +
+                                    QCOM_UEFI_GUID_BYTES + var->name_bytes;
+
+                    stl_le_p(reply + 3 * sizeof(uint32_t),
+                             QCOM_UEFI_NEXT_REPLY);
+                    stl_le_p(reply + 4 * sizeof(uint32_t),
+                             QCOM_UEFI_GUID_BYTES);
+                    stl_le_p(reply + 5 * sizeof(uint32_t),
+                             QCOM_UEFI_NEXT_REPLY + QCOM_UEFI_GUID_BYTES);
+                    stl_le_p(reply + 6 * sizeof(uint32_t), var->name_bytes);
+                    if (name_bytes < var->name_bytes || args[4] < needed) {
+                        efi_status = QCOM_EFI_BUFFER_TOO_SMALL;
+                    } else {
+                        efi_status = QCOM_EFI_SUCCESS;
+                        next_var = var;
+                        reply_bytes = needed;
+                    }
+                }
+            }
         }
-        efi_status = QCOM_EFI_NOT_FOUND;
         break;
     case QCOM_UEFI_QUERY_INFO:
+        header_bytes = QCOM_UEFI_INFO_REPLY;
         reply_bytes = QCOM_UEFI_INFO_REPLY;
         valid = args[2] >= QCOM_UEFI_COMMON_REPLY &&
                 fixed_bytes >= QCOM_UEFI_COMMON_REPLY && fixed_bytes <= args[2];
+        if (valid) {
+            uint32_t attributes = ldl_le_p(request + 2 * sizeof(uint32_t));
+
+            if (attributes & QCOM_EFI_VAR_AUTH_MASK) {
+                efi_status = QCOM_EFI_UNSUPPORTED;
+            } else {
+                efi_status = QCOM_EFI_SUCCESS;
+                stq_le_p(reply + 16, QCOM_UEFI_STORE_BYTES);
+                stq_le_p(reply + 24,
+                         QCOM_UEFI_STORE_BYTES - s->uefi_store_used);
+                stq_le_p(reply + 32, QCOM_UEFI_MAX_DATA_BYTES);
+            }
+        }
         break;
     }
     if (!valid) {
@@ -543,9 +829,28 @@ static int32_t qcom8998_qsee_uefi(ARMCPU *cpu, const uint64_t *args)
         stl_le_p(reply + 4 * sizeof(uint32_t), QCOM_UEFI_GET_REPLY);
     }
     trace_qcom8998_uefi_reply(command, efi_status, reply_bytes);
-    return address_space_write(as, args[3], MEMTXATTRS_UNSPECIFIED,
-                               reply, reply_bytes) == MEMTX_OK ?
-           0 : QCOM_SCM_EINVAL;
+    if (address_space_write(as, args[3], MEMTXATTRS_UNSPECIFIED,
+                            reply, header_bytes) != MEMTX_OK) {
+        return QCOM_SCM_EINVAL;
+    }
+    if (payload && payload_bytes) {
+        if (address_space_write(as, args[3] + header_bytes,
+                                MEMTXATTRS_UNSPECIFIED,
+                                payload, payload_bytes) != MEMTX_OK) {
+            return QCOM_SCM_EINVAL;
+        }
+    } else if (next_var) {
+        if (address_space_write(as, args[3] + header_bytes,
+                                MEMTXATTRS_UNSPECIFIED, next_var->vendor,
+                                QCOM_UEFI_GUID_BYTES) != MEMTX_OK ||
+            address_space_write(as, args[3] + header_bytes +
+                                QCOM_UEFI_GUID_BYTES,
+                                MEMTXATTRS_UNSPECIFIED, next_var->name,
+                                next_var->name_bytes) != MEMTX_OK) {
+            return QCOM_SCM_EINVAL;
+        }
+    }
+    return 0;
 }
 
 bool qcom8998_smc(ARMCPU *cpu)
@@ -758,6 +1063,12 @@ static void qcom8998_scm_reset(DeviceState *dev)
     Qcom8998Scm *s = QCOM8998_SCM(dev);
 
     memset(&s->image, 0, sizeof(s->image));
+    qcom8998_uefi_store_clear(s);
+}
+
+static void qcom8998_scm_finalize(Object *obj)
+{
+    qcom8998_uefi_store_clear(QCOM8998_SCM(obj));
 }
 
 static const VMStateDescription qcom8998_scm_vmstate = {
@@ -779,6 +1090,7 @@ static const TypeInfo qcom8998_scm_type = {
     .name = TYPE_QCOM8998_SCM,
     .parent = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(Qcom8998Scm),
+    .instance_finalize = qcom8998_scm_finalize,
     .class_init = qcom8998_scm_class_init,
 };
 
