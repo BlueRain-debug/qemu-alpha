@@ -1024,6 +1024,94 @@ static void test_a630_direct_render(void)
     /* Outside triangle (upper-right): (12, 2) must remain 0x00000000. */
     g_assert_cmphex(qtest_readl(qts, rt + (2 * 16 + 12) * 4), ==, 0x00000000);
 
+    /*
+     * Exercise GMEM binning + DI_PT_RECTLIST path used by Direct2D console:
+     * 1) RM6_BIN_VISIBILITY (marker 0x2) must skip rasterization.
+     * 2) RM6_BIN_RENDER_START (marker 0x14) with TILE6_2 must route output to
+     *    RB_RESOLVE_SYSTEM_BUFFER_* even when RB_MRT_0_BASE is stale.
+     * 3) DI_PT_RECTLIST must ignore stale non-zero VFD_INDEX_OFFSET.
+     */
+    const uint64_t rb2  = 0x41407000;
+    const uint64_t ubo2 = 0x41408000; /* Rect vertex UBO: 2 vec4s */
+    const uint64_t vs_r = 0x41409000; /* RECTLIST VS indexed by raw vtx_id */
+    const uint64_t rt2  = 0x41411000; /* New swapchain backbuffer (16x16) */
+    for (unsigned i = 0; i < 16 * 16; i++) {
+        qtest_writel(qts, rt2 + i * 4, 0);
+    }
+    /* UBO[1][0] = (8.0, 2.0, 0, 1), UBO[1][1] = (12.0, 6.0, 0, 1). */
+    qtest_writel(qts, ubo2 + 0,  0x41000000); /* 8.0f */
+    qtest_writel(qts, ubo2 + 4,  0x40000000); /* 2.0f */
+    qtest_writel(qts, ubo2 + 8,  0x00000000);
+    qtest_writel(qts, ubo2 + 12, 0x3f800000);
+    qtest_writel(qts, ubo2 + 16, 0x41400000); /* 12.0f */
+    qtest_writel(qts, ubo2 + 20, 0x40c00000); /* 6.0f */
+    qtest_writel(qts, ubo2 + 24, 0x00000000);
+    qtest_writel(qts, ubo2 + 28, 0x3f800000);
+    /* Bindless UBO descriptor 1 at btbl + 16. */
+    qtest_writel(qts, btbl + 16, (uint32_t)ubo2);
+    qtest_writel(qts, btbl + 20, (uint32_t)(ubo2 >> 32) | (2U << 17));
+    /*
+     * vs_r: ldc.4 r1.xyzw, cb[0][0] (color);
+     *       ldc.4 r0.xyzw, cb[1][r0.x] (position from raw vertex ID); end.
+     */
+    qtest_writel(qts, vs_r + 0,  0x00c7b106);
+    qtest_writel(qts, vs_r + 4,  0xc0260004);
+    qtest_writel(qts, vs_r + 8,  0x0047b106); /* s1_im=0, src1=0 (r0.x) */
+    qtest_writel(qts, vs_r + 12, 0xc0260200); /* ubo=1, dst=0 (r0.xyzw) */
+    qtest_writel(qts, vs_r + 16, 0x00000000); /* end */
+    qtest_writel(qts, vs_r + 20, 0x03000000);
+
+    /* Change UBO color to (R=0.2, G=0.8, B=0.4, A=1.0) -> BGRA8 0xff33cc66. */
+    qtest_writel(qts, ubo + 0, 0x3e4ccccd);
+    qtest_writel(qts, ubo + 4, 0x3f4ccccd);
+    qtest_writel(qts, ubo + 8, 0x3ecccccd);
+    qtest_writel(qts, ubo + 12, 0x3f800000);
+
+    p = 0;
+#define EMIT2(base, val) qtest_writel(qts, (base) + (p++) * 4, (val))
+    /* Leave RB_MRT_0_BASE pointing at stale rt, switch BUF_INFO to TILE6_2. */
+    EMIT2(rb2, pm4_type4(0x8822, 1)); EMIT2(rb2, 0x00002230); /* TILE6_2 */
+    /* Program RB_RESOLVE_SYSTEM_BUFFER_* to rt2 (linear, BGRA8, pitch=64). */
+    EMIT2(rb2, pm4_type4(0x88d7, 5));
+    EMIT2(rb2, (0x30U << 7) | (1U << 5)); /* linear, swap=1 (WZYX), RGBA8 */
+    EMIT2(rb2, (uint32_t)rt2);
+    EMIT2(rb2, (uint32_t)(rt2 >> 32));
+    EMIT2(rb2, 1);  /* pitch = 64 bytes */
+    EMIT2(rb2, 16); /* array_pitch = 1024 bytes */
+    /* Visibility pass (marker 0x2) with full scissor must not write rt or rt2. */
+    EMIT2(rb2, pm4_type7(0x65, 1)); EMIT2(rb2, 0x2);
+    EMIT2(rb2, pm4_type7(0x38, 3)); EMIT2(rb2, 0x84); EMIT2(rb2, 1); EMIT2(rb2, 3);
+    /* GMEM bin render (marker 0x14) clipped to [0..7, 8..15] writes rt2 only. */
+    EMIT2(rb2, pm4_type4(0x80f0, 2)); EMIT2(rb2, 0x00080000); EMIT2(rb2, 0x000f0007);
+    EMIT2(rb2, pm4_type7(0x65, 1)); EMIT2(rb2, 0x14);
+    EMIT2(rb2, pm4_type7(0x38, 3)); EMIT2(rb2, 0x84); EMIT2(rb2, 1); EMIT2(rb2, 3);
+    /* Direct-render DI_PT_RECTLIST with stale VFD_INDEX_OFFSET=99 -> rt2 [8..12,2..6]. */
+    EMIT2(rb2, pm4_type4(0x80f0, 2)); EMIT2(rb2, 0x00000000); EMIT2(rb2, 0x000f000f);
+    EMIT2(rb2, pm4_type4(0x8822, 5));
+    EMIT2(rb2, 0x00002030); EMIT2(rb2, 1); EMIT2(rb2, 16);
+    EMIT2(rb2, (uint32_t)rt2); EMIT2(rb2, (uint32_t)(rt2 >> 32));
+    EMIT2(rb2, pm4_type4(0xa001, 1)); EMIT2(rb2, 0xfcfcfc00); /* vtx_id -> r0.x */
+    EMIT2(rb2, pm4_type4(0xa00e, 1)); EMIT2(rb2, 99); /* Stale VFD_INDEX_OFFSET */
+    EMIT2(rb2, pm4_type4(0xa81c, 2));
+    EMIT2(rb2, (uint32_t)vs_r); EMIT2(rb2, (uint32_t)(vs_r >> 32));
+    EMIT2(rb2, pm4_type4(0x8000, 1)); EMIT2(rb2, 0x61); /* screen_space = 1 */
+    EMIT2(rb2, pm4_type7(0x65, 1)); EMIT2(rb2, 0x1);
+    EMIT2(rb2, pm4_type7(0x38, 3)); EMIT2(rb2, 0x88); EMIT2(rb2, 1); EMIT2(rb2, 2);
+#undef EMIT2
+
+    qtest_writel(qts, 0x05002008, 0x0d);
+    qtest_writel(qts, 0x05002000, rb2);
+    qtest_writel(qts, 0x05002004, 0);
+    qtest_writel(qts, 0x0500201c, p);
+
+    /* Stale rt must remain untouched (still original 0xffcc6633, not overwritten). */
+    g_assert_cmphex(qtest_readl(qts, rt + (12 * 16 + 2) * 4), ==, 0xffcc6633);
+    /* GMEM bin rendered (2, 12) in rt2; visibility pass did not draw (1, 2). */
+    g_assert_cmphex(qtest_readl(qts, rt2 + (12 * 16 + 2) * 4), ==, 0xff33cc66);
+    g_assert_cmphex(qtest_readl(qts, rt2 + (2 * 16 + 1) * 4), ==, 0x00000000);
+    /* DI_PT_RECTLIST ignored stale VFD_INDEX_OFFSET and filled (10, 4) in rt2. */
+    g_assert_cmphex(qtest_readl(qts, rt2 + (4 * 16 + 10) * 4), ==, 0xff33cc66);
+
     qtest_quit(qts);
 }
 

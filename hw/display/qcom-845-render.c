@@ -33,6 +33,11 @@
 #define A6XX_RB_MRT_0_BASE_LO            0x8825
 #define A6XX_RB_MRT_0_BASE_HI            0x8826
 #define A6XX_RB_BLEND_CONSTANT_RED_FP32  0x8860
+#define A6XX_RB_RESOLVE_SYSTEM_BUFFER_INFO        0x88d7
+#define A6XX_RB_RESOLVE_SYSTEM_BUFFER_BASE_LO     0x88d8
+#define A6XX_RB_RESOLVE_SYSTEM_BUFFER_BASE_HI     0x88d9
+#define A6XX_RB_RESOLVE_SYSTEM_BUFFER_PITCH       0x88da
+#define A6XX_RB_RESOLVE_SYSTEM_BUFFER_ARRAY_PITCH 0x88db
 
 #define A6XX_VPC_VARYING_INTERP_MODE_0   0x9200
 #define A6XX_PC_RESTART_INDEX            0x9803
@@ -2201,15 +2206,15 @@ static bool qcom845_shader_execute(Qcom845Display *s, unsigned blk,
 /* ---- VFD Vertex Fetch & VS Output Extraction ---- */
 
 static bool qcom845_vertex_fetch_and_run(Qcom845Display *s, unsigned index,
-                                         unsigned instance,
+                                         unsigned instance, bool raw_id,
                                          Qcom845ShaderRegs *r)
 {
     const uint32_t *regs = s->banks[BANK845_ADRENO].regs;
-    unsigned fetch_cnt = regs[A6XX_VFD_CONTROL_0] & 0x3f;
+    unsigned fetch_cnt = raw_id ? 0 : (regs[A6XX_VFD_CONTROL_0] & 0x3f);
     unsigned vtx_reg = regs[A6XX_VFD_CONTROL_1] & 0xff;
     unsigned inst_reg = (regs[A6XX_VFD_CONTROL_1] >> 8) & 0xff;
-    uint32_t idx_off = regs[A6XX_VFD_INDEX_OFFSET];
-    uint32_t inst_off = regs[A6XX_VFD_INSTANCE_START_OFFSET];
+    uint32_t idx_off = raw_id ? 0 : regs[A6XX_VFD_INDEX_OFFSET];
+    uint32_t inst_off = raw_id ? 0 : regs[A6XX_VFD_INSTANCE_START_OFFSET];
     float_status fp = { 0 };
 
     if (fetch_cnt > 32) {
@@ -2641,12 +2646,12 @@ static bool qcom845_fragment_eval(Qcom845Display *s, Qcom845ShaderRegs *r,
     return true;
 }
 
-static inline void qcom845_write_mrt_pixel(uint8_t *ppage, unsigned off,
-                                           unsigned fmt, unsigned cpp,
-                                           unsigned dst_swap,
-                                           bool read_dst,
-                                           const Qcom845BlendState *blend,
-                                           const float src[4])
+static inline uint32_t qcom845_write_mrt_pixel(uint8_t *ppage, unsigned off,
+                                               unsigned fmt, unsigned cpp,
+                                               unsigned dst_swap,
+                                               bool read_dst,
+                                               const Qcom845BlendState *blend,
+                                               const float src[4])
 {
     uint32_t dst_rgba = 0;
     if (read_dst) {
@@ -2668,6 +2673,7 @@ static inline void qcom845_write_mrt_pixel(uint8_t *ppage, unsigned off,
     } else {
         stl_le_p(ppage + off, qcom845_color_swap(out_rgba, dst_swap));
     }
+    return out_rgba;
 }
 
 static inline int64_t qcom845_edge(const Qcom845RasterVertex *a,
@@ -2690,6 +2696,14 @@ bool qcom845_render_draw(Qcom845Display *s, uint32_t n, const uint32_t *w)
     const uint32_t *regs = s->banks[BANK845_ADRENO].regs;
     if (n < 3) {
         return false;
+    }
+
+    /*
+     * RM6_BIN_VISIBILITY (marker low nibble == 2) is a vertex-only binning
+     * visibility pass and must not rasterize into color targets.
+     */
+    if ((s->cp_marker & 0xf) == 2) {
+        return true;
     }
 
     unsigned prim = w[0] & 0x3f;
@@ -2718,7 +2732,34 @@ bool qcom845_render_draw(Qcom845Display *s, uint32_t n, const uint32_t *w)
     uint64_t layer = (uint64_t)regs[A6XX_RB_MRT_0_ARRAY_PITCH] * 64;
     uint64_t dest = qcom845_reg64(regs, A6XX_RB_MRT_0_BASE_LO);
 
-    if (!cpp || tile != 0 || !pitch || !dest) {
+    /*
+     * Accept linear SYSMEM (tile == 0) as well as A630 GMEM bin-render passes
+     * (tile == 2 / TILE6_2, marker low nibble == 4). During GMEM binning,
+     * RB_MRT_0_BASE can remain stale across swapchain flips because hardware
+     * writes to RB_MRT_0_BASE_GMEM and resolves via RB_RESOLVE_SYSTEM_BUFFER_*
+     * in each bin's LOAD/STORE IB; prefer the linear resolve backing surface
+     * when programmed, falling back to RB_MRT_0_BASE.
+     */
+    bool gmem_bin = (tile == 2 && (s->cp_marker & 0xf) == 4);
+    if (gmem_bin) {
+        uint64_t rdest = qcom845_reg64(regs,
+                                       A6XX_RB_RESOLVE_SYSTEM_BUFFER_BASE_LO);
+        uint32_t rinfo = regs[A6XX_RB_RESOLVE_SYSTEM_BUFFER_INFO];
+        uint64_t rpitch =
+            (uint64_t)(regs[A6XX_RB_RESOLVE_SYSTEM_BUFFER_PITCH] & 0xffff) * 64;
+
+        if (rdest && (rinfo & 3) == 0 && rpitch) {
+            dest = rdest;
+            pitch = rpitch;
+            layer = (uint64_t)(regs[A6XX_RB_RESOLVE_SYSTEM_BUFFER_ARRAY_PITCH] &
+                               0x1fffffff) * 64;
+            fmt = extract32(rinfo, 7, 8);
+            dst_swap = extract32(rinfo, 5, 2);
+            cpp = (fmt == 0x30) ? 4 : (fmt == 0x0f) ? 2
+                : (fmt == 0x02 || fmt == 0x03) ? 1 : 0;
+        }
+    }
+    if (!cpp || (tile != 0 && !gmem_bin) || !pitch || !dest) {
         trace_qcom845_render_reject("mrt_cfg", mrt_info, pitch);
         return false;
     }
@@ -2780,7 +2821,7 @@ bool qcom845_render_draw(Qcom845Display *s, uint32_t n, const uint32_t *w)
         for (unsigned v = 0; v < 2; v++) {
             sh.read_cache = &read_cache;
             sh.program = &vs_prog;
-            if (!qcom845_vertex_fetch_and_run(s, v, 0, &sh) ||
+            if (!qcom845_vertex_fetch_and_run(s, v, 0, true, &sh) ||
                 !qcom845_extract_vertex(s, &sh, screen_space, &rv[v])) {
                 return false;
             }
@@ -2831,6 +2872,7 @@ bool qcom845_render_draw(Qcom845Display *s, uint32_t n, const uint32_t *w)
             }
         }
 
+        uint32_t rect_nonblack = 0;
         for (int y = by1; y < by2; y++) {
             float ty = ((float)y + 0.5f - (float)ry0) * inv_dy;
             for (int x = bx1; x < bx2; x++) {
@@ -2865,14 +2907,24 @@ bool qcom845_render_draw(Qcom845Display *s, uint32_t n, const uint32_t *w)
                 if (!ppage) {
                     return false;
                 }
-                qcom845_write_mrt_pixel(ppage, paddr & A6XX_PAGE_MASK, fmt, cpp,
-                                        dst_swap, read_dst, &blend, src);
+                uint32_t px = qcom845_write_mrt_pixel(ppage, paddr & A6XX_PAGE_MASK,
+                                                      fmt, cpp, dst_swap, read_dst,
+                                                      &blend, src);
+                if (px & 0x00ffffffU) {
+                    rect_nonblack++;
+                }
             }
         }
         if (!qcom845_publish_write_pages(write_tbl)) {
             return false;
         }
-        trace_qcom845_render_done(dest, fmt, (uint32_t)(bx2 - bx1) * (by2 - by1));
+        hwaddr dest_pa = dest;
+        if (s->gpu_smmu) {
+            qcom845_smmu_translate(s->gpu_smmu, 0, dest, false, &dest_pa);
+        }
+        trace_qcom845_render_done(dest, dest_pa, fmt,
+                                  (uint32_t)(bx2 - bx1) * (by2 - by1),
+                                  rect_nonblack);
         return true;
     }
 
@@ -2894,6 +2946,7 @@ bool qcom845_render_draw(Qcom845Display *s, uint32_t n, const uint32_t *w)
     uint32_t su_cntl = regs[A6XX_GRAS_SU_CNTL];
     uint64_t raster_budget = 64ULL << 20;
     uint32_t total_pixels = 0;
+    uint32_t total_nonblack = 0;
 
     for (unsigned inst = 0; inst < inst_cnt; inst++) {
         unsigned strip_len = 0, strip_parity = 0;
@@ -2980,7 +3033,7 @@ bool qcom845_render_draw(Qcom845Display *s, uint32_t n, const uint32_t *w)
             for (unsigned v = 0; v < 3; v++) {
                 sh.read_cache = &read_cache;
                 sh.program = &vs_prog;
-                if (!qcom845_vertex_fetch_and_run(s, tri_idx[v], inst, &sh) ||
+                if (!qcom845_vertex_fetch_and_run(s, tri_idx[v], inst, false, &sh) ||
                     !qcom845_extract_vertex(s, &sh, screen_space, &rv[v])) {
                     return false;
                 }
@@ -3190,10 +3243,14 @@ bool qcom845_render_draw(Qcom845Display *s, uint32_t n, const uint32_t *w)
                         trace_qcom845_render_reject("write_page", paddr, dest);
                         return false;
                     }
-                    qcom845_write_mrt_pixel(ppage, paddr & A6XX_PAGE_MASK,
-                                            fmt, cpp, dst_swap, read_dst,
-                                            &blend, src);
+                    uint32_t px = qcom845_write_mrt_pixel(ppage,
+                                                          paddr & A6XX_PAGE_MASK,
+                                                          fmt, cpp, dst_swap,
+                                                          read_dst, &blend, src);
                     total_pixels++;
+                    if (px & 0x00ffffffU) {
+                        total_nonblack++;
+                    }
                 }
             }
         }
@@ -3202,6 +3259,10 @@ bool qcom845_render_draw(Qcom845Display *s, uint32_t n, const uint32_t *w)
     if (!qcom845_publish_write_pages(write_tbl)) {
         return false;
     }
-    trace_qcom845_render_done(dest, fmt, total_pixels);
+    hwaddr dest_pa = dest;
+    if (s->gpu_smmu) {
+        qcom845_smmu_translate(s->gpu_smmu, 0, dest, false, &dest_pa);
+    }
+    trace_qcom845_render_done(dest, dest_pa, fmt, total_pixels, total_nonblack);
     return true;
 }
