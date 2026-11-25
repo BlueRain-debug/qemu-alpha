@@ -72,6 +72,7 @@
 #define DPU4_PANEL_WIDTH         1350
 #define DPU4_PANEL_HEIGHT        1800
 #define DPU4_VSYNC_NS            (NANOSECONDS_PER_SECOND / 60)
+#define DPU4_SCANOUT_POLL_NS     (NANOSECONDS_PER_SECOND / 10)
 
 /* Adreno 630 (A6x) core register byte offsets (dword_reg * 4). */
 #define A6XX_RBBM_INT_CLEAR_ALT  (0x01f * 4)
@@ -120,6 +121,20 @@ static const Qcom845BankDesc qcom845_bank_descs[BANK845_COUNT] = {
 
 static void qcom845_update_vsync_irq(Qcom845Display *s);
 static void qcom845_gfx_update(Qcom845Display *s);
+static void qcom845_update_vsync_timer(Qcom845Display *s);
+
+static void qcom845_panel_damage(Qcom845Display *s, unsigned head,
+                                  unsigned y1, unsigned y2)
+{
+    if (!s->panel_dirty[head]) {
+        s->panel_y1[head] = y1;
+        s->panel_y2[head] = y2;
+    } else {
+        s->panel_y1[head] = MIN(s->panel_y1[head], y1);
+        s->panel_y2[head] = MAX(s->panel_y2[head], y2);
+    }
+    s->panel_dirty[head] = true;
+}
 
 static bool qcom845_mdss_read_bytes(Qcom845Display *s, uint64_t iova,
                                     void *buf, size_t len, hwaddr *first_pa)
@@ -191,6 +206,7 @@ static void qcom845_scanout_head(Qcom845Display *s, unsigned head)
     uint64_t last_iova = 0;
     hwaddr last_pa = 0;
     uint32_t last_w = 0, last_h = 0, last_stride = 0;
+    bool count_pixels = trace_event_get_state_backends(TRACE_QCOM845_SCANOUT);
 
     if (head >= 2 || !s->panel_fb[head]) {
         return;
@@ -244,7 +260,8 @@ static void qcom845_scanout_head(Qcom845Display *s, unsigned head)
         h = MIN(h, DPU4_PANEL_HEIGHT - oy);
 
         hwaddr pa0 = 0;
-        for (uint32_t y = 0; y < h; y++) {
+        uint32_t y;
+        for (y = 0; y < h; y++) {
             uint64_t row_iova = (uint64_t)addr + (uint64_t)(sy + y) * stride +
                                 (uint64_t)sx * 4;
             if (!qcom845_mdss_read_bytes(s, row_iova, row_buf, w * 4,
@@ -259,13 +276,17 @@ static void qcom845_scanout_head(Qcom845Display *s, unsigned head)
                          ((px >> 16) & 0xff);
                 }
                 px |= 0xff000000U;
-                dst[x] = px;
-                if (px != 0xff000000U) {
+                row_buf[x] = px;
+                if (count_pixels && px != 0xff000000U) {
                     nonblack++;
                 }
             }
+            if (memcmp(dst, row_buf, w * 4)) {
+                memcpy(dst, row_buf, w * 4);
+                qcom845_panel_damage(s, head, oy + y, oy + y + 1);
+            }
         }
-        any_drawn = true;
+        any_drawn |= y != 0;
         last_iova = addr;
         last_pa = pa0;
         last_w = w;
@@ -274,10 +295,9 @@ static void qcom845_scanout_head(Qcom845Display *s, unsigned head)
     }
 
     if (any_drawn) {
-        s->panel_dirty[head] = true;
         trace_qcom845_scanout(head, last_iova, last_pa, last_w, last_h,
                               last_stride, nonblack);
-        qcom845_gfx_update(s);
+        s->scanout_active = true;
     }
 }
 
@@ -288,18 +308,24 @@ static void qcom845_vsync_tick(void *opaque)
     uint32_t en = mdss->regs[DPU4_MDP_INTR_EN / 4];
     uint32_t rd_ptr = en & (DPU4_MDP_PP_RD_PTR(0) | DPU4_MDP_PP_RD_PTR(1));
 
-    if (!rd_ptr) {
+    if (!rd_ptr && !s->scanout_active) {
         return;
     }
-    if (s->sspp_dirty) {
+    /*
+     * CPU/GDI writers can update an already committed surface without a CP
+     * draw or another CTL flush. Scanout is independent of the IRQ mask.
+     * Compare rows so unchanged frames do not repaint all three consoles.
+     */
+    if (s->scanout_active || s->sspp_dirty) {
         s->sspp_dirty = false;
         qcom845_scanout_head(s, 0);
         qcom845_scanout_head(s, 1);
+        qcom845_gfx_update(s);
     }
     mdss->regs[DPU4_MDP_INTR_STATUS / 4] |= rd_ptr;
     qcom845_update_vsync_irq(s);
-    timer_mod(s->vsync_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + DPU4_VSYNC_NS);
+    timer_mod(s->vsync_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              (rd_ptr ? DPU4_VSYNC_NS : DPU4_SCANOUT_POLL_NS));
 }
 
 static void qcom845_update_vsync_timer(Qcom845Display *s)
@@ -307,10 +333,13 @@ static void qcom845_update_vsync_timer(Qcom845Display *s)
     Qcom845DisplayBank *mdss = &s->banks[BANK845_MDSS];
     uint32_t en = mdss->regs[DPU4_MDP_INTR_EN / 4];
 
-    if (en & (DPU4_MDP_PP_RD_PTR(0) | DPU4_MDP_PP_RD_PTR(1))) {
+    if (s->scanout_active ||
+        (en & (DPU4_MDP_PP_RD_PTR(0) | DPU4_MDP_PP_RD_PTR(1)))) {
         if (!timer_pending(s->vsync_timer)) {
             timer_mod(s->vsync_timer,
-                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + DPU4_VSYNC_NS);
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      (en & (DPU4_MDP_PP_RD_PTR(0) | DPU4_MDP_PP_RD_PTR(1)) ?
+                       DPU4_VSYNC_NS : DPU4_SCANOUT_POLL_NS));
         }
     } else {
         timer_del(s->vsync_timer);
@@ -328,13 +357,14 @@ static void qcom845_gfx_update(Qcom845Display *s)
             surface_height(surf) == DPU4_PANEL_HEIGHT) {
             uint8_t *dst = surface_data(surf);
             int dst_stride = surface_stride(surf);
-            for (unsigned y = 0; y < DPU4_PANEL_HEIGHT; y++) {
+            for (unsigned y = s->panel_y1[head]; y < s->panel_y2[head]; y++) {
                 memcpy(dst + y * dst_stride,
                        s->panel_fb[head] + y * DPU4_PANEL_WIDTH,
                        DPU4_PANEL_WIDTH * 4);
             }
-            qemu_console_update(s->con[head], 0, 0, DPU4_PANEL_WIDTH,
-                                DPU4_PANEL_HEIGHT);
+            qemu_console_update(s->con[head], 0, s->panel_y1[head],
+                                DPU4_PANEL_WIDTH,
+                                s->panel_y2[head] - s->panel_y1[head]);
         }
     }
     if (s->con[2] && (s->panel_dirty[0] || s->panel_dirty[1])) {
@@ -343,16 +373,20 @@ static void qcom845_gfx_update(Qcom845Display *s)
             surface_height(surf) == DPU4_PANEL_HEIGHT) {
             uint8_t *dst = surface_data(surf);
             int dst_stride = surface_stride(surf);
-            for (unsigned y = 0; y < DPU4_PANEL_HEIGHT; y++) {
-                uint32_t *line = (uint32_t *)(dst + y * dst_stride);
-                memcpy(line, s->panel_fb[0] + y * DPU4_PANEL_WIDTH,
-                       DPU4_PANEL_WIDTH * 4);
-                memcpy(line + DPU4_PANEL_WIDTH,
-                       s->panel_fb[1] + y * DPU4_PANEL_WIDTH,
-                       DPU4_PANEL_WIDTH * 4);
+            for (unsigned head = 0; head < 2; head++) {
+                if (!s->panel_dirty[head]) {
+                    continue;
+                }
+                for (unsigned y = s->panel_y1[head]; y < s->panel_y2[head]; y++) {
+                    uint8_t *line = dst + y * dst_stride +
+                                    head * DPU4_PANEL_WIDTH * 4;
+                    memcpy(line, s->panel_fb[head] + y * DPU4_PANEL_WIDTH,
+                           DPU4_PANEL_WIDTH * 4);
+                }
+                qemu_console_update(s->con[2], head * DPU4_PANEL_WIDTH,
+                                    s->panel_y1[head], DPU4_PANEL_WIDTH,
+                                    s->panel_y2[head] - s->panel_y1[head]);
             }
-            qemu_console_update(s->con[2], 0, 0, DPU4_PANEL_WIDTH * 2,
-                                DPU4_PANEL_HEIGHT);
         }
     }
     s->panel_dirty[0] = false;
@@ -363,8 +397,8 @@ static void qcom845_gfx_invalidate(void *opaque)
 {
     Qcom845Display *s = opaque;
 
-    s->panel_dirty[0] = true;
-    s->panel_dirty[1] = true;
+    qcom845_panel_damage(s, 0, 0, DPU4_PANEL_HEIGHT);
+    qcom845_panel_damage(s, 1, 0, DPU4_PANEL_HEIGHT);
     qcom845_gfx_update(s);
 }
 
@@ -761,12 +795,16 @@ static void qcom845_bank_write(void *opaque, hwaddr offset, uint64_t value,
                 b->regs[idx] = v;
                 if (ctl < 2 && v != 0) {
                     qcom845_scanout_head(s, ctl);
+                    qcom845_gfx_update(s);
+                    qcom845_update_vsync_timer(s);
                 }
                 return;
             }
             if (reg == DPU4_CTL_START && (v & 1)) {
                 if (ctl < 2) {
                     qcom845_scanout_head(s, ctl);
+                    qcom845_gfx_update(s);
+                    qcom845_update_vsync_timer(s);
                 }
                 b->regs[DPU4_MDP_INTR_STATUS / 4] |= DPU4_MDP_PP_DONE_IRQ(ctl);
                 qcom845_update_vsync_irq(s);
@@ -867,7 +905,7 @@ static void qcom845_display_reset(DeviceState *dev)
         if (s->panel_fb[h]) {
             memset(s->panel_fb[h], 0,
                    DPU4_PANEL_WIDTH * DPU4_PANEL_HEIGHT * sizeof(uint32_t));
-            s->panel_dirty[h] = true;
+            qcom845_panel_damage(s, h, 0, DPU4_PANEL_HEIGHT);
         }
     }
     s->banks[BANK845_MDSS].regs[DPU4_MDSS_HW_VERSION / 4] = DPU4_HW_VERSION_401;
@@ -875,6 +913,7 @@ static void qcom845_display_reset(DeviceState *dev)
     s->banks[BANK845_VENUS].regs[VENUS4_WRAPPER_HW_VERSION / 4] =
         VENUS4_HW_VERSION_44;
     s->cp_marker = 0;
+    s->scanout_active = false;
     s->cp_reg_trace_count = 0;
     memset(s->draw_states, 0, sizeof(s->draw_states));
     qcom845_render_reset(s);
@@ -882,6 +921,7 @@ static void qcom845_display_reset(DeviceState *dev)
     qemu_set_irq(s->gfx_irq, 0);
     qemu_set_irq(s->vidc_irq, 0);
     qemu_set_irq(s->vidc_wd_irq, 0);
+    qcom845_gfx_update(s);
 }
 
 static void qcom845_display_realize(DeviceState *dev, Error **errp)

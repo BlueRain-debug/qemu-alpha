@@ -2873,7 +2873,45 @@ bool qcom845_render_draw(Qcom845Display *s, uint32_t n, const uint32_t *w)
         }
 
         uint32_t rect_nonblack = 0;
+        bool solid = uniform && !read_dst && !(dest % cpp) && !(pitch % cpp);
+        uint8_t solid_pixel[4];
+
+        if (solid) {
+            /* Quantize a constant, unblended fragment only once per draw. */
+            uint32_t rgba = qcom845_write_mrt_pixel(solid_pixel, 0, fmt, cpp,
+                                                   dst_swap, false, &blend,
+                                                   u_src);
+            if (rgba & 0x00ffffffU) {
+                rect_nonblack = (uint32_t)(bx2 - bx1) * (by2 - by1);
+            }
+        }
         for (int y = by1; y < by2; y++) {
+            if (solid) {
+                uint64_t addr = dest + (uint64_t)y * pitch +
+                                (uint64_t)bx1 * cpp;
+                unsigned left = (bx2 - bx1) * cpp;
+
+                while (left) {
+                    unsigned off = addr & A6XX_PAGE_MASK;
+                    unsigned len = MIN(left, A6XX_PAGE_SIZE - off);
+                    uint8_t *page = qcom845_stage_write_page(s, &write_cache,
+                                                            addr);
+
+                    if (!page) {
+                        return false;
+                    }
+                    if (cpp == 1) {
+                        memset(page + off, solid_pixel[0], len);
+                    } else {
+                        for (unsigned i = 0; i < len; i += cpp) {
+                            memcpy(page + off + i, solid_pixel, cpp);
+                        }
+                    }
+                    addr += len;
+                    left -= len;
+                }
+                continue;
+            }
             float ty = ((float)y + 0.5f - (float)ry0) * inv_dy;
             for (int x = bx1; x < bx2; x++) {
                 float src[4];

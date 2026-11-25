@@ -68,6 +68,8 @@ struct Qcom845Display {
     QemuConsole *con[3]; /* 0: head 0, 1: head 1, 2: dual 2700x1800 */
     uint32_t *panel_fb[2];
     bool panel_dirty[2];
+    unsigned panel_y1[2], panel_y2[2];
+    bool scanout_active;
     bool sspp_dirty;
     uint32_t cp_marker;
     uint32_t cp_reg_trace_count;

@@ -895,6 +895,62 @@ static void test_display_frontend(void)
     qtest_quit(qts);
 }
 
+static void assert_scanout_pixel(QTestState *qts, const char *path,
+                                  unsigned x, unsigned y, uint32_t rgb)
+{
+    g_autofree char *data = NULL;
+    gsize size;
+    /* The merged width also avoids padding in the legacy PPM encoder. */
+    const char header[] = "P6\n2700 1800\n255\n";
+    size_t offset = sizeof(header) - 1 + (y * 2700 + x) * 3;
+
+    qtest_qmp_assert_success(qts,
+        "{'execute':'screendump','arguments':{'filename':%s,"
+        "'device':'qcom845-display','head':2}}", path);
+    g_assert_true(g_file_get_contents(path, &data, &size, NULL));
+    g_assert_cmpuint(size, >, offset + 2);
+    g_assert_cmpmem(data, sizeof(header) - 1, header, sizeof(header) - 1);
+    g_assert_cmphex((uint8_t)data[offset], ==, rgb >> 16);
+    g_assert_cmphex((uint8_t)data[offset + 1], ==, (rgb >> 8) & 255);
+    g_assert_cmphex((uint8_t)data[offset + 2], ==, rgb & 255);
+}
+
+static void test_scanout_cpu_write(void)
+{
+    QTestState *qts = start_board();
+    g_autofree char *path = NULL;
+    int fd = g_file_open_tmp("oemsk850-scanout-XXXXXX", &path, NULL);
+    const uint64_t source = 0x41500000;
+    const uint64_t pipe = 0x0ae05000;
+
+    g_assert_cmpint(fd, >=, 0);
+    close(fd);
+    qtest_writel(qts, 0x15000000, 1); /* SMMU bypass. */
+    qtest_writel(qts, pipe, (2U << 16) | 16); /* Two rows. */
+    qtest_writel(qts, pipe + 0xc, (2U << 16) | 16);
+    qtest_writel(qts, pipe + 0x24, 64);
+    qtest_writel(qts, pipe + 0x14, source);
+    qtest_writel(qts, 0x0ae02000, 1); /* VIG0 staged on CTL0. */
+    qtest_writel(qts, 0x0ae02018, 1);
+    assert_scanout_pixel(qts, path, 0, 0, 0);
+
+    /* No further SSPP writes, GPU draws, CTL flushes or enabled IRQs. */
+    qtest_writel(qts, source, 0x00112233);
+    qtest_clock_step(qts, 100000000);
+    assert_scanout_pixel(qts, path, 0, 0, 0x112233);
+    assert_scanout_pixel(qts, path, 0, 1, 0);
+    g_assert_cmphex(qtest_readl(qts, 0x0ae00010), ==, 0);
+    qtest_writel(qts, source + 64, 0x00abcdef);
+    qtest_clock_step(qts, 100000000);
+    assert_scanout_pixel(qts, path, 0, 0, 0x112233);
+    assert_scanout_pixel(qts, path, 0, 1, 0xabcdef);
+    qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
+    qtest_clock_step(qts, 20000000);
+    assert_scanout_pixel(qts, path, 0, 0, 0);
+    qtest_quit(qts);
+    unlink(path);
+}
+
 static uint32_t pm4_type4(uint32_t reg, uint32_t cnt)
 {
     return (4U << 28) | ((reg & 0x3ffffU) << 8) | (cnt & 0x7fU);
@@ -1112,6 +1168,39 @@ static void test_a630_direct_render(void)
     /* DI_PT_RECTLIST ignored stale VFD_INDEX_OFFSET and filled (10, 4) in rt2. */
     g_assert_cmphex(qtest_readl(qts, rt2 + (4 * 16 + 10) * 4), ==, 0xff33cc66);
 
+    /* Solid RECTLIST across page boundaries, with clipping and row padding. */
+    const uint64_t wide_rt = 0x41800ffc;
+    const unsigned wide_pitch = 5440;
+
+    qtest_writel(qts, ubo2, 0x40400000);      /* x0 = 3 */
+    qtest_writel(qts, ubo2 + 4, 0x3f800000);  /* y0 = 1 */
+    qtest_writel(qts, ubo2 + 16, 0x44a8a000); /* x1 = 1349 */
+    qtest_writel(qts, ubo2 + 20, 0x40400000); /* y1 = 3 */
+    qtest_writel(qts, 0x050203c0, 0x00010007); /* scissor TL (7, 1) */
+    qtest_writel(qts, 0x050203c4, 0x00020542); /* scissor BR (1346, 2) */
+    qtest_writel(qts, 0x0502208c, wide_pitch / 64);
+    qtest_writel(qts, 0x05022090, wide_pitch * 4 / 64);
+    qtest_writel(qts, 0x05022094, wide_rt);
+    qtest_writel(qts, 0x05022098, 0);
+    qtest_writel(qts, rb2, pm4_type7(0x38, 3));
+    qtest_writel(qts, rb2 + 4, 0x88);
+    qtest_writel(qts, rb2 + 8, 1);
+    qtest_writel(qts, rb2 + 12, 2);
+    qtest_writel(qts, 0x05002018, 0);
+    qtest_writel(qts, 0x0500201c, 4);
+    for (unsigned y = 1; y <= 2; y++) {
+        uint64_t row = wide_rt + y * wide_pitch;
+
+        g_assert_cmphex(qtest_readl(qts, row + 6 * 4), ==, 0);
+        g_assert_cmphex(qtest_readl(qts, row + 7 * 4), ==, 0xff33cc66);
+        g_assert_cmphex(qtest_readl(qts, row + 1024 * 4), ==, 0xff33cc66);
+        g_assert_cmphex(qtest_readl(qts, row + 1346 * 4), ==, 0xff33cc66);
+        g_assert_cmphex(qtest_readl(qts, row + 1347 * 4), ==, 0);
+        g_assert_cmphex(qtest_readl(qts, row + 1350 * 4), ==, 0);
+    }
+    g_assert_cmphex(qtest_readl(qts, wide_rt + 7 * 4), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, wide_rt + 3 * wide_pitch + 7 * 4), ==, 0);
+
     qtest_quit(qts);
 }
 
@@ -1141,6 +1230,7 @@ int main(int argc, char **argv)
     qtest_add_func("/oemsk850/tlmm", test_tlmm);
     qtest_add_func("/oemsk850/multimedia-clock-control", test_mmcc);
     qtest_add_func("/oemsk850/display-frontend", test_display_frontend);
+    qtest_add_func("/oemsk850/scanout-cpu-write", test_scanout_cpu_write);
     qtest_add_func("/oemsk850/a630-direct-render", test_a630_direct_render);
     return g_test_run();
 }

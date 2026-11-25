@@ -1,5 +1,5 @@
 param(
-    [string]$OsDisk = 'C:\DOWN\900170480965_10.0.17047.1034_FactoryOS_3BW3.2.PRIBG.lun0.vhdx',
+    [string]$OsDisk = 'C:\DOWN\900170480965_10.0.17047.1034_FactoryOS_3BW3.2.PRIBG.lun0.rw.vhdx',
     [string]$Qemu = 'C:\DOWN\tempgitrepo\qemu\build-oemsk-arm64\qemu-system-aarch64.exe',
     [string]$PcBios = 'C:\DOWN\tempgitrepo\qemu\build-oemsk-arm64\pc-bios',
     [string]$Firmware = 'C:\DOWN\tempgitrepo\edk2-winrt\Build\ArmVirtFakeOemsk850-AARCH64\DEBUG_GCC5\FV\FAKEOEMSK850_CODE.fd',
@@ -16,10 +16,20 @@ param(
     [switch]$Headless,
     [switch]$WaitForDebugger,
     [switch]$TraceDisplay,
+    [switch]$Snapshot,
+    [Alias('h')][switch]$Help,
     [ValidateSet('vhdx', 'qcow2')][string]$OsFormat = 'vhdx'
 )
 
 $ErrorActionPreference = 'Stop'
+
+if ($Help -or $args -contains '--help') {
+    Write-Host 'run-oemsk850.ps1 [-OsDisk PATH] [-BoardSsdt AML] [-CmdDb BIN]'
+    Write-Host '                  [-Snapshot] [-Headless] [-TraceDisplay] [-WaitForDebugger]'
+    Write-Host 'Default disk mode: direct writable. -Snapshot uses a temporary overlay.'
+    Write-Host 'Ports: -QmpPort 5970 -GdbPort 5971 -TelnetPort 5925'
+    return
+}
 
 $OsDisk = (Resolve-Path -LiteralPath $OsDisk).Path
 $Qemu = (Resolve-Path -LiteralPath $Qemu).Path
@@ -59,7 +69,8 @@ function Escape-QemuOpt([string]$Value) {
     return $Value.Replace(',', ',,')
 }
 
-$osDrive = "if=none,id=os,format=$OsFormat,snapshot=on,file=$(Escape-QemuOpt $OsDisk)"
+$osDrive = "if=none,id=os,format=$OsFormat,file=$(Escape-QemuOpt $OsDisk)"
+if ($Snapshot) { $osDrive += ',snapshot=on' }
 
 $display = if ($Headless) {
     'none'
@@ -104,8 +115,7 @@ $vmArgs = @(
     '-trace', 'enable=qcom845_qsee_message',
     '-trace', 'enable=qcom845_spmi_access',
     '-qmp', "tcp:127.0.0.1:${QmpPort},server=on,wait=off",
-    '-gdb', "tcp:127.0.0.1:${GdbPort}",
-    '-action', 'reboot=shutdown,shutdown=pause'
+    '-gdb', "tcp:127.0.0.1:${GdbPort}"
 )
 
 if ($TraceDisplay) {
@@ -120,7 +130,7 @@ if ($WaitForDebugger) {
     $vmArgs += '-S'
 }
 
-$mode = 'snapshot (read-only base)'
+$mode = if ($Snapshot) { 'snapshot (read-only base)' } else { 'direct writable' }
 Write-Host "OS Disk : $OsDisk ($mode)"
 Write-Host "Run Dir : $RunDirectory"
 Write-Host "Ports   : QMP=$QmpPort, GDB=$GdbPort, Telnet=127.0.0.1:$TelnetPort -> guest:23"

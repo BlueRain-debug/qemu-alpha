@@ -146,9 +146,10 @@ Local Windows launcher
 ----------------------
 
 ``scripts/run-oemsk850.ps1`` uses the separate FakeOemsk850 AArch64 firmware,
-a small per-run VARS/RPMB copy, GTK with scaling, and ``snapshot=on`` for
-the OS disk. It creates no persistent OS differential disk and never opens
-the base image writable. Default forwarded ports are Telnet 5925 to guest
+a small per-run VARS/RPMB copy and GTK with scaling. The OS disk is opened
+directly writable by default; ``-Snapshot`` selects a temporary overlay
+without creating a persistent OS differential disk. ``-Help`` or ``--help``
+prints usage without starting QEMU. Default forwarded ports are Telnet 5925 to guest
 23, QMP 5970 and GDB 5971. Telnet reachability does not establish login.
 Paths can be supplied as parameters; ``-BoardSsdt`` opts into the diagnostic
 table above, and ``-CmdDb`` supplies the corresponding firmware resource
@@ -178,3 +179,37 @@ with zero bugchecks, zero SMMU faults, and zero GPU SW resets. All 41 initial
 rejects, lighting up both native ``1350x1800`` panels (and merged
 ``2700x1800`` view) with the dual-screen wallpaper and anti-aliased
 DirectWrite text overlays.
+
+Input latency diagnostics (2026-11-25)
+------------------------------------
+
+A later CMD boot reproduced repeated characters with separate QMP key-down
+and key-up requests. USB keyboard PCAP contained one down report and one
+release report per key. A requested 50 ms press lasted 366 ms at USB level:
+the key-up QMP request itself took 316 ms. Windows then displayed two copies
+of the character. CPU samples during input included the A630 software
+rasterizer; command submission currently executes it synchronously in the
+MMIO write path under BQL. This can postpone input processing long enough
+to trigger guest keyboard repeat. It is not evidence of duplicated USB
+press reports or a missing release packet.
+
+For automated command entry, submit both transitions in a single
+``input-send-event`` request. For a shifted character, order the events as
+modifier down, character down, character up, modifier up. This queues the
+release together with the press, before a subsequent draw can delay a
+second QMP request. A 26-letter control produced exactly 26 characters;
+USB press durations were 0.5--5 ms. The requested CurrentVersion registry
+query then completed with all 14 REG_SZ matches and a native screenshot.
+QMP responses can still be slow, and GTK manual-input latency is not fixed
+by this automation workaround. Cooperative GPU execution or a separate
+render worker needs additional command-ordering, reset and fence work.
+
+The current local build passes 25 OEMSK850 and 20 MSM8998 qtests. The new
+scanout check covers CPU updates to a committed surface without another
+CTL flush, row damage and reset. The rendering check also covers a clipped
+solid rectangle crossing page boundaries with padded rows. A diskless
+1350x1800 constant-color RECTLIST benchmark improved from about 260 ms to
+10 ms per draw after quantizing once and filling staged page spans. This
+microbenchmark does not establish a corresponding whole-guest speedup.
+Initial CMD black-screen behavior still reproduces without keyboard input;
+periodic scanout alone does not correct the missing initial text drawing.
