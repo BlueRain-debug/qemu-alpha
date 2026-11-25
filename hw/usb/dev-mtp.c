@@ -1152,19 +1152,20 @@ enum {
 
 static int usb_mtp_deletefn(MTPState *s, MTPObject *o, uint32_t trans)
 {
-    MTPObject *iter, *iter2, *iter2_next;
+    MTPObject *iter, *iter_next;
     int ret = 0;
 
     /*
      * TODO: Add support for Protection Status
      */
 
-    QLIST_FOREACH(iter, &o->children, list) {
-        if (iter->format == FMT_ASSOCIATION) {
-            QLIST_FOREACH_SAFE(iter2, &iter->children, list, iter2_next) {
-                ret |= usb_mtp_deletefn(s, iter2, trans);
-            }
-        }
+    QLIST_FOREACH_SAFE(iter, &o->children, list, iter_next) {
+        ret |= usb_mtp_deletefn(s, iter, trans);
+    }
+
+    /* Avoid deleting the mtp root */
+    if (o->parent == NULL) {
+        return ret ? ret : DELETE_SUCCESS;
     }
 
     if (o->format == FMT_UNDEFINED_OBJECT) {
@@ -1392,14 +1393,17 @@ static void usb_mtp_command(MTPState *s, MTPControl *c)
         if (!FLAG_SET(s, MTP_FLAG_WRITABLE)) {
             usb_mtp_queue_result(s, RES_STORE_READ_ONLY,
                                  c->trans, 0, 0, 0, 0);
+            return;
         } else if (c->argv[0] && (c->argv[0] != QEMU_STORAGE_ID)) {
             /* First parameter points to storage id or is 0 */
             usb_mtp_queue_result(s, RES_STORE_NOT_AVAILABLE, c->trans,
                                  0, 0, 0, 0);
+            return;
         } else if (c->argv[1] && !c->argv[0]) {
             /* If second parameter is specified, first must also be specified */
             usb_mtp_queue_result(s, RES_DESTINATION_UNSUPPORTED, c->trans,
                                  0, 0, 0, 0);
+            return;
         } else {
             uint32_t handle = c->argv[1];
             if (handle == 0xFFFFFFFF || handle == 0) {
@@ -1411,9 +1415,11 @@ static void usb_mtp_command(MTPState *s, MTPControl *c)
             if (o == NULL) {
                 usb_mtp_queue_result(s, RES_INVALID_OBJECT_HANDLE, c->trans,
                                      0, 0, 0, 0);
+                return;
             } else if (o->format != FMT_ASSOCIATION) {
                 usb_mtp_queue_result(s, RES_INVALID_PARENT_OBJECT, c->trans,
                                      0, 0, 0, 0);
+                return;
             }
         }
         if (o) {
@@ -1515,6 +1521,10 @@ static void usb_mtp_handle_control(USBDevice *dev, USBPacket *p,
 
     switch (request) {
     case ClassInterfaceOutRequest | 0x64:
+        if (length < sizeof(*event)) {
+            p->status = USB_RET_STALL;
+            break;
+        }
         if (*event == EVT_CANCEL_TRANSACTION) {
             g_free(s->result);
             s->result = NULL;
@@ -1696,7 +1706,7 @@ close:
     s->write_pending = false;
 }
 
-static void usb_mtp_write_metadata(MTPState *s, uint64_t dlen)
+static void usb_mtp_write_metadata(MTPState *s)
 {
     MTPData *d = s->data_out;
     ObjectInfo *dataset = (ObjectInfo *)d->data;
@@ -1704,7 +1714,15 @@ static void usb_mtp_write_metadata(MTPState *s, uint64_t dlen)
     MTPObject *o;
     MTPObject *p = usb_mtp_object_lookup(s, s->dataset.parent_handle);
     uint32_t next_handle = s->next_handle;
-    size_t filename_chars = dlen - offsetof(ObjectInfo, filename);
+    size_t filename_chars;
+
+    if (d->length <= offsetof(ObjectInfo, filename)) {
+        usb_mtp_queue_result(s, RES_INVALID_OBJECTINFO, d->trans,
+                             0, 0, 0, 0);
+        return;
+    }
+
+    filename_chars = d->length - offsetof(ObjectInfo, filename);
 
     /*
      * filename is utf-16. We're intentionally doing
@@ -1801,7 +1819,7 @@ static void usb_mtp_get_data(MTPState *s, mtp_container *container,
         if (d->data_offset == d->length) {
             /* The operation might have already failed */
             if (!s->result) {
-                usb_mtp_write_metadata(s, dlen);
+                usb_mtp_write_metadata(s);
             }
             usb_mtp_data_free(s->data_out);
             s->data_out = NULL;
@@ -1813,9 +1831,6 @@ static void usb_mtp_get_data(MTPState *s, mtp_container *container,
         d->offset += dlen;
         d->data_offset += dlen;
         if ((p->iov.size % 64) || !p->iov.size) {
-            assert((s->dataset.size == 0xFFFFFFFF) ||
-                   (s->dataset.size == d->offset));
-
             if (d->length == MTP_WRITE_BUF_SZ) {
                 d->write_status = WRITE_END;
             } else {
@@ -1905,6 +1920,13 @@ static void usb_mtp_handle_data(USBDevice *dev, USBPacket *p)
         } else if (s->result != NULL) {
             MTPControl *r = s->result;
             int length = sizeof(container) + r->argc * sizeof(uint32_t);
+
+            if (p->iov.size < length) {
+                trace_usb_mtp_stall(s->dev.addr,
+                                    "packet too small to send response");
+                p->status = USB_RET_STALL;
+                return;
+            }
             if (r->code == RES_OK) {
                 trace_usb_mtp_success(s->dev.addr, r->trans,
                                       (r->argc > 0) ? r->argv[0] : 0,

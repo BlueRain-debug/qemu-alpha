@@ -1185,7 +1185,7 @@ static IOMMUTLBEntry virtio_iommu_translate(IOMMUMemoryRegion *mr, hwaddr addr,
     GList *l;
 
     interval.low = addr;
-    interval.high = addr + 1;
+    interval.high = addr;
     granule = ctz64(s->config.page_size_mask);
 
     IOMMUTLBEntry entry = {
@@ -1749,12 +1749,14 @@ static const TypeInfo virtio_iommu_info = {
     .instance_size = sizeof(VirtIOIOMMU),
     .instance_init = virtio_iommu_instance_init,
     .class_init = virtio_iommu_class_init,
+    .secure = true,
 };
 
 static const TypeInfo virtio_iommu_memory_region_info = {
     .parent = TYPE_IOMMU_MEMORY_REGION,
     .name = TYPE_VIRTIO_IOMMU_MEMORY_REGION,
     .class_init = virtio_iommu_memory_region_class_init,
+    .secure = true,
 };
 
 static void virtio_register_types(void)

@@ -6932,8 +6932,7 @@ static abi_long do_map_shadow_stack(CPUArchState *env, abi_ulong addr,
 static pthread_mutex_t clone_lock = PTHREAD_MUTEX_INITIALIZER;
 typedef struct {
     CPUArchState *env;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
+    QemuSemaphore sem;
     pthread_t thread;
     uint32_t tid;
     abi_ulong child_tidptr;
@@ -6964,9 +6963,7 @@ static void *clone_func(void *arg)
     /* Enable signals.  */
     sigprocmask(SIG_SETMASK, &info->sigmask, NULL);
     /* Signal to the parent that we're ready.  */
-    pthread_mutex_lock(&info->mutex);
-    pthread_cond_broadcast(&info->cond);
-    pthread_mutex_unlock(&info->mutex);
+    qemu_sem_post(&info->sem);
     /* Wait until the parent has finished initializing the tls state.  */
     pthread_mutex_lock(&clone_lock);
     pthread_mutex_unlock(&clone_lock);
@@ -7071,9 +7068,7 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
         }
 
         memset(&info, 0, sizeof(info));
-        pthread_mutex_init(&info.mutex, NULL);
-        pthread_mutex_lock(&info.mutex);
-        pthread_cond_init(&info.cond, NULL);
+        qemu_sem_init(&info.sem, 0);
         info.env = new_env;
         if (flags & CLONE_CHILD_SETTID) {
             info.child_tidptr = child_tidptr;
@@ -7097,7 +7092,7 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
         pthread_attr_destroy(&attr);
         if (ret == 0) {
             /* Wait for the child to initialize.  */
-            pthread_cond_wait(&info.cond, &info.mutex);
+            qemu_sem_wait(&info.sem);
             ret = info.tid;
         } else {
             errno = ret;
@@ -7111,9 +7106,7 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
 #endif
             g_free(ts);
         }
-        pthread_mutex_unlock(&info.mutex);
-        pthread_cond_destroy(&info.cond);
-        pthread_mutex_destroy(&info.mutex);
+        qemu_sem_destroy(&info.sem);
         pthread_mutex_unlock(&clone_lock);
     } else {
         /* if no CLONE_VM, we consider it is a fork */
@@ -8250,6 +8243,7 @@ static int do_futex(CPUState *cpu, bool time64, target_ulong uaddr,
     case FUTEX_WAIT_BITSET:
         val = tswap32(val);
         break;
+#if HOST_BIG_ENDIAN == TARGET_BIG_ENDIAN
     case FUTEX_WAIT_REQUEUE_PI:
         val = tswap32(val);
         haddr2 = g2h(cpu, uaddr2);
@@ -8257,10 +8251,11 @@ static int do_futex(CPUState *cpu, bool time64, target_ulong uaddr,
     case FUTEX_LOCK_PI:
     case FUTEX_LOCK_PI2:
         break;
-    case FUTEX_WAKE:
-    case FUTEX_WAKE_BITSET:
     case FUTEX_TRYLOCK_PI:
     case FUTEX_UNLOCK_PI:
+#endif
+    case FUTEX_WAKE:
+    case FUTEX_WAKE_BITSET:
         timeout = 0;
         break;
     case FUTEX_FD:
@@ -8268,7 +8263,9 @@ static int do_futex(CPUState *cpu, bool time64, target_ulong uaddr,
         timeout = 0;
         break;
     case FUTEX_CMP_REQUEUE:
+#if HOST_BIG_ENDIAN == TARGET_BIG_ENDIAN
     case FUTEX_CMP_REQUEUE_PI:
+#endif
         val3 = tswap32(val3);
         /* fall through */
     case FUTEX_REQUEUE:
@@ -11463,6 +11460,14 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
 #endif
 #if defined(TARGET_NR_getrandom) && defined(__NR_getrandom)
     case TARGET_NR_getrandom:
+        if (arg2 == 0) {
+            /*
+             * A zero-length request has no buffer to lock, and the kernel
+             * never looks at the pointer for it, so pass the call through
+             * instead of failing on a NULL or otherwise unusable address.
+             */
+            return get_errno(getrandom(NULL, 0, arg3));
+        }
         p = lock_user(VERIFY_WRITE, arg1, arg2, 0);
         if (!p) {
             return -TARGET_EFAULT;
@@ -11550,7 +11555,7 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
             struct itimerval value;
 
             ret = get_errno(getitimer(arg1, &value));
-            if (!is_error(ret) && arg2) {
+            if (!is_error(ret)) {
                 if (copy_to_user_timeval(arg2,
                                          &value.it_interval)
                     || copy_to_user_timeval(arg2 + sizeof(struct target_timeval),
@@ -11665,7 +11670,7 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
             struct target_sysinfo *target_value;
             struct sysinfo value;
             ret = get_errno(sysinfo(&value));
-            if (!is_error(ret) && arg1)
+            if (!is_error(ret))
             {
                 if (!lock_user_struct(VERIFY_WRITE, target_value, arg1, 0))
                     return -TARGET_EFAULT;
@@ -12248,7 +12253,7 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
                 return -TARGET_EFAULT;
             }
             ret = get_errno(safe_nanosleep(&req, &rem));
-            if (is_error(ret) && arg2) {
+            if (ret == -TARGET_EINTR && arg2) {
                 if (host_to_target_timespec(arg2, &rem)) {
                     return -TARGET_EFAULT;
                 }

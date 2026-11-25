@@ -25,6 +25,7 @@
 #include "hw/core/cpu.h"
 #include "hw/hppa/hppa_hardware.h"
 #include "qemu/plugin.h"
+#include "qemu/timer.h"
 
 static void eval_interrupt(HPPACPU *cpu)
 {
@@ -78,14 +79,34 @@ const MemoryRegionOps hppa_io_eir_ops = {
 
 void hppa_cpu_alarm_timer(void *opaque)
 {
+    HPPACPU *cpu = opaque;
+
     /* Raise interrupt 0.  */
     io_eir_write(opaque, 0, 0, 4);
+
+    /*
+     * Re-arm the alarm one counter wrap later.  The hardware compares CR16
+     * against a free running 32-bit counter, so the match recurs every
+     * 2^32 counts, which is 2^34 ns at the 250 MHz shown to the guest.
+     * This brings the model closer to that and limits a lost tick to a
+     * 17 s stall instead of a dead clock.
+     */
+    cpu->env.cr[CR_IT] += 1ULL << 34;
+    timer_mod(cpu->alarm_timer, cpu->env.cr[CR_IT]);
 }
 
 void HELPER(write_eirr)(CPUHPPAState *env, target_ulong val)
 {
-    env->cr[CR_EIRR] &= ~val;
+    /*
+     * Clear EIRR under the BQL.  io_eir_write() sets EIRR bits from the main
+     * loop thread for the interval timer and for device interrupts, and it
+     * holds the BQL.  This helper runs in the vCPU thread, so an unlocked
+     * read-modify-write here drops any bit set between the load and the
+     * store.  A dropped interval timer bit is never re-armed and the guest
+     * clock stops, which is how HP-UX 10.20 installs wedged under load.
+     */
     bql_lock();
+    env->cr[CR_EIRR] &= ~val;
     eval_interrupt(env_archcpu(env));
     bql_unlock();
 }
@@ -235,53 +256,11 @@ void hppa_cpu_do_interrupt(CPUState *cs)
     }
 
     if (qemu_loglevel_mask(CPU_LOG_INT)) {
-        static const char * const names[] = {
-            [EXCP_HPMC]          = "high priority machine check",
-            [EXCP_POWER_FAIL]    = "power fail interrupt",
-            [EXCP_RC]            = "recovery counter trap",
-            [EXCP_EXT_INTERRUPT] = "external interrupt",
-            [EXCP_LPMC]          = "low priority machine check",
-            [EXCP_ITLB_MISS]     = "instruction tlb miss fault",
-            [EXCP_IMP]           = "instruction memory protection trap",
-            [EXCP_ILL]           = "illegal instruction trap",
-            [EXCP_BREAK]         = "break instruction trap",
-            [EXCP_PRIV_OPR]      = "privileged operation trap",
-            [EXCP_PRIV_REG]      = "privileged register trap",
-            [EXCP_OVERFLOW]      = "overflow trap",
-            [EXCP_COND]          = "conditional trap",
-            [EXCP_ASSIST]        = "assist exception trap",
-            [EXCP_DTLB_MISS]     = "data tlb miss fault",
-            [EXCP_NA_ITLB_MISS]  = "non-access instruction tlb miss",
-            [EXCP_NA_DTLB_MISS]  = "non-access data tlb miss",
-            [EXCP_DMP]           = "data memory protection trap",
-            [EXCP_DMB]           = "data memory break trap",
-            [EXCP_TLB_DIRTY]     = "tlb dirty bit trap",
-            [EXCP_PAGE_REF]      = "page reference trap",
-            [EXCP_ASSIST_EMU]    = "assist emulation trap",
-            [EXCP_HPT]           = "high-privilege transfer trap",
-            [EXCP_LPT]           = "low-privilege transfer trap",
-            [EXCP_TB]            = "taken branch trap",
-            [EXCP_DMAR]          = "data memory access rights trap",
-            [EXCP_DMPI]          = "data memory protection id trap",
-            [EXCP_UNALIGN]       = "unaligned data reference trap",
-            [EXCP_PER_INTERRUPT] = "performance monitor interrupt",
-            [EXCP_SYSCALL]       = "syscall",
-            [EXCP_SYSCALL_LWS]   = "syscall-lws",
-            [EXCP_TOC]           = "TOC (transfer of control)",
-        };
-
         FILE *logfile = qemu_log_trylock();
         if (logfile) {
-            const char *name = NULL;
-
-            if (i >= 0 && i < ARRAY_SIZE(names)) {
-                name = names[i];
-            }
-            if (name) {
-                fprintf(logfile, "INT: cpu %d %s\n", cs->cpu_index, name);
-            } else {
-                fprintf(logfile, "INT: cpu %d unknown %d\n", cs->cpu_index, i);
-            }
+            const char *name = hppa_exception_name(i);
+            fprintf(logfile, "INT: cpu %d excp %d (%s)\n",
+                             cs->cpu_index, i, name);
             hppa_cpu_dump_state(cs, logfile, 0);
             qemu_log_unlock(logfile);
         }

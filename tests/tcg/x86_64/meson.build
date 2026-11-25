@@ -1,7 +1,3 @@
-cc = 'x86_64-linux-gnu-gcc'
-cc_alt = ['x86_64-redhat-linux-gcc']
-cc_dockerfile = 'debian-amd64-cross'
-
 subdir('system')
 
 tests = []
@@ -51,7 +47,10 @@ tests += {
     'exe_name': 'test-x86_64'
   },
   '../i386/test-i386-adcox.c': {'cflags': ['-O2']},
+  '../i386/test-i386-blendv.c': {},
   '../i386/test-i386-bmi2.c': {'cflags': ['-O2', '-fwrapv']},
+  '../i386/test-idiv-overflow.c': {},
+  '../i386/test-i386-enter.c': {'cflags': ['-O2', '-fomit-frame-pointer']},
 }
 
 tests += {
@@ -61,6 +60,7 @@ tests += {
     'cflags': ['-pthread', '-Wl,--no-warn-rwx-segments']
   },
   'fma.c': {},
+  'fxsave.c': {},
   'noexec.c': {},
   'segment-prefixes.c': {},
   'test-1648.c': {},
@@ -72,9 +72,9 @@ tests += {
 if 'qemu-x86_64' in emulators
   tcg_tests += {
     'x86_64-linux-user': {
-      'cc': cc,
-      'cc_alt': cc_alt,
-      'cc_dockerfile': cc_dockerfile,
+      'cc': 'x86_64-linux-gnu-gcc',
+      'cc_alt': ['x86_64-redhat-linux-gcc'],
+      'cc_dockerfile': 'debian-amd64-cross',
       'folder': 'x86_64',
       'gdb_arch': 'x86_64',
       'qemu': emulators['qemu-x86_64'],

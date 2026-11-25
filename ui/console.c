@@ -28,6 +28,7 @@
 #include "ui/vgafont.h"
 #include "hw/core/qdev.h"
 #include "qapi/error.h"
+#include "qapi/qapi-builtin-type-infos.h"
 #include "qapi/qapi-commands-ui.h"
 #include "qapi/visitor.h"
 #include "qemu/coroutine.h"
@@ -535,7 +536,7 @@ qemu_graphic_console_class_init(ObjectClass *oc, const void *data)
                                    offsetof(QemuGraphicConsole, device),
                                    object_property_allow_set_link,
                                    OBJ_PROP_LINK_STRONG);
-    object_class_property_add(oc, "head", "uint32",
+    object_class_property_add(oc, "head", "uint32", &uint32_type_info,
                               qemu_graphic_console_prop_get_head,
                               NULL, NULL, NULL);
 
@@ -740,6 +741,9 @@ void qemu_console_update(QemuConsole *con, int x, int y, int w, int h)
     y = MIN(y, height);
     w = MIN(w, width - x);
     h = MIN(h, height - y);
+    if (w <= 0 || h <= 0) {
+        return;
+    }
 
     dpy_gfx_update_texture(con, con->surface, x, y, w, h);
     QLIST_FOREACH(dcl, &s->listeners, next) {
@@ -825,9 +829,9 @@ bool qemu_console_check_format(QemuConsole *con,
 
 static void dpy_refresh(DisplayState *s)
 {
-    DisplayChangeListener *dcl;
+    DisplayChangeListener *dcl, *next_dcl;
 
-    QLIST_FOREACH(dcl, &s->listeners, next) {
+    QLIST_FOREACH_SAFE(dcl, &s->listeners, next, next_dcl) {
         if (dcl->ops->dpy_refresh) {
             dcl->ops->dpy_refresh(dcl);
         }

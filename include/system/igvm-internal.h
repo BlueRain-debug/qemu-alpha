@@ -18,10 +18,11 @@
 #include "system/confidential-guest-support.h"
 #include <igvm/igvm.h>
 
-typedef struct IgvmMemoryRegion {
-    QTAILQ_ENTRY(IgvmMemoryRegion) next;
-    MemoryRegion *mr;
-} IgvmMemoryRegion;
+typedef struct IgvmMemoryRegion IgvmMemoryRegion;
+
+#define TYPE_IGVM_MEMORY_REGION "igvm-memory-region"
+
+OBJECT_DECLARE_SIMPLE_TYPE(IgvmMemoryRegion, IGVM_MEMORY_REGION)
 
 struct IgvmCfg {
     Object parent_obj;
@@ -32,6 +33,11 @@ struct IgvmCfg {
      *           format.
      */
     char *filename;
+    /*
+     * cmdline: Command line for the software loaded from the IGVM file,
+     *          if it asks for one.
+     */
+    char *cmdline;
     IgvmHandle file;
     ResettableState reset_state;
     QTAILQ_HEAD(, IgvmMemoryRegion) memory_regions;
@@ -63,9 +69,6 @@ struct QIgvm {
      */
     struct sev_id_block *id_block;
     struct sev_id_authentication *id_auth;
-
-    /* Define the guest policy for SEV guests */
-    uint64_t sev_policy;
 
     /* These variables keep track of contiguous page regions */
     IGVM_VHS_PAGE_DATA region_prev_page_data;

@@ -1,11 +1,6 @@
 env = find_program('env')
 
 docker_wrapper = find_program('../docker/docker.py')
-if get_option('gdb') != ''
-  gdb = find_program(get_option('gdb'), required: true)
-else
-  gdb = find_program(['gdb-multiarch', 'gdb'], required: false)
-endif
 prog_check_plugin_output = find_program('./scripts/check_plugin_output.sh')
 prog_gdb_test = find_program('../guest-debug/run-test.py')
 prog_record_replay = find_program('./scripts/record_replay.sh')
@@ -47,6 +42,7 @@ tcg_tests = {}
 #           'gdb_test': ['gdb test args'],
 #           'gdb_feat': ['feature name, must be present in gdb_feat_version'],
 #           'env_var': ['VAR=value', ...],
+#           'protocol': 'meson test protocol, default is exitcode',
 #           'wrapper': [program_to_launch_test, 'args'...],
 #           'plugin_test': {
 #             'plugin': 'plugin_name',
@@ -186,6 +182,7 @@ subdir('mips64el')
 subdir('or1k')
 subdir('ppc64')
 subdir('ppc64le')
+subdir('riscv32')
 subdir('riscv64')
 subdir('s390x')
 subdir('sh4')
@@ -197,6 +194,7 @@ image_targets = {}
 exe_targets = []
 # Finally, we can create all test executables and test targets
 foreach target, plan: tcg_tests
+  target_exe_targets = []
   if target.startswith('multiarch-')
     # those tests are included by architecture files if needed
     continue
@@ -326,8 +324,8 @@ foreach target, plan: tcg_tests
       # return a clear error if user misspell a setup entry
       foreach key, _ : setup
         allowed = ['exe_name', 'env_var', 'expected_output', 'cc_feat', 'cflags',
-                   'depends', 'gdb_feat', 'gdb_test', 'plugin_test', 'qemu_args',
-                   'test_name', 'wrapper']
+                   'depends', 'gdb_feat', 'gdb_test', 'plugin_test', 'protocol',
+                   'qemu_args', 'test_name', 'wrapper']
         if key not in allowed
           error('unknown tcg setup entry \'' + key + '\' for test ' + src +
                 ' (possible: [' + ', '.join(allowed) + '])')
@@ -358,11 +356,19 @@ foreach target, plan: tcg_tests
       file = files(src)
       exe_name = fs.stem(src)
       if 'exe_name' in setup
+        if exe_name == setup['exe_name']
+          error('test ' + exe_name +
+                ' has "exe_name" that matches default one, please remove it')
+        endif
         exe_name = setup['exe_name']
       endif
 
       test_name = exe_name
       if 'test_name' in setup
+        if test_name == setup['test_name']
+          error('test ' + test_name +
+                ' has "test_name" that matches default one, please remove it')
+        endif
         test_name = setup['test_name']
       endif
       if 'gdb_test' in setup
@@ -432,7 +438,7 @@ foreach target, plan: tcg_tests
 
       # build executable if needed
       if exe_name not in built_tests
-        exe = custom_target(exe_name,
+        exe = custom_target(exe_name + '.test',
                             input: file,
                             command: [cc, '@INPUT@',
                                       '-o', '@OUTPUT@', '-static',
@@ -451,7 +457,7 @@ foreach target, plan: tcg_tests
                             depends: exe_depends,
                             depend_files: build_test_depend_files,
                             build_by_default: false)
-        exe_targets += exe
+        target_exe_targets += exe
         built_tests += {exe_name: exe}
       endif
 
@@ -523,8 +529,11 @@ foreach target, plan: tcg_tests
       endif
 
       if skip_test != ''
+        test_protocol = 'exitcode'
         # still declare test, but skip it and print reason
         cmd = ['sh', '-c', 'echo "' + skip_test + '" && exit 77']
+      else
+        test_protocol = 'protocol' in setup ? setup['protocol'] : 'exitcode'
       endif
 
       # Do not add a skipped test when compiler is missing,
@@ -533,11 +542,17 @@ foreach target, plan: tcg_tests
         test(test_name, env, args: cmd,
              depends: test_depends,
              timeout: 120,
+             protocol: test_protocol,
              suite: ['tcg', 'tcg-' + target])
       endif
       added_tests += {test_name: true}
     endforeach
   endforeach
+  if target_exe_targets.length() > 0
+    # finally create a top level target to rebuild all tests for this target
+    alias_target('tcg-tests-' + target, target_exe_targets)
+  endif
+  exe_targets += target_exe_targets
 endforeach
 
 if exe_targets.length() > 0

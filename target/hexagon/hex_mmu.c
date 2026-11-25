@@ -12,6 +12,7 @@
 #include "system/cpus.h"
 #include "internal.h"
 #include "exec/cpu-interrupt.h"
+#include "accel/tcg/cpu-loop.h"
 #include "cpu_helper.h"
 #include "exec/cputlb.h"
 #include "hex_mmu.h"
@@ -19,6 +20,7 @@
 #include "sys_macros.h"
 #include "hw/hexagon/hexagon_tlb.h"
 #include "hw/hexagon/hexagon_globalreg.h"
+#include "hex_interrupts.h"
 
 static inline void hex_log_tlbw(uint32_t index, uint64_t entry)
 {
@@ -27,19 +29,34 @@ static inline void hex_log_tlbw(uint32_t index, uint64_t entry)
                   index, entry);
 }
 
+static void hex_tlb_flush_all(CPUState *cs)
+{
+    tlb_flush_by_mmuidx_all_cpus_synced(cs, MMU_IDX_ALL);
+}
+
 void hex_tlbw(CPUHexagonState *env, uint32_t index, uint64_t value)
 {
     uint32_t myidx = fTLB_NONPOW2WRAP(fTLB_IDXMASK(index));
     HexagonTLBState *tlb = env_archcpu(env)->tlb;
-    uint64_t old_entry = hexagon_tlb_read(tlb, myidx);
-
+    uint64_t old_entry = hexagon_tlb_write(tlb, myidx, value);
     bool old_entry_valid = extract64(old_entry, 63, 1);
     if (old_entry_valid && hexagon_cpu_mmu_enabled(env)) {
-        CPUState *cs = env_cpu(env);
-        tlb_flush(cs);
+        hex_tlb_flush_all(env_cpu(env));
     }
-    hexagon_tlb_write(tlb, myidx, value);
     hex_log_tlbw(myidx, value);
+}
+
+void hex_tlb_invalidate_asid(CPUHexagonState *env, uint32_t asid)
+{
+    HexagonTLBState *tlb = env_archcpu(env)->tlb;
+    uint32_t invalidated = hexagon_tlb_invalidate_asid(tlb, asid);
+
+    qemu_log_mask(CPU_LOG_MMU,
+                  "tlbinvasid: asid 0x%02" PRIx32 ", %" PRIu32 " entries\n",
+                  asid, invalidated);
+    if (invalidated && hexagon_cpu_mmu_enabled(env)) {
+        hex_tlb_flush_all(env_cpu(env));
+    }
 }
 
 void hex_mmu_on(CPUHexagonState *env)
@@ -56,11 +73,12 @@ void hex_mmu_off(CPUHexagonState *env)
     tlb_flush(cs);
 }
 
-void hex_mmu_mode_change(CPUHexagonState *env)
+void hex_mmu_asid_change(CPUHexagonState *env)
 {
-    qemu_log_mask(CPU_LOG_MMU, "Hexagon mode change!\n");
     CPUState *cs = env_cpu(env);
-    tlb_flush(cs);
+
+    qemu_log_mask(CPU_LOG_MMU, "Hexagon ASID change!\n");
+    tlb_flush_by_mmuidx(cs, MMU_IDX_ALL);
 }
 
 bool hex_tlb_find_match(CPUHexagonState *env, uint32_t VA,
@@ -117,7 +135,7 @@ int hex_tlb_check_overlap(CPUHexagonState *env, uint64_t entry, uint64_t index)
 }
 
 #ifdef CONFIG_HMP
-void dump_mmu(MonitorHMP *hmp, CPUHexagonState *env)
+void hexagon_dump_mmu(MonitorHMP *hmp, CPUHexagonState *env)
 {
     HexagonCPU *cpu = env_archcpu(env);
     hexagon_tlb_dump(hmp, cpu->tlb);
@@ -156,7 +174,7 @@ static inline void print_thread_states(const char *str)
     }
 }
 
-void hex_tlb_lock(CPUHexagonState *env)
+void hex_tlb_lock(CPUHexagonState *env, uint32_t PC)
 {
     qemu_log_mask(CPU_LOG_MMU, "hex_tlb_lock: " TARGET_FMT_ld "\n",
                   env->threadId);
@@ -170,7 +188,6 @@ void hex_tlb_lock(CPUHexagonState *env)
     uint8_t tlb_lock = GET_SYSCFG_FIELD(SYSCFG_TLBLOCK, syscfg);
     if (tlb_lock) {
         if (env->tlb_lock_state == HEX_LOCK_QUEUED) {
-            env->next_PC += 4;
             env->tlb_lock_count++;
             env->tlb_lock_state = HEX_LOCK_OWNER;
             SET_SYSCFG_FIELD(env, SYSCFG_TLBLOCK, 1);
@@ -178,19 +195,24 @@ void hex_tlb_lock(CPUHexagonState *env)
         }
         if (env->tlb_lock_state == HEX_LOCK_OWNER) {
             qemu_log_mask(CPU_LOG_MMU | LOG_GUEST_ERROR,
-                          "Double tlblock at PC: 0x%" PRIx32
-                          ", thread may hang\n",
-                          env->next_PC);
-            env->next_PC += 4;
+                "Double tlblock at PC: 0x" TARGET_FMT_lx
+                ", thread may hang\n", PC);
             CPUState *cs = env_cpu(env);
             cpu_interrupt(cs, CPU_INTERRUPT_HALT);
+            cpu_loop_exit(cs);
             return;
         }
         env->tlb_lock_state = HEX_LOCK_WAITING;
+        /*
+         * The PC has already been advanced past this packet.  Rewind it
+         * so that the thread re-executes the tlblock when it is woken by
+         * the thread that releases the lock.
+         */
+        env->gpr[HEX_REG_PC] = PC;
         CPUState *cs = env_cpu(env);
         cpu_interrupt(cs, CPU_INTERRUPT_HALT);
+        cpu_loop_exit(cs);
     } else {
-        env->next_PC += 4;
         env->tlb_lock_count++;
         env->tlb_lock_state = HEX_LOCK_OWNER;
         SET_SYSCFG_FIELD(env, SYSCFG_TLBLOCK, 1);
@@ -271,6 +293,8 @@ void hex_tlb_unlock(CPUHexagonState *env)
         unlock_thread->tlb_lock_state = HEX_LOCK_QUEUED;
         SET_SYSCFG_FIELD(unlock_thread, SYSCFG_TLBLOCK, 1);
         cpu_interrupt(cs, CPU_INTERRUPT_TLB_UNLOCK);
+        hex_interrupt_update(unlock_thread);
+        qemu_cpu_kick(cs);
     }
 
     if (qemu_loglevel_mask(CPU_LOG_MMU)) {

@@ -42,16 +42,14 @@
 #include "qobject/qstring.h"
 #include "qobject/qbool.h"
 
-/* GIC inputs on native ARM boards can exceed the legacy 256-pin limit. */
-#define MAX_IRQ 1024
+#define ACCEPT_TIMEOUT_MS 250
+#define ACCEPT_RETRIES (4 * 50)
 
 #ifndef _WIN32
-# define SOCKET_TIMEOUT 50
 # define CMD_EXEC   "exec "
 # define DEV_STDERR "/dev/fd/2"
 # define DEV_NULL   "/dev/null"
 #else
-# define SOCKET_TIMEOUT 50000
 # define CMD_EXEC   ""
 # define DEV_STDERR "2"
 # define DEV_NULL   "nul"
@@ -88,7 +86,7 @@ struct QTestState
 #endif
     int expected_status;
     bool big_endian;
-    bool irq_level[MAX_IRQ];
+    GArray *irq_level;
     GString *rx;
     QTestTransportOps ops;
     GList *pending_events;
@@ -117,38 +115,43 @@ static int init_socket(const char *socket_path)
     return sock;
 }
 
-static int socket_accept(int sock)
+static int qtest_socket_accept(QTestState *s, int sock)
 {
     struct sockaddr_un addr;
     socklen_t addrlen;
-    int ret;
-    /*
-     * timeout unit of blocking receive calls is different among platforms.
-     * It's in seconds on non-Windows platforms but milliseconds on Windows.
-     */
+    int ret = -1;
+    size_t i;
 #ifndef _WIN32
-    struct timeval timeout = { .tv_sec = SOCKET_TIMEOUT,
-                               .tv_usec = 0 };
+    struct timeval timeout = { .tv_sec = 0,
+                               .tv_usec = ACCEPT_TIMEOUT_MS * 1000ul };
 #else
-    DWORD timeout = SOCKET_TIMEOUT;
+    DWORD timeout = ACCEPT_TIMEOUT_MS;
 #endif
 
     if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
                    (void *)&timeout, sizeof(timeout))) {
         fprintf(stderr, "%s failed to set SO_RCVTIMEO: %s\n",
                 __func__, strerror(errno));
-        close(sock);
         return -1;
     }
 
-    do {
+    for (i = 0; i < ACCEPT_RETRIES ; i++) {
+        if (!qtest_probe_child(s)) {
+            fprintf(stderr,
+                    "child process unexpectedly exited, skipping socket accept\n");
+            return -1;
+        }
+
         addrlen = sizeof(addr);
         ret = accept(sock, (struct sockaddr *)&addr, &addrlen);
-    } while (ret == -1 && errno == EINTR);
+        if (ret == -1 && (errno == EINTR || errno == EAGAIN)) {
+            continue;
+        }
+        break;
+    }
     if (ret == -1) {
         fprintf(stderr, "%s failed: %s\n", __func__, strerror(errno));
     }
-    close(sock);
 
     return ret;
 }
@@ -491,7 +494,7 @@ static QTestState *qtest_init_internal(const char *qemu_bin,
                                        void *opaque)
 {
     QTestState *s;
-    int sock, qmpsock, i;
+    int sock, qmpsock;
     g_autofree gchar *socket_path = qtest_socket_path("sock");
     g_autofree gchar *qmp_socket_path = qtest_socket_path("qmp");
     g_autofree gchar *args = qtest_qemu_args(extra_args);
@@ -515,9 +518,7 @@ static QTestState *qtest_init_internal(const char *qemu_bin,
     qtest_client_set_tx_handler(s, qtest_client_socket_send);
 
     s->rx = g_string_new("");
-    for (i = 0; i < MAX_IRQ; i++) {
-        s->irq_level[i] = false;
-    }
+    s->irq_level = g_array_new(false, true, sizeof(bool));
 
     s->fd = -1;
     s->qmp_fd = -1;
@@ -550,13 +551,15 @@ void qtest_connect(QTestState *s)
     g_autofree gchar *qmp_socket_path = qtest_socket_path("qmp");
 
     g_assert(s->sock >= 0 && s->qmpsock >= 0);
-    s->fd = socket_accept(s->sock);
+    s->fd = qtest_socket_accept(s, s->sock);
     if (s->fd >= 0) {
-        s->qmp_fd = socket_accept(s->qmpsock);
+        s->qmp_fd = qtest_socket_accept(s, s->qmpsock);
     }
     unlink(socket_path);
     unlink(qmp_socket_path);
     g_assert(s->fd >= 0 && s->qmp_fd >= 0);
+    close(s->sock);
+    close(s->qmpsock);
     s->sock = s->qmpsock = -1;
     /* ask endianness of the target */
     s->big_endian = qtest_query_target_endianness(s);
@@ -664,8 +667,9 @@ QTestState *qtest_init_with_serial(const char *extra_args, int *sock_fd)
     qts = qtest_initf("-chardev socket,id=s0,path=%s -serial chardev:s0 %s",
                       sock_path, extra_args);
 
-    *sock_fd = socket_accept(sock_fd_init);
+    *sock_fd = qtest_socket_accept(qts, sock_fd_init);
 
+    close(sock_fd_init);
     unlink(sock_path);
     g_free(sock_path);
     rmdir(sock_dir);
@@ -683,6 +687,7 @@ void qtest_quit(QTestState *s)
     close(s->fd);
     close(s->qmp_fd);
     g_string_free(s->rx, true);
+    g_array_unref(s->irq_level);
 
     for (GList *it = s->pending_events; it != NULL; it = it->next) {
         qobject_unref((QDict *)it->data);
@@ -768,12 +773,14 @@ redo:
         ret = qemu_strtol(words[2], NULL, 0, &irq);
         g_assert(!ret);
         g_assert_cmpint(irq, >=, 0);
-        g_assert_cmpint(irq, <, MAX_IRQ);
 
+        if (s->irq_level->len <= irq) {
+            g_array_set_size(s->irq_level, irq + 1);
+        }
         if (strcmp(words[1], "raise") == 0) {
-            s->irq_level[irq] = true;
+            g_array_index(s->irq_level, bool, irq) = true;
         } else {
-            s->irq_level[irq] = false;
+            g_array_index(s->irq_level, bool, irq) = false;
         }
 
         g_strfreev(words);
@@ -1182,7 +1189,10 @@ bool qtest_get_irq(QTestState *s, int num)
     /* dummy operation in order to make sure irq is up to date */
     qtest_inb(s, 0);
 
-    return s->irq_level[num];
+    if (s->irq_level->len <= num) {
+        return false;
+    }
+    return g_array_index(s->irq_level, bool, num);
 }
 
 void qtest_module_load(QTestState *s, const char *prefix, const char *libname)
@@ -2090,9 +2100,7 @@ QTestState *qtest_inproc_init(QTestState **s, bool log, const char* arch,
     qts->pending_events = NULL;
     *s = qts; /* Expose qts early on, since the query endianness relies on it */
     qts->wstatus = 0;
-    for (int i = 0; i < MAX_IRQ; i++) {
-        qts->irq_level[i] = false;
-    }
+    qts->irq_level = g_array_new(false, true, sizeof(bool));
 
     qtest_client_set_rx_handler(qts, qtest_client_inproc_recv_line);
 

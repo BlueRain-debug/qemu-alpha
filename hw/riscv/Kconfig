@@ -6,6 +6,10 @@ config RISCV_NUMA
 
 config IBEX
     bool
+    select SSI
+
+config RISCV_DEVICE_COMMON
+    bool
 
 # RISC-V machines in alphabetical order
 
@@ -68,6 +72,25 @@ config RISCV_VIRT
     select PLATFORM_BUS
     select ACPI
     select ACPI_PCI
+    select RISCV_DEVICE_COMMON
+
+config RISCV_SERVER_PLATFORM_REF
+    bool
+    default y
+    depends on RISCV64
+    imply TPM_TIS_SYSBUS
+    select GOLDFISH_RTC
+    select PCI_EXPRESS_GENERIC_BRIDGE
+    select PCIE_DEVICES
+    select PFLASH_CFI01
+    select PLATFORM_BUS
+    select RISCV_ACLINT
+    select RISCV_APLIC
+    select RISCV_IMSIC
+    select RISCV_IOMMU
+    select RISCV_NUMA
+    select SERIAL_MM
+    select RISCV_DEVICE_COMMON
 
 config SHAKTI_C
     bool
@@ -127,7 +150,7 @@ config TENSTORRENT
     select RISCV_ACLINT
     select RISCV_APLIC
     select RISCV_IMSIC
-    select SERIAL_MM
+    select DW8250
     select DEVICE_TREE
     select DESIGNWARE_I2C
     select DS1338
@@ -164,3 +187,17 @@ config K230
     select K230_WDT
     select K230_GSDMA
     select K230_DECOMP_GZIP
+
+config SOPHGO_CV1800B
+    bool
+    depends on RISCV64
+    select RISCV_ACLINT
+    select SIFIVE_PLIC
+    select SOPHGO_CV1800B_CLK
+    select DW8250
+
+config MILKV_DUO
+    bool
+    depends on RISCV64
+    default y
+    select SOPHGO_CV1800B

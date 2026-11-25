@@ -1105,6 +1105,13 @@ vu_set_mem_table_exec(VuDev *dev, VhostUserMsg *vmsg)
     vu_remove_all_mem_regs(dev);
 
     DPRINT("Nregions: %u\n", memory->nregions);
+
+    if (memory->nregions > VHOST_MEMORY_BASELINE_NREGIONS) {
+        vu_panic(dev, "Invalid set_mem_table nregions: %u > %u",
+                 memory->nregions, VHOST_MEMORY_BASELINE_NREGIONS);
+        return false;
+    }
+
     for (i = 0; i < memory->nregions; i++) {
         _vu_add_mem_reg(dev, &memory->regions[i], vmsg->fds[i]);
         close(vmsg->fds[i]);
@@ -1112,6 +1119,7 @@ vu_set_mem_table_exec(VuDev *dev, VhostUserMsg *vmsg)
 
     if (dev->postcopy_listening) {
         /* Send the message back to qemu with the addresses filled in */
+        vmsg->payload.memory = m;
         vmsg->fd_num = 0;
         if (!vu_send_reply(dev, dev->sock, vmsg)) {
             vu_panic(dev, "failed to respond to set-mem-table for postcopy");

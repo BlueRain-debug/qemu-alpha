@@ -549,10 +549,10 @@ typedef enum {
     Irrr_UMULH         = 0x9bc07c00,
     Irrr_UDIV          = 0x1ac00800,
     Irrr_SDIV          = 0x1ac00c00,
-    Irrr_SMAX          = 0x1ac00600,
-    Irrr_UMAX          = 0x1ac00640,
-    Irrr_SMIN          = 0x1ac00680,
-    Irrr_UMIN          = 0x1ac006c0,
+    Irrr_SMAX          = 0x1ac06000,
+    Irrr_UMAX          = 0x1ac06400,
+    Irrr_SMIN          = 0x1ac06800,
+    Irrr_UMIN          = 0x1ac06c00,
 
     /* Data-processing (3 source) instructions.  */
     Irrrr_MADD         = 0x1b000000,
@@ -3079,6 +3079,17 @@ static const TCGOutOpStore outop_st16 = {
 static const TCGOutOpStore outop_st = {
     .base.static_constraint = C_O0_I2(rz, r),
     .out_r = tcg_out_st,
+};
+
+static void tgen_lea(TCGContext *s, TCGType type, TCGReg a0, TCGReg a1,
+                     TCGReg a2, unsigned sh, tcg_target_long imm)
+{
+    tcg_out_insn(s, addsub_realshift, ADD_LSL, type, a0, a1, a2, sh);
+}
+
+static const TCGOutOpLea outop_lea = {
+    .base.static_constraint = C_O1_I2(r, r, r),
+    .out = tgen_lea,
 };
 
 static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,

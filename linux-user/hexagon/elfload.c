@@ -53,6 +53,21 @@ abi_ulong get_elf_hwcap(CPUState *cs)
     case HEX_VER_V73:
         hwcaps = HWCAP_HEXAGON_ISA_V73;
         break;
+    case HEX_VER_V75:
+        hwcaps = HWCAP_HEXAGON_ISA_V75;
+        break;
+    case HEX_VER_V79:
+        hwcaps = HWCAP_HEXAGON_ISA_V79;
+        break;
+    case HEX_VER_V81:
+        hwcaps = HWCAP_HEXAGON_ISA_V81;
+        break;
+    case HEX_VER_V83:
+        hwcaps = HWCAP_HEXAGON_ISA_V83;
+        break;
+    case HEX_VER_V85:
+        hwcaps = HWCAP_HEXAGON_ISA_V85;
+        break;
     default:
         return 0;
     }
@@ -104,6 +119,10 @@ const char *get_elf_cpu_model(uint32_t eflags)
         return "v79";
     case 0x81:
         return "v81";
+    case 0x83:
+        return "v83";
+    case 0x85:
+        return "v85";
     }
 
     err = snprintf(buf, sizeof(buf), "unknown (0x%x)", eflags);

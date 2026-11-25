@@ -1,6 +1,3 @@
-cc = 'i686-linux-gnu-gcc'
-cc_dockerfile = 'debian-i686-cross'
-
 subdir('system')
 
 tests = []
@@ -13,6 +10,7 @@ tests += {
   },
   'test-aes.c': {'cflags': ['-O1', '-msse2', '-maes']},
   'test-i386-adcox.c': {'cflags': ['-O2']},
+  'test-i386-blendv.c': {'cflags': ['-msse4.1']},
   'test-i386-bmi2.c': {'cflags': ['-O2', '-fwrapv']},
   'test-i386-f2xm1.c': {},
   'test-i386-fbstp.c': {},
@@ -28,6 +26,7 @@ tests += {
   'test-i386-fxtract.c': {},
   'test-i386-fyl2x.c': {},
   'test-i386-fyl2xp1.c': {},
+  'test-i386-opt-rol.c': {},
   'test-i386-opt-shr.c': {},
   'test-i386-pcmpistri.c': {'cflags': ['-msse4.2']},
   'test-i386-pseudo-denormal.c': {},
@@ -37,6 +36,8 @@ tests += {
     'cflags': [files('test-i386-code16.S'), files('test-i386-vm86.S'),
                '-lm', '-fno-pie', '-Wl,--no-warn-rwx-segments'],
   },
+  'test-idiv-overflow.c': {},
+  'test-i386-enter.c': {'cflags': ['-O2', '-fomit-frame-pointer']},
   '../multiarch/sha512.c': {
      'exe_name': 'sha512-sse',
      'cflags': ['-msse4.1', '-O3'],
@@ -46,8 +47,8 @@ tests += {
 if 'qemu-i386' in emulators
   tcg_tests += {
     'i386-linux-user': {
-      'cc': cc,
-      'cc_dockerfile': cc_dockerfile,
+      'cc': 'i686-linux-gnu-gcc',
+      'cc_dockerfile': 'debian-i686-cross',
       'folder': 'i386',
       'gdb_arch': 'i386',
       'qemu': emulators['qemu-i386'],

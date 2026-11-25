@@ -107,7 +107,7 @@ an issue as a normal bug.
   possibility of large memory peaks and apply countermeasures to
   provide continuity of host operations. It is typical for the Linux
   OOM killer to reap the process triggering host memory overcommit
-  in the case of exccessive usage, offering a degree of protection.
+  in the case of excessive usage, offering a degree of protection.
   As such, bugs which can lead to excessive/unbounded memory allocations
   will usually not be classified as security flaws, but should be
   fixed as hardening bugs.
@@ -168,7 +168,7 @@ eligible for CVE assignment. Annotations will be extended to other backend
 and object types over time, to make their security status explicit.
 
 It is possible to control or identify the usage of types that do not offer
-an explicit security boundary using the ``insecure-types`` parameter to the
+an explicit security boundary using the ``insecure-input`` parameter to the
 ``-compat`` argument, which accepts three values:
 
  * accept: usage of any type will be permitted. This is the current
@@ -320,3 +320,26 @@ encryption and authorization control policy on client connections.
 In summary, the monitor console is considered a privileged control interface to
 QEMU and as such should only be made accessible to a trusted management
 application or user.
+
+Block device network protocols (NBD, NFS, etc.)
+'''''''''''''''''''''''''''''''''''''''''''''''
+
+When using QEMU to access remote storage over a network (such as QEMU
+acting as an NBD or NFS client) or to provide remote storage access
+(such as QEMU acting as an NBD server), it is important to realize
+that an unencrypted connection can allow any external process a
+potential attack vector via the network port. When possible, QEMU
+should be configured to require TLS to prevent a man-in-the-middle
+attack, as well as use x509 client certificates with the
+tls-creds-x509 object set with 'verify-peer=on' to check that the peer
+is allowed to connect. It may also be worth using 'tls-authz' to
+filter which certificates are allowed if the CA issues certs more
+broadly.
+
+Proper hardening of network connections cannot prevent a client from
+violating protocol, but does increase the complexity of an attack,
+because a malicious actor must first find a way to convince an
+authenticated client to send the bytes that will trigger any QEMU
+misbehavior.  Use of a hardened connection is therefore an
+environmental factor used in determining the risk and severity of a
+network-triggered bug.

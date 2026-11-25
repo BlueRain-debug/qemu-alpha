@@ -314,8 +314,8 @@ static void nvme_ns_zoned_init_state(NvmeNamespace *ns)
 
     ns->zone_array = g_new0(NvmeZone, ns->num_zones);
     if (ns->params.zd_extension_size) {
-        ns->zd_extensions = g_malloc0(ns->params.zd_extension_size *
-                                      ns->num_zones);
+        ns->zd_extensions = g_malloc0_n(ns->num_zones,
+                                        ns->params.zd_extension_size);
     }
 
     QTAILQ_INIT(&ns->exp_open_zones);
@@ -484,6 +484,12 @@ static bool nvme_ns_init_fdp(NvmeNamespace *ns, Error **errp)
     const char *endptr, *token;
     char *r, *p;
     uint16_t *ph;
+
+    if (endgrp->fdp.runs < nvme_l2b(ns, 1)) {
+        error_setg(errp, "fdp.runs must be greater than or equal to the "
+                   "lba data size of the namespace");
+        return false;
+    }
 
     if (!ns->params.fdp.ruhs) {
         ns->fdp.nphs = 1;

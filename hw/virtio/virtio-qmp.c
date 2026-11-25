@@ -33,6 +33,12 @@
 #include "standard-headers/linux/virtio_vsock.h"
 #include "standard-headers/linux/virtio_gpio.h"
 
+/* TODO Remove once the Linux headers have caught up */
+#ifndef VIRTIO_BLK_F_REQ_FLAGS_OUT_FUA
+#define VIRTIO_BLK_F_REQ_FLAGS         18      /* Request flags supported */
+#define VIRTIO_BLK_F_REQ_FLAGS_OUT_FUA 19      /* FUA flag supported */
+#endif
+
 #define FEATURE_ENTRY(name, desc) (qmp_virtio_feature_map_t) \
     { .virtio_bit = name, .feature_desc = desc }
 
@@ -171,6 +177,10 @@ static const qmp_virtio_feature_map_t virtio_blk_feature_map[] = {
             "VIRTIO_BLK_F_SECURE_ERASE: Secure erase supported"),
     FEATURE_ENTRY(VIRTIO_BLK_F_ZONED, \
             "VIRTIO_BLK_F_ZONED: Zoned block devices"),
+    FEATURE_ENTRY(VIRTIO_BLK_F_REQ_FLAGS, \
+            "VIRTIO_BLK_F_REQ_FLAGS: Request flags supported"),
+    FEATURE_ENTRY(VIRTIO_BLK_F_REQ_FLAGS_OUT_FUA, \
+            "VIRTIO_BLK_F_REQ_FLAGS_OUT_FUA: FUA flag for OUT requests"),
     FEATURE_ENTRY(VIRTIO_BLK_F_BARRIER, \
             "VIRTIO_BLK_F_BARRIER: Request barriers supported"),
     FEATURE_ENTRY(VIRTIO_BLK_F_SCSI, \
@@ -713,6 +723,8 @@ VirtioStatus *qmp_x_query_virtio_status(const char *path, Error **errp)
                                                  vdev->guest_features_ex);
     status->host_features = qmp_decode_features(vdev->device_id,
                                                 vdev->host_features_ex);
+    status->backend_features = qmp_decode_features(vdev->device_id,
+                                                   vdev->backend_features_ex);
 
     switch (vdev->device_endian) {
     case VIRTIO_DEVICE_ENDIAN_LITTLE:
@@ -787,6 +799,7 @@ VirtVhostQueueStatus *qmp_x_query_virtio_vhost_queue_status(const char *path,
 
     VirtioDeviceClass *vdc = VIRTIO_DEVICE_GET_CLASS(vdev);
     struct vhost_dev *hdev = vdc->get_vhost(vdev);
+    int vq = queue - hdev->vq_index;
 
     if (queue < hdev->vq_index || queue >= hdev->vq_index + hdev->nvqs) {
         error_setg(errp, "Invalid vhost virtqueue number %d", queue);
@@ -795,15 +808,15 @@ VirtVhostQueueStatus *qmp_x_query_virtio_vhost_queue_status(const char *path,
 
     status = g_new0(VirtVhostQueueStatus, 1);
     status->name = g_strdup(vdev->name);
-    status->kick = hdev->vqs[queue].kick;
-    status->call = hdev->vqs[queue].call;
-    status->num = hdev->vqs[queue].num;
-    status->desc_phys = hdev->vqs[queue].desc_phys;
-    status->desc_size = hdev->vqs[queue].desc_size;
-    status->avail_phys = hdev->vqs[queue].avail_phys;
-    status->avail_size = hdev->vqs[queue].avail_size;
-    status->used_phys = hdev->vqs[queue].used_phys;
-    status->used_size = hdev->vqs[queue].used_size;
+    status->kick = hdev->vqs[vq].kick;
+    status->call = hdev->vqs[vq].call;
+    status->num = hdev->vqs[vq].num;
+    status->desc_phys = hdev->vqs[vq].desc_phys;
+    status->desc_size = hdev->vqs[vq].desc_size;
+    status->avail_phys = hdev->vqs[vq].avail_phys;
+    status->avail_size = hdev->vqs[vq].avail_size;
+    status->used_phys = hdev->vqs[vq].used_phys;
+    status->used_size = hdev->vqs[vq].used_size;
 
     return status;
 }

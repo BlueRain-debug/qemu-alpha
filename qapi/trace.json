@@ -16,8 +16,6 @@
 # @TraceEventState:
 #     State of a tracing event.
 #
-# @unavailable: The event is statically disabled.
-#
 # @disabled: The event is dynamically disabled.
 #
 # @enabled: The event is dynamically enabled.
@@ -25,7 +23,7 @@
 # Since: 2.2
 ##
 { 'enum': 'TraceEventState',
-  'data': ['unavailable', 'disabled', 'enabled'] }
+  'data': ['disabled', 'enabled'] }
 
 ##
 # @TraceEventInfo:
@@ -72,6 +70,11 @@
 #
 # Since: 2.2
 #
+# Features:
+#
+# @deprecated: @ignore-unavailable no longer has any effect
+#    (since 11.2)
+#
 # .. qmp-example::
 #
 #     -> { "execute": "trace-event-set-state",
@@ -79,4 +82,6 @@
 #     <- { "return": {} }
 ##
 { 'command': 'trace-event-set-state',
-  'data': {'name': 'str', 'enable': 'bool', '*ignore-unavailable': 'bool' } }
+  'data': {'name': 'str', 'enable': 'bool',
+           '*ignore-unavailable': { 'type': 'bool',
+                                    'features': ['deprecated'] } } }

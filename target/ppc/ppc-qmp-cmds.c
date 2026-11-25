@@ -27,17 +27,9 @@
 #include "qemu/ctype.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-machine.h"
+#include "system/qmp-cpu.h"
 #include "cpu-models.h"
 #include "cpu-qom.h"
-
-CpuModelExpansionInfo *
-qmp_query_cpu_model_expansion(CpuModelExpansionType type,
-                              CpuModelInfo *model,
-                              Error **errp)
-{
-    error_setg(errp, "CPU model expansion is not supported on this target");
-    return NULL;
-}
 
 static void ppc_cpu_defs_entry(gpointer data, gpointer user_data)
 {
@@ -53,7 +45,7 @@ static void ppc_cpu_defs_entry(gpointer data, gpointer user_data)
     QAPI_LIST_PREPEND(*first, info);
 }
 
-CpuDefinitionInfoList *qmp_query_cpu_definitions(Error **errp)
+CpuDefinitionInfoList *qmp_query_ppc_cpu_definitions(Error **errp)
 {
     CpuDefinitionInfoList *cpu_list = NULL;
     GSList *list;

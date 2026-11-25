@@ -30,6 +30,7 @@
 #include "qapi/error.h"
 #include "qapi/qapi-commands-control.h"
 #include "qapi/qapi-commands-char.h"
+#include "qapi/qapi-type-infos-qom.h"
 #include "qobject/qdict.h"
 #include "qobject/qjson.h"
 #include "qobject/qlist.h"
@@ -135,7 +136,7 @@ static void monitor_qmp_class_init(ObjectClass *cls, const void *data)
                                    monitor_qmp_set_pretty);
     object_class_property_add_enum(cls, "close-action",
                                    "MonitorQMPCloseAction",
-                                   &MonitorQMPCloseAction_lookup,
+                                   &MonitorQMPCloseAction_type_info,
                                    monitor_qmp_get_close_action,
                                    monitor_qmp_set_close_action);
 
@@ -439,7 +440,7 @@ void coroutine_fn monitor_qmp_dispatcher_co(void *data)
 
         /* Process request */
         if (req_obj->req) {
-            if (trace_event_get_state(TRACE_MONITOR_QMP_CMD_IN_BAND)) {
+            if (trace_event_get_state_backends(TRACE_MONITOR_QMP_CMD_IN_BAND)) {
                 QDict *qdict = qobject_to(QDict, req_obj->req);
                 QObject *id = qdict ? qdict_get(qdict, "id") : NULL;
                 GString *id_json;
@@ -495,7 +496,7 @@ static void handle_qmp_command(void *opaque, QObject *req, Error *err)
 
     if (qdict && qmp_is_oob(qdict)) {
         /* OOB commands are executed immediately */
-        if (trace_event_get_state(TRACE_MONITOR_QMP_CMD_OUT_OF_BAND)) {
+        if (trace_event_get_state_backends(TRACE_MONITOR_QMP_CMD_OUT_OF_BAND)) {
             QObject *id = qdict_get(qdict, "id");
             GString *id_json;
 
@@ -663,6 +664,7 @@ static void monitor_qmp_event(void *opaque, QEMUChrEvent event)
     case CHR_EVENT_BREAK:
     case CHR_EVENT_MUX_IN:
     case CHR_EVENT_MUX_OUT:
+    case CHR_EVENT_RESIZE:
         /* Ignore */
         break;
     }

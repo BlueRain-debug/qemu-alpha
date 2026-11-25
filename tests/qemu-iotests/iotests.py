@@ -596,6 +596,10 @@ def filter_qemu_io(msg):
     return qemu_io_re.sub("X ops; XX:XX:XX.X "
                           "(XXX YYY/sec and XXX ops/sec)", msg)
 
+qemu_re = re.compile(r"%s" % os.path.basename(qemu_prog))
+def filter_qemu(msg):
+    return qemu_re.sub("QEMU_PROG", msg)
+
 chown_re = re.compile(r"chown [0-9]+:[0-9]+")
 def filter_chown(msg):
     return chown_re.sub("chown UID:GID", msg)
@@ -1381,6 +1385,36 @@ class QMPTestCase(unittest.TestCase):
         case_notrun(reason)
         self.skipTest(reason)
 
+    @contextmanager
+    def run_nbd_server(self, nbd_sock: str,
+                       max_conn: Optional[int] = None) -> Iterator[None]:
+        args: Dict[str, Any] = {
+            'addr': {
+                'type': 'unix',
+                'data': {'path': nbd_sock}
+            }
+        }
+        if max_conn is not None:
+            args['max-connections'] = max_conn
+
+        self.vm.cmd('nbd-server-start', args)
+        try:
+            yield
+        finally:
+            self.vm.cmd('nbd-server-stop')
+
+    def add_nbd_export(self, node_name: str, name: str,
+                       writable: Optional[bool] = None) -> None:
+        args: Dict[str, Any] = {
+            'type': 'nbd',
+            'id': name,
+            'node-name': node_name,
+            'name': name,
+        }
+        if writable is not None:
+            args['writable'] = writable
+
+        self.vm.cmd('block-export-add', args)
 
 def notrun(reason):
     '''Skip this test suite'''

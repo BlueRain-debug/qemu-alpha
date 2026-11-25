@@ -7,6 +7,7 @@ test_x86_64_timeouts = {
   'netdev_ethtool' : 180,
   'replay' : 480,
   'virtio_balloon': 120,
+  'vhost_vsock_cpr': 300,
 }
 
 tests_x86_64_system_quick = [
@@ -34,6 +35,7 @@ endif
 
 tests_x86_64_system_thorough = [
   'acpi_bits',
+  'ccid_emulated',
   'hotplug_blk',
   'hotplug_scsi',
   'hotplug_cpu',
@@ -43,6 +45,7 @@ tests_x86_64_system_thorough = [
   'multiprocess',
   'netdev_ethtool',
   'nvme_migration',
+  'pcie_switch',
   'replay',
   'reverse_debug',
   'tuxrun',
@@ -51,4 +54,5 @@ tests_x86_64_system_thorough = [
   'virtio_balloon',
   'virtio_gpu',
   'rebuild_vmfd',
+  'vhost_vsock_cpr',
 ]

@@ -16,6 +16,9 @@
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <dirent.h>
+#if defined(CONFIG_SOLARIS) && defined(CONFIG_GETLOADAVG)
+#include <sys/loadavg.h>
+#endif
 #include "qga-qapi-commands.h"
 #include "qapi/error.h"
 #include "qemu/host-utils.h"
@@ -43,9 +46,6 @@
 #include <net/ethernet.h>
 #endif
 #ifdef CONFIG_SOLARIS
-#ifdef CONFIG_GETLOADAVG
-#include <sys/loadavg.h>
-#endif
 #include <sys/sockio.h>
 #endif
 #endif
@@ -321,6 +321,20 @@ void qmp_guest_set_time(bool has_time, int64_t time_ns, Error **errp)
             return;
         }
     }
+
+#if !defined(CONFIG_LINUX)
+    /*
+     * BSDs (FreeBSD, OpenBSD, NetBSD) and illumos do not have the
+     * hwclock(8) tool. These systems update hardware clock when
+     * settimeofday() sets system time, so no additional actions
+     * are needed. Setting system time from RTC is not supported.
+     */
+    if (!has_time) {
+        error_setg(errp, "Setting system time from RTC is not supported");
+    }
+
+    return;
+#endif
 
     /* Now, if user has passed a time to set and the system time is set, we
      * just need to synchronize the hardware clock. However, if no time was
@@ -718,7 +732,7 @@ void qmp_guest_file_flush(int64_t handle, Error **errp)
     }
 }
 
-#if defined(CONFIG_FSFREEZE) || defined(CONFIG_FSTRIM)
+#if defined(CONFIG_FSFREEZE) || defined(CONFIG_FSTRIM) || defined(CONFIG_BSD)
 void free_fs_mount_list(FsMountList *mounts)
 {
      FsMount *mount, *temp;
@@ -731,7 +745,7 @@ void free_fs_mount_list(FsMountList *mounts)
          QTAILQ_REMOVE(mounts, mount, next);
          g_free(mount->dirname);
          g_free(mount->devtype);
-#if defined(__FreeBSD__)
+#ifdef CONFIG_BSD
          g_free(mount->fromname);
 #endif
          g_free(mount);
@@ -1322,7 +1336,7 @@ GuestOSInfo *qmp_guest_get_osinfo(Error **errp)
 
     info = g_new0(GuestOSInfo, 1);
 
-    if (uname(&kinfo) != 0) {
+    if (uname(&kinfo) < 0) {
         error_setg_errno(errp, errno, "uname failed");
     } else {
         info->kernel_version = g_strdup(kinfo.version);

@@ -290,9 +290,20 @@ static bool l2vic_update(HexL2VICState *s, int irq)
 
 static void l2vic_update_all(HexL2VICState *s)
 {
-    for (int i = 0; i < L2VIC_INTERRUPT_MAX; i++) {
-        if (l2vic_update(s, i)) {
-            /* once vid is active, no-one else can set it until ciad */
+    /* once vid is active, no-one else can set it until ciad */
+    if (vid_active(s)) {
+        return;
+    }
+
+    /*
+     * Quickly find lowest-numbered irq ready by scanning their statuses
+     * range by range instead of one by one.
+     */
+    for (int slice = 0; slice < SLICE_MAX; slice++) {
+        uint32_t ready = s->int_pending[slice] & s->int_enable[slice];
+
+        if (ready) {
+            l2vic_update(s, slice * 32 + ctz32(ready));
             return;
         }
     }
@@ -381,7 +392,7 @@ static void fastl2vic_write(void *opaque, hwaddr offset, uint64_t val,
         uint32_t cmd = (val >> 16) & 0x3;
         uint32_t irq = val & 0x3ff;
         uint32_t slice = (irq / 32) * 4;
-        val = 1 << (irq % 32);
+        val = 1ULL << (irq % 32);
 
         if (cmd == FASTL2VIC_ENABLE) {
             l2vic_write(opaque, L2VIC_INT_ENABLE_SETn + slice, val, size);
@@ -448,12 +459,16 @@ static void l2vic_interface_update_vid_impl(HexL2VicInterface *iface,
     l2vic_update_all(s);
 }
 
-static void l2vic_interface_clear_interrupt_impl(HexL2VicInterface *iface)
+static void l2vic_interface_clear_interrupt_impl(HexL2VicInterface *iface,
+                                                 uint32_t mask)
 {
     HexL2VICState *s = HEX_L2VIC(iface);
+    const uint32_t size = L2VIC_INTERRUPT_MAX;
+    const uint32_t active_irq = find_first_bit32(s->int_status, size);
 
-    if (s->vid < L2VIC_INTERRUPT_MAX) {
-        clear_bit32(s->vid, s->int_status);
+    /* VID group n is delivered on CPU interrupt n + 2 */
+    if (active_irq != size && (mask & BIT(get_vid(s, active_irq) + 2))) {
+        clear_bit32(active_irq, s->int_status);
     }
     l2vic_update_all(s);
 }

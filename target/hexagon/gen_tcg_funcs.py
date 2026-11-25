@@ -28,7 +28,7 @@ def gen_disabled_ieee_insn(f, tag, regs):
     for regtype, regid in regs:
         reg = hex_common.get_register(tag, regtype, regid)
         if reg.is_hvx_reg() and reg.is_written():
-            reg.gen_zero(f)
+            reg.gen_zero(f, tag)
     f.write("        return;\n")
     f.write("    }\n")
 
@@ -58,16 +58,20 @@ def gen_tcg_func(f, tag, regs, imms):
 
     f.write("    Insn *insn G_GNUC_UNUSED = ctx->insn;\n")
 
-    if "A_PRIV" in hex_common.attribdict[tag]:
+    if (
+        "A_PRIV" in hex_common.attribdict[tag]
+        or "A_GUEST" in hex_common.attribdict[tag]
+    ):
         f.write(dedent("""\
 #ifdef CONFIG_USER_ONLY
-    hex_gen_exception_end_tb(ctx, HEX_CAUSE_PRIV_USER_NO_SINSN);
-#else
 """))
-    if "A_GUEST" in hex_common.attribdict[tag]:
+        if "A_PRIV" in hex_common.attribdict[tag]:
+            f.write("    hex_gen_exception_end_tb(ctx, "
+                    "HEX_CAUSE_PRIV_USER_NO_SINSN);\n")
+        else:
+            f.write("    hex_gen_exception_end_tb(ctx, "
+                    "HEX_CAUSE_PRIV_USER_NO_GINSN);\n")
         f.write(dedent("""\
-#ifdef CONFIG_USER_ONLY
-    hex_gen_exception_end_tb(ctx, HEX_CAUSE_PRIV_USER_NO_GINSN);
 #else
 """))
     if hex_common.need_ea(tag):
@@ -113,6 +117,9 @@ def gen_tcg_func(f, tag, regs, imms):
 
         arguments = ", ".join(["ctx", "ctx->insn", "&ctx->pkt"] + declared)
         f.write(f"    emit_{tag}({arguments});\n")
+
+    elif hex_common.is_hlx_inline_tag(tag):
+        hex_common.gen_hlx_inline(f, tag, regs)
 
     elif hex_common.skip_qemu_helper(tag):
         if "A_FPOP" in hex_common.attribdict[tag]:
@@ -169,11 +176,7 @@ def main():
 
         for tag in hex_common.tags:
             if hex_common.tag_ignore(tag):
-                f.write(f"static void generate_{tag}"
-                        f"(DisasContext *ctx)\n")
-                f.write("{\n}\n\n")
                 continue
-
             gen_def_tcg_func(f, tag, tagregs, tagimms)
 
         f.write("#endif    /* HEXAGON_TCG_FUNCS_H */\n")

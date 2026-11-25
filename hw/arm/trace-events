@@ -125,3 +125,7 @@ qcom845_qsee_message(uint32_t app_id, uint64_t request, uint64_t request_size, u
 qcom845_qsee_request_word(uint32_t app_id, uint32_t offset, uint32_t value) "app=%u offset=0x%x value=0x%08x"
 qcom845_uefi_reply(uint32_t command, uint32_t status, uint32_t bytes) "command=0x%x status=0x%08x bytes=%u"
 qcom845_pas_state(uint32_t function, int32_t status, unsigned segments, uint64_t base, uint64_t bytes, bool running) "fn=0x%x status=%d segments=%u base=0x%"PRIx64" bytes=0x%"PRIx64" running=%d"
+
+# bcm2838_pcie.c
+bcm2838_pcie_host_read(unsigned int size, uint64_t offset, uint64_t value) "%u bytes @ 0x%04"PRIx64": 0x%016"PRIx64
+bcm2838_pcie_host_write(unsigned int size, uint64_t offset, uint64_t value) "%u bytes @ 0x%04"PRIx64": 0x%016"PRIx64

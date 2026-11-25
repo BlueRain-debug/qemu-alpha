@@ -241,11 +241,11 @@ static FWCfgState *create_fw_cfg(MachineState *ms, PCIBus *pci_bus,
     fw_cfg_add_file(fw_cfg, "/etc/hppa/power-button-addr",
                     g_memdup2(&val, sizeof(val)), sizeof(val));
 
-    val = cpu_to_le64(CPU_HPA + 16);
+    val = cpu_to_le64(cpu[0]->env.cpu_hpa + 16);
     fw_cfg_add_file(fw_cfg, "/etc/hppa/rtc-addr",
                     g_memdup2(&val, sizeof(val)), sizeof(val));
 
-    val = cpu_to_le64(CPU_HPA + 24);
+    val = cpu_to_le64(cpu[0]->env.cpu_hpa + 24);
     fw_cfg_add_file(fw_cfg, "/etc/hppa/DebugOutputPort",
                     g_memdup2(&val, sizeof(val)), sizeof(val));
 
@@ -286,7 +286,8 @@ static DinoState *dino_init(MemoryRegion *addr_space)
 /*
  * Step 1: Create CPUs and Memory
  */
-static TranslateFn *machine_HP_common_init_cpus(MachineState *machine)
+static TranslateFn *machine_HP_common_init_cpus(MachineState *machine,
+                        target_ulong initial_cpu_hpa)
 {
     MemoryRegion *addr_space = get_system_memory();
     unsigned int smp_cpus = machine->smp.cpus;
@@ -299,6 +300,7 @@ static TranslateFn *machine_HP_common_init_cpus(MachineState *machine)
     /* Create CPUs.  */
     for (unsigned int i = 0; i < smp_cpus; i++) {
         cpu[i] = HPPA_CPU(cpu_create(machine->cpu_type));
+        cpu[i]->env.cpu_hpa = initial_cpu_hpa + i * 0x1000;
     }
 
     /* Initialize memory */
@@ -321,7 +323,7 @@ static TranslateFn *machine_HP_common_init_cpus(MachineState *machine)
         memory_region_init_io(cpu_region, OBJECT(cpu[i]), &hppa_io_eir_ops,
                               cpu[i], name, 4);
         memory_region_add_subregion(addr_space,
-                                    translate(NULL, CPU_HPA + i * 0x1000),
+                                    translate(NULL, cpu[i]->env.cpu_hpa),
                                     cpu_region);
 
         if (!hppa_is_pa20(&cpu[0]->env)) {
@@ -339,7 +341,7 @@ static TranslateFn *machine_HP_common_init_cpus(MachineState *machine)
         memory_region_init_io(cflush, NULL, &hppa_pci_ignore_ops,
                               NULL, cflush_name, 4);
         memory_region_add_subregion(addr_space,
-                              translate(NULL, CPU_HPA + i * 0x1000 + 0x500),
+                              translate(NULL, cpu[i]->env.cpu_hpa + 0x500),
                               cflush);
     }
 
@@ -347,7 +349,8 @@ static TranslateFn *machine_HP_common_init_cpus(MachineState *machine)
     cpu_region = g_new(MemoryRegion, 1);
     memory_region_init_io(cpu_region, OBJECT(cpu[0]), &hppa_io_helper_ops,
                           cpu[0], "cpu0-io-rtc", 2 * sizeof(uint64_t));
-    memory_region_add_subregion(addr_space, translate(NULL, CPU_HPA + 16),
+    memory_region_add_subregion(addr_space,
+                                translate(NULL, cpu[0]->env.cpu_hpa + 16),
                                 cpu_region);
 
     /* Main memory region. */
@@ -574,6 +577,47 @@ static void machine_HP_common_init_tail(MachineState *machine, PCIBus *pci_bus,
 }
 
 /*
+ * Local broadcast I/O space: a write to IO_EIR (offset 0) posts an external
+ * interrupt on all processors, CMD_RESET (5) written to IO_COMMAND (0x30)
+ * resets the system.  HP-UX 9 reboots through the latter.
+ */
+#define HPPA_BROADCAST_HPA      0xfffc0000
+#define HPPA_IO_COMMAND         0x30
+#define HPPA_CMD_RESET          5
+
+static uint64_t hppa_broadcast_read(void *opaque, hwaddr addr, unsigned size)
+{
+    return 0;
+}
+
+static void hppa_broadcast_write(void *opaque, hwaddr addr, uint64_t val,
+                                 unsigned size)
+{
+    unsigned int i;
+
+    switch (addr) {
+    case 0:
+        for (i = 0; i < current_machine->smp.cpus; i++) {
+            hppa_io_eir_ops.write(cpu[i], 0, val, 4);
+        }
+        break;
+    case HPPA_IO_COMMAND:
+        if (val == HPPA_CMD_RESET) {
+            qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        }
+        break;
+    }
+}
+
+static const MemoryRegionOps hppa_broadcast_ops = {
+    .read = hppa_broadcast_read,
+    .write = hppa_broadcast_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+};
+
+/*
  * Create HP 715/64 workstation
  */
 static void machine_HP_715_init(MachineState *machine)
@@ -585,7 +629,7 @@ static void machine_HP_715_init(MachineState *machine)
     ISABus *isa_bus;
 
     /* Create CPUs and RAM.  */
-    translate = machine_HP_common_init_cpus(machine);
+    translate = machine_HP_common_init_cpus(machine, 0xfffbe000);
 
     if (hppa_is_pa20(&cpu[0]->env)) {
         error_report("The HP 715/64 workstation requires a 32-bit "
@@ -596,6 +640,14 @@ static void machine_HP_715_init(MachineState *machine)
     /* Create ISA bus, needed for PS/2 kbd/mouse port emulation */
     isa_bus = hppa_isa_bus(translate(NULL, IDE_HPA));
     assert(isa_bus);
+
+    /* Local broadcast I/O space */
+    MemoryRegion *dev_mr_bcast = g_new(MemoryRegion, 1);
+    memory_region_init_io(dev_mr_bcast, NULL, &hppa_broadcast_ops, NULL,
+                          "local-broadcast", 0x1000);
+    memory_region_add_subregion(addr_space,
+                                translate(NULL, HPPA_BROADCAST_HPA),
+                                dev_mr_bcast);
 
     /* Init Lasi chip */
     lasi_dev = DEVICE(lasi_init());
@@ -664,7 +716,7 @@ static void machine_HP_B160L_init(MachineState *machine)
     PCIBus *pci_bus;
 
     /* Create CPUs and RAM.  */
-    translate = machine_HP_common_init_cpus(machine);
+    translate = machine_HP_common_init_cpus(machine, 0xfff10000);
 
     if (hppa_is_pa20(&cpu[0]->env)) {
         error_report("The HP B160L workstation requires a 32-bit "
@@ -761,7 +813,7 @@ static void machine_HP_C3700_init(MachineState *machine)
     bool is_C3700 = strcmp(mc->name, "C3700") == 0;
 
     /* Create CPUs and RAM.  */
-    translate = machine_HP_common_init_cpus(machine);
+    translate = machine_HP_common_init_cpus(machine, 0xfffa0000);
 
     if (!hppa_is_pa20(&cpu[0]->env)) {
         error_report("The HP C3000 workstation requires a 64-bit CPU. "
@@ -842,7 +894,42 @@ static void hppa_machine_reset(MachineState *ms, ResetType type)
 
         cpu_set_pc(cs, firmware_entry);
         cpu[i]->env.psw = PSW_Q;
-        cpu[i]->env.gr[5] = CPU_HPA + i * 0x1000;
+        /* Firmware uses FP registers before configuring CCR. */
+        cpu[i]->env.cr[CR_SCRCCR] = 0xc0;
+        cpu[i]->env.gr[5] = cpu[i]->env.cpu_hpa;
+    }
+
+    /*
+     * BTLB equivalence maps for the I/O ranges HP-UX 9 uses
+     * without creating page directory entries: the LASI block and the
+     * central bus (CPU HPA, broadcast).  Must not cover other I/O space, as
+     * HP-UX probes with LPA and skips pdir setup for already mapped pages.
+     */
+    if (!hppa_is_pa20(&cpu[0]->env)) {
+        static const struct { uint32_t start, last; } io_btlb[] = {
+            { 0xf0100000, 0xf01fffff },     /* LASI */
+            { 0xfff80000, 0xffffffff },     /* central bus */
+            { 0xf00ff000, 0xf00fffff },     /* soft power button register */
+        };
+        CPUHPPAState *env = &cpu[0]->env;
+
+        for (i = 0; i < ARRAY_SIZE(io_btlb); i++) {
+            HPPATLBEntry *ent = &env->tlb[HPPA_BTLB_ENTRIES(env) - 1 - i];
+
+            ent->itree.start = io_btlb[i].start;
+            ent->itree.last = io_btlb[i].last;
+            ent->pa = io_btlb[i].start;
+            ent->access_id = 0;
+            ent->u = 1;
+            ent->ar_pl2 = 0;
+            ent->ar_pl1 = 0;
+            ent->ar_type = 1;
+            ent->b = 0;
+            ent->d = 1;
+            ent->t = 0;
+            ent->entry_valid = 1;
+            interval_tree_insert(&ent->itree, &env->tlb_root);
+        }
     }
 
     cpu[0]->env.gr[26] = ms->ram_size;

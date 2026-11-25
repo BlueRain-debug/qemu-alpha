@@ -49,7 +49,7 @@ static bool msgint_needed(void *opaque)
 {
     LoongArchCPU *cpu = opaque;
 
-    return FIELD_EX64(cpu->env.cpucfg[1], CPUCFG1, MSG_INT);
+    return cpu_has_msgint(&cpu->env);
 }
 
 static const VMStateDescription vmstate_msgint = {
@@ -178,7 +178,11 @@ static const VMStateDescription vmstate_pmu = {
 #if defined(CONFIG_TCG) && !defined(CONFIG_USER_ONLY)
 static bool tlb_needed(void *opaque)
 {
-    return tcg_enabled();
+    /*
+     * Not needed, will remove field of vmstate_tlb when virt-11.1 is
+     * deprecated.
+     */
+    return false;
 }
 
 /* TLB state */

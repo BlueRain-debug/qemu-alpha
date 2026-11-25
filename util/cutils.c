@@ -954,6 +954,12 @@ const char *iec_binary_prefix(unsigned int exp2)
     return prefixes[exp2 / 10];
 }
 
+const char *str_array_elem_or_null(const char *const *array,
+                                   size_t nelem, uint64_t index)
+{
+    return index >= nelem ? NULL : array[index];
+}
+
 /*
  * Return human readable string for size @val.
  * @val can be anything that uint64_t allows (no more than "16 EiB").
@@ -1088,6 +1094,12 @@ void qemu_init_exec_dir(const char *argv0)
         if (!sysctl(mib, ARRAY_SIZE(mib), buf, &len, NULL, 0) &&
             *buf) {
             buf[sizeof(buf) - 1] = '\0';
+            p = buf;
+        }
+    }
+#elif defined(__OpenBSD__) && defined(CONFIG_GETEXECPATH)
+    {
+        if (getexecpath(buf, sizeof(buf)) == 0) {
             p = buf;
         }
     }

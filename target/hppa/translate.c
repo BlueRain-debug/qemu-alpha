@@ -726,7 +726,7 @@ static void install_link(DisasContext *ctx, unsigned link, bool with_sr0)
 
 static void gen_excp_1(int exception)
 {
-    gen_helper_hppa_excp(tcg_env, tcg_constant_i32(exception));
+    gen_helper_excp(tcg_env, tcg_constant_i32(exception));
 }
 
 static void gen_excp(DisasContext *ctx, int exception)
@@ -1711,8 +1711,30 @@ static bool do_floadw(DisasContext *ctx, unsigned rt, unsigned rb,
     return nullify_end(ctx);
 }
 
+static bool gen_fmem_excp(DisasContext *ctx, arg_ldst *a, MemOp mop, int type)
+{
+#ifndef CONFIG_USER_ONLY
+    TCGv_i64 addr, ofs;
+
+    nullify_over(ctx);
+    form_gva(ctx, &addr, &ofs, a->b, a->x,
+             a->scale ? mop & MO_SIZE : 0, a->disp, a->sp, a->m,
+             MMU_DISABLED(ctx));
+    gen_helper_fpu_mem(tcg_env, addr, tcg_constant_i32(ctx->mmu_idx),
+                       tcg_constant_i32(mop | ctx->mo_align | mo_endian(ctx)),
+                       tcg_constant_i32(type));
+    ctx->base.is_jmp = DISAS_NORETURN;
+    return nullify_end(ctx);
+#else
+    g_assert_not_reached();
+#endif
+}
+
 static bool trans_fldw(DisasContext *ctx, arg_ldst *a)
 {
+    if (ctx->tb_flags & TB_FLAG_FPU_DISABLED) {
+        return gen_fmem_excp(ctx, a, MO_UL, PAGE_READ);
+    }
     return do_floadw(ctx, a->t, a->b, a->x, a->scale ? 2 : 0,
                      a->disp, a->sp, a->m);
 }
@@ -1738,6 +1760,9 @@ static bool do_floadd(DisasContext *ctx, unsigned rt, unsigned rb,
 
 static bool trans_fldd(DisasContext *ctx, arg_ldst *a)
 {
+    if (ctx->tb_flags & TB_FLAG_FPU_DISABLED) {
+        return gen_fmem_excp(ctx, a, MO_UQ, PAGE_READ);
+    }
     return do_floadd(ctx, a->t, a->b, a->x, a->scale ? 3 : 0,
                      a->disp, a->sp, a->m);
 }
@@ -1767,6 +1792,9 @@ static bool do_fstorew(DisasContext *ctx, unsigned rt, unsigned rb,
 
 static bool trans_fstw(DisasContext *ctx, arg_ldst *a)
 {
+    if (ctx->tb_flags & TB_FLAG_FPU_DISABLED) {
+        return gen_fmem_excp(ctx, a, MO_UL, PAGE_WRITE);
+    }
     return do_fstorew(ctx, a->t, a->b, a->x, a->scale ? 2 : 0,
                       a->disp, a->sp, a->m);
 }
@@ -1787,6 +1815,9 @@ static bool do_fstored(DisasContext *ctx, unsigned rt, unsigned rb,
 
 static bool trans_fstd(DisasContext *ctx, arg_ldst *a)
 {
+    if (ctx->tb_flags & TB_FLAG_FPU_DISABLED) {
+        return gen_fmem_excp(ctx, a, MO_UQ, PAGE_WRITE);
+    }
     return do_fstored(ctx, a->t, a->b, a->x, a->scale ? 3 : 0,
                       a->disp, a->sp, a->m);
 }
@@ -2311,8 +2342,9 @@ static bool trans_mtctl(DisasContext *ctx, arg_mtctl *a)
 #endif
         break;
 
+    case CR_SCRCCR:
     case CR_EIEM:
-        /* Exit to re-evaluate interrupts in the main loop. */
+        /* Exit to re-evaluate translation flags and interrupts. */
         ctx->base.is_jmp = DISAS_IAQ_N_STALE_EXIT;
         /* FALLTHRU */
     default:
@@ -2367,7 +2399,7 @@ static bool trans_rsm(DisasContext *ctx, arg_rsm *a)
     nullify_over(ctx);
 
     tmp = tcg_temp_new_i64();
-    tcg_gen_ld_i64(tmp, tcg_env, offsetof(CPUHPPAState, psw));
+    tcg_gen_ld32u_i64(tmp, tcg_env, offsetof(CPUHPPAState, psw));
     tcg_gen_andi_i64(tmp, tmp, ~a->i);
     gen_helper_swap_system_mask(tmp, tcg_env, tmp);
     save_gpr(ctx, a->t, tmp);
@@ -2387,7 +2419,7 @@ static bool trans_ssm(DisasContext *ctx, arg_ssm *a)
     nullify_over(ctx);
 
     tmp = tcg_temp_new_i64();
-    tcg_gen_ld_i64(tmp, tcg_env, offsetof(CPUHPPAState, psw));
+    tcg_gen_ld32u_i64(tmp, tcg_env, offsetof(CPUHPPAState, psw));
     tcg_gen_ori_i64(tmp, tmp, a->i);
     gen_helper_swap_system_mask(tmp, tcg_env, tmp);
     save_gpr(ctx, a->t, tmp);
@@ -2450,7 +2482,7 @@ static bool trans_halt(DisasContext *ctx, arg_halt *a)
 #ifndef CONFIG_USER_ONLY
     set_psw_xb(ctx, 0);
     nullify_over(ctx);
-    gen_helper_hppa_halt(tcg_env);
+    gen_helper_halt(tcg_env);
     ctx->base.is_jmp = DISAS_NORETURN;
     return nullify_end(ctx);
 #endif
@@ -2462,7 +2494,7 @@ static bool trans_reset(DisasContext *ctx, arg_reset *a)
 #ifndef CONFIG_USER_ONLY
     set_psw_xb(ctx, 0);
     nullify_over(ctx);
-    gen_helper_hppa_reset(tcg_env);
+    gen_helper_reset(tcg_env);
     ctx->base.is_jmp = DISAS_NORETURN;
     return nullify_end(ctx);
 #endif
@@ -4721,6 +4753,31 @@ static void hppa_tr_insn_start(DisasContextBase *dcbase, CPUState *cs)
     ctx->insn_start_updated = false;
 }
 
+static bool decode_insn(DisasContext *ctx, uint32_t insn)
+{
+#ifndef CONFIG_USER_ONLY
+    if (ctx->tb_flags & TB_FLAG_FPU_DISABLED) {
+        switch (insn >> 26) {
+        case 0x0b:
+            /* Both floating-point uids trap when the coprocessor is disabled. */
+            insn &= ~0x40;
+            break;
+        case 0x0c:
+            if (extract32(insn, 7, 2)) {
+                break;
+            }
+            /* fall through */
+        case 0x06:
+        case 0x0e:
+        case 0x26:
+        case 0x2e:
+            return gen_excp_iir(ctx, EXCP_ASSIST_EMU);
+        }
+    }
+#endif
+    return decode(ctx, insn);
+}
+
 static void hppa_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
 {
     DisasContext *ctx = container_of(dcbase, DisasContext, base);
@@ -4754,7 +4811,7 @@ static void hppa_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
             ret = DISAS_NEXT;
         } else {
             ctx->insn = insn;
-            if (!decode(ctx, insn)) {
+            if (!decode_insn(ctx, insn)) {
                 gen_illegal(ctx);
             }
             ret = ctx->base.is_jmp;

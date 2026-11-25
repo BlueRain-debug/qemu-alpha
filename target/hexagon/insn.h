@@ -42,6 +42,7 @@ struct Instruction {
     int32_t new_read_idx;
     int32_t dest_idx;
     bool has_pred_dest;
+    bool has_pair_dest;
 
     bool part1;              /*
                               * cmp-jumps are split into two insns.
@@ -49,6 +50,7 @@ struct Instruction {
                               */
     bool extension_valid;   /* Has a constant extender attached */
     bool is_endloop;   /* This is an end of loop */
+    bool hlx_new_zero; /* HLX .new store without a producer. */
     int32_t immed[IMMEDS_MAX];    /* immediate field */
 };
 
@@ -70,7 +72,9 @@ struct Packet {
     bool pkt_has_scalar_store_s1;
 
     bool pkt_has_hvx;
+    bool pkt_has_hmx;
     Insn *vhist_insn;
+    bool pkt_has_hlx;
 
     Insn insn[INSTRUCTIONS_MAX];
 };

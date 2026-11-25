@@ -15,6 +15,7 @@
 #define QEMU_OBJECT_H
 
 #include "qapi/qapi-builtin-types.h"
+#include "qapi/qapi-type-info.h"
 #include "qemu/module.h"
 
 struct TypeImpl;
@@ -91,6 +92,7 @@ struct ObjectProperty
     char *name;
     char *type;
     char *description;
+    const QAPITypeInfo *qapi_type;
     ObjectPropertyAccessor *get;
     ObjectPropertyAccessor *set;
     ObjectPropertyResolve *resolve;
@@ -1161,6 +1163,7 @@ void object_unref(void *obj);
  *   defined.  Sub namespaces are constructed by using a prefix and then
  *   to angle brackets.  For instance, the type 'virtio-net-pci' in the
  *   'link' namespace would be 'link<virtio-net-pci>'.
+ * @qapi_type: QAPI type info descriptor
  * @get: The getter to be called to read a property.  If this is NULL, then
  *   the property cannot be read.
  * @set: the setter to be called to write a property.  If this is NULL,
@@ -1171,11 +1174,22 @@ void object_unref(void *obj);
  * @opaque: an opaque pointer to pass to the callbacks for the property
  * @errp: pointer to error object
  *
+ * Further use of this method is deprecated. Properties for an
+ * object should be statically declared against the class, and
+ * not be permitted to vary at runtime. Use the
+ * object_class_property_add() method (and its variants) instead.
+ *
+ * If usage scenarios require differing subsets of properties
+ * to be present, this should be handled by creating further
+ * specialized subclasses instead of dynamically registering
+ * properties against instances.
+ *
  * Returns: The #ObjectProperty; this can be used to set the @resolve
  * callback for child and link properties.
  */
 ObjectProperty *object_property_try_add(Object *obj, const char *name,
                                         const char *type,
+                                        const QAPITypeInfo *qapi_type,
                                         ObjectPropertyAccessor *get,
                                         ObjectPropertyAccessor *set,
                                         ObjectPropertyRelease *release,
@@ -1183,9 +1197,6 @@ ObjectProperty *object_property_try_add(Object *obj, const char *name,
 
 /**
  * object_property_add:
- * Same as object_property_try_add() with @errp hardcoded to
- * &error_abort.
- *
  * @obj: the object to add a property to
  * @name: the name of the property.  This can contain any character except for
  *  a forward slash.  In general, you should use hyphens '-' instead of
@@ -1194,6 +1205,7 @@ ObjectProperty *object_property_try_add(Object *obj, const char *name,
  *   defined.  Sub namespaces are constructed by using a prefix and then
  *   to angle brackets.  For instance, the type 'virtio-net-pci' in the
  *   'link' namespace would be 'link<virtio-net-pci>'.
+ * @qapi_type: QAPI type info descriptor
  * @get: The getter to be called to read a property.  If this is NULL, then
  *   the property cannot be read.
  * @set: the setter to be called to write a property.  If this is NULL,
@@ -1202,18 +1214,34 @@ ObjectProperty *object_property_try_add(Object *obj, const char *name,
  *   meant to allow a property to free its opaque upon object
  *   destruction.  This may be NULL.
  * @opaque: an opaque pointer to pass to the callbacks for the property
+ *
+ * Same as object_property_try_add() with @errp hardcoded to
+ * &error_abort.
+ *
+ * Further use of this method is deprecated, see
+ * object_property_try_add() for details.
  */
 ObjectProperty *object_property_add(Object *obj, const char *name,
                                     const char *type,
+                                    const QAPITypeInfo *qapi_type,
                                     ObjectPropertyAccessor *get,
                                     ObjectPropertyAccessor *set,
                                     ObjectPropertyRelease *release,
                                     void *opaque);
 
+/**
+ * object_property_del:
+ * @obj: the object to remove a property from
+ * @name: the property to be deleted
+ *
+ * Further use of this method is deprecated, see
+ * object_property_try_add() for details.
+ */
 void object_property_del(Object *obj, const char *name);
 
 ObjectProperty *object_class_property_add(ObjectClass *klass, const char *name,
                                           const char *type,
+                                          const QAPITypeInfo *qapi_type,
                                           ObjectPropertyAccessor *get,
                                           ObjectPropertyAccessor *set,
                                           ObjectPropertyRelease *release,
@@ -1534,7 +1562,7 @@ uint64_t object_property_get_uint(Object *obj, const char *name,
  * object_property_get_enum:
  * @obj: the object
  * @name: the name of the property
- * @typename: the name of the enum data type
+ * @type_info: the QAPITypeInfo of the enum
  * @errp: returns an error if this function fails
  *
  * Returns: the value of the property, converted to an integer (which
@@ -1542,7 +1570,7 @@ uint64_t object_property_get_uint(Object *obj, const char *name,
  * value is not an enum).
  */
 int object_property_get_enum(Object *obj, const char *name,
-                             const char *typename, Error **errp);
+                             const QAPITypeInfo *type_info, Error **errp);
 
 /**
  * object_property_set:
@@ -1959,7 +1987,7 @@ ObjectProperty *object_class_property_add_bool(ObjectClass *klass,
  * @obj: the object to add a property to
  * @name: the name of the property
  * @typename: the name of the enum data type
- * @lookup: enum value namelookup table
+ * @qapi_type: QAPI type info descriptor
  * @get: the getter or %NULL if the property is write-only.
  * @set: the setter or %NULL if the property is read-only
  *
@@ -1970,7 +1998,7 @@ ObjectProperty *object_class_property_add_bool(ObjectClass *klass,
  */
 ObjectProperty *object_property_add_enum(Object *obj, const char *name,
                               const char *typename,
-                              const QEnumLookup *lookup,
+                              const QAPITypeInfo *qapi_type,
                               int (*get)(Object *, Error **),
                               void (*set)(Object *, int, Error **));
 
@@ -1979,7 +2007,7 @@ ObjectProperty *object_property_add_enum(Object *obj, const char *name,
  * @klass: the object class to add a property to
  * @name: the name of the property
  * @typename: the name of the enum data type
- * @lookup: enum value namelookup table
+ * @qapi_type: QAPI type info descriptor
  * @get: the getter or %NULL if the property is write-only.
  * @set: the setter or %NULL if the property is read-only
  *
@@ -1991,38 +2019,9 @@ ObjectProperty *object_property_add_enum(Object *obj, const char *name,
 ObjectProperty *object_class_property_add_enum(ObjectClass *klass,
                                     const char *name,
                                     const char *typename,
-                                    const QEnumLookup *lookup,
+                                    const QAPITypeInfo *qapi_type,
                                     int (*get)(Object *, Error **),
                                     void (*set)(Object *, int, Error **));
-
-/**
- * object_property_add_tm:
- * @obj: the object to add a property to
- * @name: the name of the property
- * @get: the getter or NULL if the property is write-only.
- *
- * Add a read-only struct tm valued property using a getter function.
- * This function will add a property of type 'struct tm'.
- *
- * Returns: The newly added property on success, or %NULL on failure.
- */
-ObjectProperty *object_property_add_tm(Object *obj, const char *name,
-                            void (*get)(Object *, struct tm *, Error **));
-
-/**
- * object_class_property_add_tm:
- * @klass: the object class to add a property to
- * @name: the name of the property
- * @get: the getter or NULL if the property is write-only.
- *
- * Add a read-only struct tm valued property using a getter function.
- * This function will add a property of type 'struct tm'.
- *
- * Returns: The newly added property on success, or %NULL on failure.
- */
-ObjectProperty *object_class_property_add_tm(ObjectClass *klass,
-                            const char *name,
-                            void (*get)(Object *, struct tm *, Error **));
 
 typedef enum {
     /* Automatically add a getter to the property */

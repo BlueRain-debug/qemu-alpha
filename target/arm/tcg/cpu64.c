@@ -20,6 +20,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qapi/qapi-builtin-type-infos.h"
 #include "cpu.h"
 #include "qemu/module.h"
 #include "qapi/visitor.h"
@@ -47,8 +48,8 @@ static void aarch64_a35_initfn(Object *obj)
     set_feature(&cpu->env, ARM_FEATURE_PMU);
 
     /* From B2.2 AArch64 identification registers. */
-    cpu->midr = 0x411fd040;
-    cpu->revidr = 0;
+    SET_IDREG(isar, MIDR, 0x411fd040);
+    SET_IDREG(isar, REVIDR, 0);
     cpu->ctr = 0x84448004;
     SET_IDREG(isar, ID_PFR0, 0x00000131);
     SET_IDREG(isar, ID_PFR1, 0x00011011);
@@ -247,8 +248,8 @@ static void aarch64_a55_initfn(Object *obj)
     SET_IDREG(isar, ID_PFR0, 0x10010131);
     SET_IDREG(isar, ID_PFR1, 0x00011011);
     SET_IDREG(isar, ID_PFR2, 0x00000011);
-    cpu->midr = 0x412FD050;          /* r2p0 */
-    cpu->revidr = 0;
+    SET_IDREG(isar, MIDR, 0x412FD050); /* r2p0 */
+    SET_IDREG(isar, REVIDR, 0);
 
     /* From B2.23 CCSIDR_EL1 */
     /* 32KB L1 dcache */
@@ -291,8 +292,8 @@ static void aarch64_a72_initfn(Object *obj)
     set_feature(&cpu->env, ARM_FEATURE_EL2);
     set_feature(&cpu->env, ARM_FEATURE_EL3);
     set_feature(&cpu->env, ARM_FEATURE_PMU);
-    cpu->midr = 0x410fd083;
-    cpu->revidr = 0x00000000;
+    SET_IDREG(isar, MIDR, 0x410fd083);
+    SET_IDREG(isar, REVIDR, 0);
     cpu->reset_fpsid = 0x41034080;
     cpu->isar.mvfr0 = 0x10110222;
     cpu->isar.mvfr1 = 0x12111111;
@@ -382,8 +383,8 @@ static void aarch64_a76_initfn(Object *obj)
     SET_IDREG(isar, ID_PFR0, 0x10010131);
     SET_IDREG(isar, ID_PFR1, 0x00010000); /* GIC filled in later */
     SET_IDREG(isar, ID_PFR2, 0x00000011);
-    cpu->midr = 0x414fd0b1;          /* r4p1 */
-    cpu->revidr = 0;
+    SET_IDREG(isar, MIDR, 0x414fd0b1); /* r4p1 */
+    SET_IDREG(isar, REVIDR, 0);
 
     /* From B2.18 CCSIDR_EL1 */
     /* 64KB L1 dcache */
@@ -455,8 +456,8 @@ static void aarch64_a78ae_initfn(Object *obj)
     SET_IDREG(isar, ID_PFR0, 0x10010131);
     SET_IDREG(isar, ID_PFR1, 0x00010000); /* GIC filled in later */
     SET_IDREG(isar, ID_PFR2, 0x00000011);
-    cpu->midr = 0x410fd423;          /* r0p3 */
-    cpu->revidr = 0;
+    SET_IDREG(isar, MIDR, 0x410fd423); /* r0p3 */
+    SET_IDREG(isar, REVIDR, 0);
 
     /* From 3.2.33 CCSIDR_EL1 */
     /* 64KB L1 dcache */
@@ -500,11 +501,12 @@ static void aarch64_a64fx_initfn(Object *obj)
     set_feature(&cpu->env, ARM_FEATURE_EL2);
     set_feature(&cpu->env, ARM_FEATURE_EL3);
     set_feature(&cpu->env, ARM_FEATURE_PMU);
-    cpu->midr = 0x461f0010;
-    cpu->revidr = 0x00000000;
+    SET_IDREG(isar, MIDR, 0x461f0010);
+    SET_IDREG(isar, REVIDR, 0);
     cpu->ctr = 0x86668006;
     cpu->reset_sctlr = 0x30000180;
-    SET_IDREG(isar, ID_AA64PFR0, 0x0000000101111111); /* No RAS Extensions */
+    /* No RAS Extensions, GIC filled in later */
+    SET_IDREG(isar, ID_AA64PFR0, 0x0000000100111111);
     SET_IDREG(isar, ID_AA64PFR1, 0x0000000000000000);
     SET_IDREG(isar, ID_AA64DFR0, 0x0000000010305408);
     SET_IDREG(isar, ID_AA64DFR1, 0x0000000000000000);
@@ -706,8 +708,8 @@ static void aarch64_neoverse_n1_initfn(Object *obj)
     SET_IDREG(isar, ID_PFR0, 0x10010131);
     SET_IDREG(isar, ID_PFR1, 0x00010000); /* GIC filled in later */
     SET_IDREG(isar, ID_PFR2, 0x00000011);
-    cpu->midr = 0x414fd0c1;          /* r4p1 */
-    cpu->revidr = 0;
+    SET_IDREG(isar, MIDR, 0x414fd0c1); /* r4p1 */
+    SET_IDREG(isar, REVIDR, 0);
 
     /* From B2.23 CCSIDR_EL1 */
     /* 64KB L1 dcache */
@@ -786,8 +788,8 @@ static void aarch64_neoverse_v1_initfn(Object *obj)
     SET_IDREG(isar, ID_PFR0, 0x21110131);
     SET_IDREG(isar, ID_PFR1, 0x00010000); /* GIC filled in later */
     SET_IDREG(isar, ID_PFR2, 0x00000011);
-    cpu->midr = 0x411FD402;          /* r1p2 */
-    cpu->revidr = 0;
+    SET_IDREG(isar, MIDR, 0x411FD402); /* r1p2 */
+    SET_IDREG(isar, REVIDR, 0);
 
     /*
      * The Neoverse-V1 r1p2 TRM lists 32-bit format CCSIDR_EL1 values,
@@ -983,8 +985,8 @@ static void aarch64_a710_initfn(Object *obj)
     set_feature(&cpu->env, ARM_FEATURE_PMU);
 
     /* Ordered by Section B.4: AArch64 registers */
-    cpu->midr          = 0x412FD471; /* r2p1 */
-    cpu->revidr        = 0;
+    SET_IDREG(isar, MIDR, 0x412FD471); /* r2p1 */
+    SET_IDREG(isar, REVIDR, 0);
     SET_IDREG(isar, ID_PFR0, 0x21110131);
     SET_IDREG(isar, ID_PFR1, 0x00010000); /* GIC filled in later */
     SET_IDREG(isar, ID_DFR0, 0x16011099);
@@ -1086,8 +1088,8 @@ static void aarch64_neoverse_n2_initfn(Object *obj)
     set_feature(&cpu->env, ARM_FEATURE_PMU);
 
     /* Ordered by Section B.5: AArch64 ID registers */
-    cpu->midr          = 0x410FD493; /* r0p3 */
-    cpu->revidr        = 0;
+    SET_IDREG(isar, MIDR, 0x410FD493); /* r0p3 */
+    SET_IDREG(isar, REVIDR, 0);
     SET_IDREG(isar, ID_PFR0, 0x21110131);
     SET_IDREG(isar, ID_PFR1, 0x00010000); /* GIC filled in later */
     SET_IDREG(isar, ID_DFR0, 0x16011099);
@@ -1214,7 +1216,7 @@ void aarch64_max_v8_tcg_initfn(Object *obj)
     t = FIELD_DP64(t, MIDR_EL1, PARTNUM, 'Q');
     t = FIELD_DP64(t, MIDR_EL1, VARIANT, 0);
     t = FIELD_DP64(t, MIDR_EL1, REVISION, 0);
-    cpu->midr = t;
+    SET_IDREG(isar, MIDR, t);
 
     /*
      * We're going to set FEAT_S2FWB, which mandates that CLIDR_EL1.{LoUU,LoUIS}
@@ -1392,7 +1394,7 @@ void aarch64_max_v8_tcg_initfn(Object *obj)
     /* v8.2: FEAT_SVE */
     cpu->sve_vq.supported = MAKE_64BIT_MASK(0, ARM_MAX_VQ);
     aarch64_add_sve_properties(OBJECT(cpu));
-    object_property_add(OBJECT(cpu), "sve-max-vq", "uint32",
+    object_property_add(OBJECT(cpu), "sve-max-vq", "uint32", &uint32_type_info,
                         cpu_max_get_sve_max_vq, cpu_max_set_sve_max_vq,
                         NULL, NULL);
 
@@ -1461,6 +1463,10 @@ void aarch64_max_v9_tcg_initfn(Object *obj)
     t = FIELD_DP64(t, ID_AA64PFR2, FPMR, 1);      /* v9.2: FEAT_FPMR */
     SET_IDREG(isar, ID_AA64PFR2, t);
 
+    t = GET_IDREG(isar, ID_AA64MMFR2);
+    t = FIELD_DP64(t, ID_AA64MMFR2, IDS, 2);      /* v9.0: FEAT_IDTE3 */
+    SET_IDREG(isar, ID_AA64MMFR2, t);
+
     t = GET_IDREG(isar, ID_AA64MMFR3);
     t = FIELD_DP64(t, ID_AA64MMFR3, MEC, 1);      /* v9.2: FEAT_MEC */
     SET_IDREG(isar, ID_AA64MMFR3, t);
@@ -1525,7 +1531,8 @@ void aarch64_max_v9_tcg_initfn(Object *obj)
     object_property_add_bool(obj, "x-rme", cpu_arm_get_rme, cpu_arm_set_rme);
 
     /* v9.4: FEAT_RME_GPC2 */
-    object_property_add(obj, "x-l0gptsz", "uint32", cpu_max_get_l0gptsz,
+    object_property_add(obj, "x-l0gptsz", "uint32", &uint32_type_info,
+                        cpu_max_get_l0gptsz,
                         cpu_max_set_l0gptsz, NULL, NULL);
 }
 

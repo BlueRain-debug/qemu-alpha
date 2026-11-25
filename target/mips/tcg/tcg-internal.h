@@ -27,8 +27,6 @@ void mips_restore_state_to_opc(CPUState *cs,
                                const TranslationBlock *tb,
                                const uint64_t *data);
 
-const char *mips_exception_name(int32_t exception);
-
 G_NORETURN void do_raise_exception_err(CPUMIPSState *env, uint32_t exception,
                                        int error_code, uintptr_t pc);
 
@@ -50,7 +48,7 @@ void mmu_init(CPUMIPSState *env, const mips_def_t *def);
 uint32_t compute_pagemask(uint32_t val);
 
 void r4k_invalidate_tlb(CPUMIPSState *env, int idx, int use_extra);
-uint32_t cpu_mips_get_random(CPUMIPSState *env);
+uint32_t cpu_mips_get_random(const CPUMIPSState *env);
 
 bool mips_io_recompile_replay_branch(CPUState *cs, const TranslationBlock *tb);
 

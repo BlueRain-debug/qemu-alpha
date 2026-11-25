@@ -26,6 +26,7 @@
 #include "hw/virtio/virtio-bus.h"
 #include "hw/virtio/virtio-mem.h"
 #include "qapi/error.h"
+#include "qapi/qapi-builtin-type-infos.h"
 #include "qapi/visitor.h"
 #include "migration/misc.h"
 #include "hw/core/boards.h"
@@ -846,7 +847,7 @@ static void virtio_mem_device_realize(DeviceState *dev, Error **errp)
     if ((nb_numa_nodes && vmem->node >= nb_numa_nodes) ||
         (!nb_numa_nodes && vmem->node)) {
         error_setg(errp, "'%s' property has value '%" PRIu32 "', which exceeds"
-                   "the number of numa nodes: %d", VIRTIO_MEM_NODE_PROP,
+                   " the number of numa nodes: %d", VIRTIO_MEM_NODE_PROP,
                    vmem->node, nb_numa_nodes ? nb_numa_nodes : 1);
         return;
     }
@@ -1533,12 +1534,16 @@ static void virtio_mem_instance_init(Object *obj)
 
     notifier_list_init(&vmem->size_change_notifiers);
 
-    object_property_add(obj, VIRTIO_MEM_SIZE_PROP, "size", virtio_mem_get_size,
+    object_property_add(obj, VIRTIO_MEM_SIZE_PROP, "size",
+                        &size_type_info,
+                        virtio_mem_get_size,
                         NULL, NULL, NULL);
     object_property_add(obj, VIRTIO_MEM_REQUESTED_SIZE_PROP, "size",
+                        &size_type_info,
                         virtio_mem_get_requested_size,
                         virtio_mem_set_requested_size, NULL, NULL);
     object_property_add(obj, VIRTIO_MEM_BLOCK_SIZE_PROP, "size",
+                        &size_type_info,
                         virtio_mem_get_block_size, virtio_mem_set_block_size,
                         NULL, NULL);
 }
@@ -1668,6 +1673,7 @@ static const TypeInfo virtio_mem_info = {
     .instance_finalize = virtio_mem_instance_finalize,
     .class_init = virtio_mem_class_init,
     .class_size = sizeof(VirtIOMEMClass),
+    .secure = true,
     .interfaces = (const InterfaceInfo[]) {
         { TYPE_RAM_DISCARD_SOURCE },
         { }

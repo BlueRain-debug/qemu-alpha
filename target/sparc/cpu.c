@@ -30,6 +30,7 @@
 #include "tcg/tcg.h"
 #include "fpu/softfloat.h"
 #include "target/sparc/translate.h"
+#include "qapi/qapi-builtin-type-infos.h"
 
 //#define DEBUG_FEATURES
 
@@ -560,6 +561,7 @@ static const char * const feature_name[] = {
     [CPU_FEATURE_BIT_VIS3] = "vis3",
     [CPU_FEATURE_BIT_IMA] = "ima",
     [CPU_FEATURE_BIT_VIS4] = "vis4",
+    [CPU_FEATURE_BIT_CRYPTO] = "crypto",
 #else
     [CPU_FEATURE_BIT_MUL] = "mul",
     [CPU_FEATURE_BIT_DIV] = "div",
@@ -949,6 +951,7 @@ static void sparc_set_nwindows(Object *obj, Visitor *v, const char *name,
 
 static const PropertyInfo qdev_prop_nwindows = {
     .type  = "int",
+    .qapi_type = &int_type_info,
     .description = "Number of register windows",
     .get   = sparc_get_nwindows,
     .set   = sparc_set_nwindows,
@@ -977,6 +980,8 @@ static const Property sparc_cpu_properties[] = {
                     CPU_FEATURE_BIT_IMA, false),
     DEFINE_PROP_BIT("vis4",     SPARCCPU, env.def.features,
                     CPU_FEATURE_BIT_VIS4, false),
+    DEFINE_PROP_BIT("crypto",   SPARCCPU, env.def.features,
+                    CPU_FEATURE_BIT_CRYPTO, false),
 #else
     DEFINE_PROP_BIT("mul",      SPARCCPU, env.def.features,
                     CPU_FEATURE_BIT_MUL, false),
@@ -1074,7 +1079,6 @@ static const TCGCPUOps sparc_tcg_ops = {
     .tlb_fill = sparc_cpu_tlb_fill,
     .pointer_wrap = sparc_pointer_wrap,
     .cpu_exec_interrupt = sparc_cpu_exec_interrupt,
-    .cpu_exec_halt = sparc_cpu_has_work,
     .cpu_exec_reset = cpu_reset,
     .do_interrupt = sparc_cpu_do_interrupt,
     .do_transaction_failed = sparc_cpu_do_transaction_failed,
@@ -1098,6 +1102,7 @@ static void sparc_cpu_class_init(ObjectClass *oc, const void *data)
                                        &scc->parent_phases);
 
     cc->class_by_name = sparc_cpu_class_by_name;
+    cc->exception_name = sparc_exception_name;
     cc->list_cpus = sparc_cpu_list,
     cc->parse_features = sparc_cpu_parse_features;
     cc->dump_state = sparc_cpu_dump_state;

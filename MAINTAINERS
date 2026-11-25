@@ -129,6 +129,7 @@ F: docs/system/s390x/
 F: tests/qtest/migration/s390x/
 K: ^Subject:.*(?i)s390x?
 T: git https://gitlab.com/cohuck/qemu.git s390-next
+T: git https://gitlab.com/efarman/qemu.git s390-next
 L: qemu-s390x@nongnu.org
 
 MIPS general architecture support
@@ -149,6 +150,7 @@ F: configs/targets/i386-softmmu.mak
 F: configs/targets/x86_64-softmmu.mak
 F: docs/system/i386/
 F: docs/system/target-i386*
+F: gdbstub/gdb-xml/i386-*.xml
 F: stubs/hmp-cmds-target-i386.c
 F: target/i386/*.[ch]
 F: target/i386/Kconfig
@@ -256,6 +258,8 @@ F: tests/qtest/l2vic-test.c
 F: hw/timer/qct-qtimer.c
 F: include/hw/timer/qct-qtimer.h
 F: tests/qtest/qct-qtimer-test.c
+F: hw/hexagon/hex-board.c
+F: include/hw/hexagon/hex-board.h
 X: target/hexagon/idef-parser/
 X: target/hexagon/gen_idef_parser_funcs.py
 F: linux-user/hexagon/
@@ -302,6 +306,8 @@ M: Laurent Vivier <laurent@vivier.eu>
 S: Maintained
 F: target/m68k/
 F: disas/m68k.c
+F: gdbstub/gdb-xml/cf*.xml
+F: gdbstub/gdb-xml/m68k*.xml
 F: tests/functional/m68k/meson.build
 F: tests/tcg/m68k/
 
@@ -342,7 +348,7 @@ M: Nicholas Piggin <npiggin@gmail.com>
 R: Glenn Miles <milesg@linux.ibm.com>
 R: Harsh Prateek Bora <harshpb@linux.ibm.com>
 L: qemu-ppc@nongnu.org
-S: Odd Fixes
+S: Maintained
 F: target/ppc/
 F: hw/ppc/ppc.c
 F: hw/ppc/ppc_booke.c
@@ -369,6 +375,7 @@ F: configs/targets/riscv*
 F: docs/system/target-riscv.rst
 F: docs/specs/riscv-iommu.rst
 F: target/riscv/
+F: gdbstub/gdb-xml/riscv*.xml
 F: hw/char/riscv_htif.c
 F: hw/riscv/
 F: hw/intc/riscv*
@@ -377,6 +384,7 @@ F: include/hw/riscv/
 F: common-user/host/riscv*
 F: tests/functional/riscv32
 F: tests/functional/riscv64
+F: tests/tcg/riscv32/
 F: tests/tcg/riscv64/
 F: tests/qtest/iommu-riscv-test.c
 
@@ -397,6 +405,16 @@ S: Maintained
 F: target/riscv/XVentanaCondOps.decode
 F: target/riscv/insn_trans/trans_xventanacondops.c.inc
 F: disas/riscv-xventana*
+
+RISC-V SiFive (Xsf*) extensions
+M: Max Chou <max.chou@sifive.com>
+L: qemu-riscv@nongnu.org
+S: Supported
+F: target/riscv/xsf.decode
+F: target/riscv/tcg/insn_trans/trans_xsf.c.inc
+F: target/riscv/tcg/xsf_helper.c
+F: disas/riscv-xsf*
+F: tests/tcg/riscv64/test-xsfvqmacc.S
 
 RENESAS RX CPUs
 R: Yoshinori Sato <yoshinori.sato@nifty.com>
@@ -497,9 +515,9 @@ F: tests/functional/aarch64/test_kvm.py
 
 PPC KVM CPUs
 M: Nicholas Piggin <npiggin@gmail.com>
+M: Amit Machhiwal <amachhiw@linux.ibm.com>
 R: Harsh Prateek Bora <harshpb@linux.ibm.com>
-R: Amit Machhiwal <amachhiw@linux.ibm.com>
-S: Odd Fixes
+S: Maintained
 F: target/ppc/kvm.c
 
 S390 KVM CPUs
@@ -935,6 +953,7 @@ F: include/hw/misc/imx7_*.h
 F: hw/pci-host/designware.c
 F: include/hw/pci-host/designware.h
 F: docs/system/arm/mcimx7d-sabre.rst
+F: tests/functional/arm/test_mcimx7d_sabre.py
 
 MCIMX8MM-EVK / iMX8MM
 M: Gaurav Sharma <gaurav.sharma_7@nxp.com>
@@ -1054,6 +1073,7 @@ F: include/hw/usb/imx-usb-phy.h
 F: include/hw/arm/fsl-imx6.h
 F: include/hw/misc/imx6_*.h
 F: include/hw/ssi/imx_spi.h
+F: tests/functional/arm/test_sabrelite.py
 
 SBSA-REF
 M: Peter Maydell <peter.maydell@linaro.org>
@@ -1064,6 +1084,7 @@ F: hw/arm/sbsa-ref.c
 F: hw/misc/sbsa_ec.c
 F: hw/watchdog/sbsa_gwdt.c
 F: include/hw/watchdog/sbsa_gwdt.h
+F: tests/qtest/sbsa-gwdt-test.c
 F: docs/system/arm/sbsa.rst
 F: tests/functional/aarch64/test_*sbsaref*.py
 
@@ -1204,6 +1225,7 @@ F: hw/char/stm32f2xx_usart.c
 F: hw/timer/stm32f2xx_timer.c
 F: hw/adc/*
 F: hw/ssi/stm32f2xx_spi.c
+F: tests/qtest/stm32f2xx-spi-test.c
 F: include/hw/*/stm32*.h
 
 STM32F405
@@ -1216,6 +1238,7 @@ F: hw/misc/stm32f4xx_syscfg.c
 F: hw/misc/stm32f4xx_exti.c
 F: hw/misc/stm32_rcc.c
 F: include/hw/misc/stm32_rcc.h
+F: tests/qtest/stm32f405*
 
 Netduino 2
 M: Alistair Francis <alistair@alistair23.me>
@@ -1265,12 +1288,8 @@ F: tests/functional/arm/test_emcraft_sf2.py
 ASPEED BMCs
 M: Cédric Le Goater <clg@kaod.org>
 M: Peter Maydell <peter.maydell@linaro.org>
-R: Steven Lee <steven_lee@aspeedtech.com>
-R: Troy Lee <leetroy@gmail.com>
 R: Jamin Lin <jamin_lin@aspeedtech.com>
 R: Kane Chen <kane_chen@aspeedtech.com>
-R: Andrew Jeffery <andrew@codeconstruct.com.au>
-R: Joel Stanley <joel@jms.id.au>
 L: qemu-arm@nongnu.org
 S: Maintained
 F: hw/*/*aspeed*
@@ -1370,11 +1389,18 @@ M: Brian Cain <brian.cain@oss.qualcomm.com>
 R: Pierrick Bouvier <pierrick.bouvier@oss.qualcomm.com>
 S: Supported
 F: hw/hexagon/
+F: hw/misc/qcom-qdsp6ss-clk.c
 F: include/hw/hexagon/
+F: include/hw/misc/qcom-qdsp6ss-clk.h
 F: configs/devices/hexagon-softmmu/default.mak
 F: docs/system/hexagon/
 F: tests/functional/hexagon/
+F: tests/qtest/hexagon-config-test.c
+F: tests/qtest/qcom-dsp-test.c
 F: docs/devel/hexagon-sys.rst
+F: pc-bios/hexagon*
+F: roms/hexagon-hypervisor
+F: roms/hexagon-hypervisor-version
 
 LoongArch Machines
 ------------------
@@ -1662,7 +1688,7 @@ M: Nicholas Piggin <npiggin@gmail.com>
 M: Harsh Prateek Bora <harshpb@linux.ibm.com>
 R: Amit Machhiwal <amachhiw@linux.ibm.com>
 L: qemu-ppc@nongnu.org
-S: Odd Fixes
+S: Maintained
 F: hw/*/spapr*
 F: include/hw/*/spapr*
 F: hw/*/xics*
@@ -1687,7 +1713,7 @@ M: Aditya Gupta <adityag@linux.ibm.com>
 R: Glenn Miles <milesg@linux.ibm.com>
 R: Harsh Prateek Bora <harshpb@linux.ibm.com>
 L: qemu-ppc@nongnu.org
-S: Odd Fixes
+S: Maintained
 F: docs/system/ppc/powernv.rst
 F: hw/ppc/pnv*
 F: hw/intc/pnv*
@@ -1837,7 +1863,9 @@ R: Portia Stephens <portias@oss.tenstorrent.com>
 L: qemu-riscv@nongnu.org
 S: Supported
 F: docs/system/riscv/tt_*.rst
+F: hw/misc/tt_*.c
 F: hw/riscv/tt_*.c
+F: include/hw/misc/tt_*.h
 F: include/hw/riscv/tt_*.h
 F: tests/functional/riscv64/test_tt_*.py
 
@@ -1874,6 +1902,18 @@ F: tests/qtest/k230-ddr-test.c
 F: tests/qtest/k230-wdt-test.c
 F: tests/qtest/k230-gsdma-test.c
 F: tests/qtest/k230-decomp-gzip-test.c
+
+Milk-V Duo
+M: Kuan-Wei Chiu <visitorckw@gmail.com>
+S: Maintained
+F: docs/system/riscv/milkv-duo.rst
+F: hw/misc/cv1800b_clk.c
+F: hw/riscv/cv1800b.c
+F: hw/riscv/milkv_duo.c
+F: include/hw/misc/cv1800b_clk.h
+F: include/hw/riscv/cv1800b.h
+F: tests/functional/riscv64/test_milkv_duo.py
+F: tests/qtest/milkv-duo-test.c
 
 RX Machines
 -----------
@@ -1964,7 +2004,7 @@ S390-ccw boot
 M: Jared Rossi <jrossi@linux.ibm.com>
 R: Zhuoying Cai <zycai@linux.ibm.com>
 R: Christian Borntraeger <borntraeger@linux.ibm.com>
-R: Jason Herne <jjherne@linux.ibm.com>
+R: Joshua Daley <jdaley@linux.ibm.com>
 S: Supported
 F: hw/s390x/ipl.*
 F: hw/s390x/cert-store.[ch]
@@ -2148,8 +2188,7 @@ M: Philippe Mathieu-Daudé <philmd@oss.qualcomm.com>
 S: Supported
 F: include/qemu/target-info*.h
 F: target-info*.c
-F: configs/targets/*.c
-F: tests/unit/test-multi-targets.c
+F: tests/unit/test-multi-target.c
 
 Xtensa Machines
 ---------------
@@ -2279,7 +2318,7 @@ F: docs/specs/*pci*
 F: docs/system/sriov.rst
 
 ARM PCI Hotplug
-M: Gustavo Romero <gustavo.romero@linaro.org>
+M: Gustavo Romero <gromero@redhat.com>
 L: qemu-arm@nongnu.org
 S: Supported
 F: tests/functional/aarch64/test_hotplug_pci.py
@@ -2511,18 +2550,26 @@ M: Michael S. Tsirkin <mst@redhat.com>
 R: Stefano Garzarella <sgarzare@redhat.com>
 S: Supported
 F: hw/*/*vhost*
-F: docs/interop/vhost-user*
 F: docs/system/devices/virtio/vhost-user*
 F: contrib/vhost-user-*/
 F: backends/*vhost*
 F: include/system/vhost-user-backend.h
 F: include/hw/virtio/vhost*
 F: include/*/vhost*
-F: subprojects/libvhost-user/
 F: block/export/vhost-user*
 F: util/vhost-user-server.c
 F: net/vhost*
 F: tests/functional/x86_64/test_vhost_user_bridge.py
+
+vhost-user protocol
+M: Michael S. Tsirkin <mst@redhat.com>
+R: Stefano Garzarella <sgarzare@redhat.com>
+L: vhost-user@lists.linux.dev
+S: Supported
+F: docs/interop/vhost-user*
+F: hw/virtio/vhost-user.c
+F: include/hw/virtio/vhost-user.h
+F: subprojects/libvhost-user/
 
 vhost-shadow-virtqueue
 R: Eugenio Pérez <eperezma@redhat.com>
@@ -2561,6 +2608,7 @@ F: hw/9pfs/
 X: hw/9pfs/xen-9p*
 F: fsdev/
 F: tests/qtest/virtio-9p-test.c
+F: tests/qtest/virtio-9p-race-test.c
 F: tests/qtest/libqos/virtio-9p*
 T: git https://github.com/cschoenebeck/qemu.git 9p.next
 
@@ -2758,6 +2806,7 @@ S: Supported
 F: hw/ufs/*
 F: include/block/ufs.h
 F: tests/qtest/ufs-test.c
+F: docs/system/devices/ufs.rst
 
 megasas
 L: qemu-block@nongnu.org
@@ -2852,6 +2901,12 @@ S: Maintained
 F: hw/i2c/designware_i2c.c
 F: include/hw/i2c/designware_i2c.h
 
+DesignWare 8250 UART
+M: Kuan-Wei Chiu <visitorckw@gmail.com>
+S: Maintained
+F: hw/char/dw8250.c
+F: include/hw/char/dw8250.h
+
 Generic Loader
 M: Alistair Francis <alistair@alistair23.me>
 S: Maintained
@@ -2892,7 +2947,7 @@ F: tests/qtest/vmgenid-test.c
 
 VM Launch Update
 M: Ani Sinha <anisinha@redhat.com>
-M: Gerd Hoffman <kraxel@redhat.com>
+M: Gerd Hoffmann <kraxel@redhat.com>
 S: Maintained
 F: hw/misc/vmlaunchupdate.c
 F: include/hw/misc/vmlaunchupdate.h
@@ -3025,9 +3080,9 @@ F: tests/qtest/fw_cfg-test.c
 
 XIVE
 M: Glenn Miles <milesg@linux.ibm.com>
-R: Gautam Menghani <gautam@linux.ibm.com>
+M: Gautam Menghani <gautam@linux.ibm.com>
 L: qemu-ppc@nongnu.org
-S: Odd Fixes
+S: Maintained
 F: hw/*/*xive*
 F: include/hw/*/*xive*
 F: tests/qtest/*xive*
@@ -3147,7 +3202,7 @@ F: include/hw/hyperv/dynmem-proto.h
 F: include/hw/hyperv/hv-balloon.h
 
 ivshmem-flat
-M: Gustavo Romero <gustavo.romero@linaro.org>
+M: Gustavo Romero <gromero@redhat.com>
 S: Maintained
 F: hw/misc/ivshmem-flat.c
 F: include/hw/misc/ivshmem-flat.h
@@ -3341,7 +3396,7 @@ F: docs/devel/migration/CPR.rst
 
 Compute Express Link
 M: Jonathan Cameron <jic23@kernel.org>
-R: Junjie Cao <junjie.cao@intel.com>
+R: Junjie Cao <junjie.cao@linux.dev>
 R: Anisa Su <anisa.su@samsung.com>
 L: linux-cxl@vger.kernel.org
 S: Supported
@@ -3365,7 +3420,7 @@ F: migration/block-dirty-bitmap.c
 F: util/hbitmap.c
 F: tests/unit/test-hbitmap.c
 F: docs/interop/bitmaps.rst
-T: git https://repo.or.cz/qemu/ericb.git bitmaps
+T: git https://gitlab.com/ebblake/qemu.git bitmaps
 T: git https://gitlab.com/vsementsov/qemu.git block
 
 Character device backends
@@ -4364,7 +4419,7 @@ F: blockdev-nbd.c
 F: docs/interop/nbd.rst
 F: docs/tools/qemu-nbd.rst
 F: tests/qemu-iotests/tests/*nbd*
-T: git https://repo.or.cz/qemu/ericb.git nbd
+T: git https://gitlab.com/ebblake/qemu.git nbd
 T: git https://gitlab.com/vsementsov/qemu.git block
 
 NFS
@@ -4656,6 +4711,7 @@ Guest Test Compilation Support
 M: Alex Bennée <alex.bennee@linaro.org>
 M: Pierrick Bouvier <pierrick.bouvier@oss.qualcomm.com>
 S: Maintained
+F: tests/tcg/include/tap.h
 F: tests/tcg/meson.build
 
 GitLab custom runners (HW sponsored by Linaro, OSUOSL and IBM)

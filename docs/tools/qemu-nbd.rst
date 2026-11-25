@@ -83,9 +83,15 @@ driver options if :option:`--image-opts` is specified.
 
 .. option:: -B, --bitmap=NAME
 
-  If *filename* has a qcow2 persistent bitmap *NAME*, expose
-  that bitmap via the ``qemu:dirty-bitmap:NAME`` metadata context
-  accessible through NBD_OPT_SET_META_CONTEXT.
+  If *filename* has a persistent bitmap *NAME* (possibly via a backing
+  chain), expose that bitmap via the ``qemu:dirty-bitmap:NAME`` metadata
+  context accessible through NBD_OPT_SET_META_CONTEXT.
+
+.. option:: --all-bitmaps
+
+  If *filename* has any persistent bitmaps (possibly via a backing
+  chain), expose one ``qemu:dirty-bitmap:NAME`` metadata context per
+  bitmap, accessible through NBD_OPT_SET_META_CONTEXT.
 
 .. option:: -s, --snapshot
 
@@ -95,9 +101,10 @@ driver options if :option:`--image-opts` is specified.
 
 .. option:: -l, --load-snapshot=SNAPSHOT_PARAM
 
-  Load an internal snapshot inside *filename* and export it
-  as an read-only device, SNAPSHOT_PARAM format is
-  ``snapshot.id=[ID],snapshot.name=[NAME]`` or ``[ID_OR_NAME]``
+  Load an internal snapshot inside *filename* and export it.
+  SNAPSHOT_PARAM format is ``snapshot.id=[ID],snapshot.name=[NAME]``
+  or ``[ID_OR_NAME]``. The export is read-only unless ``-s`` is also
+  in use.
 
 .. option:: --cache=CACHE
 

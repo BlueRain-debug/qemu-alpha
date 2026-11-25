@@ -346,7 +346,8 @@ int hppa_get_physical_address(CPUHPPAState *env, vaddr addr, int mmu_idx,
     return ret;
 }
 
-hwaddr hppa_cpu_get_phys_addr_debug(CPUState *cs, vaddr addr)
+bool hppa_cpu_translate_for_debug(CPUState *cs, vaddr addr,
+                                  TranslateForDebugResult *result)
 {
     HPPACPU *cpu = HPPA_CPU(cs);
     hwaddr phys;
@@ -361,10 +362,20 @@ hwaddr hppa_cpu_get_phys_addr_debug(CPUState *cs, vaddr addr)
     excp = hppa_get_physical_address(&cpu->env, addr, mmu_idx, 0, 0,
                                      &phys, &prot);
 
-    /* Since we're translating for debugging, the only error that is a
-       hard error is no translation at all.  Otherwise, while a real cpu
-       access might not have permission, the debugger does.  */
-    return excp == EXCP_DTLB_MISS ? -1 : phys;
+    /*
+     * Since we're translating for debugging, the only error that is a
+     * hard error is no translation at all.  Otherwise, while a real cpu
+     * access might not have permission, the debugger does.
+     */
+    if (excp == EXCP_DTLB_MISS) {
+        return false;
+    }
+    *result = (TranslateForDebugResult) {
+        .physaddr = phys,
+        .lg_page_size = TARGET_PAGE_BITS,
+        .attrs.debug = 1,
+    };
+    return true;
 }
 
 void hppa_set_ior_and_isr(CPUHPPAState *env, vaddr addr, bool mmu_disabled)
@@ -414,6 +425,21 @@ raise_exception_with_ior(CPUHPPAState *env, int excp, uintptr_t retaddr,
     hppa_set_ior_and_isr(env, addr, mmu_disabled);
 
     cpu_loop_exit(cs);
+}
+
+G_NORETURN void HELPER(fpu_mem)(CPUHPPAState *env, target_ulong addr,
+                               uint32_t mmu_idx, uint32_t mop, uint32_t type)
+{
+    hwaddr phys;
+    int prot, excp;
+
+    /* Memory faults take priority over the assist emulation trap. */
+    excp = hppa_get_physical_address(env, addr, mmu_idx, type, mop, &phys, &prot);
+    if (excp < 0) {
+        excp = EXCP_ASSIST_EMU;
+    }
+    raise_exception_with_ior(env, excp, GETPC(), addr,
+                             MMU_IDX_MMU_DISABLED(mmu_idx));
 }
 
 void hppa_cpu_do_transaction_failed(CPUState *cs, hwaddr physaddr,
@@ -512,7 +538,15 @@ void HELPER(itlba_pa11)(CPUHPPAState *env, target_ulong addr, target_ulong reg)
 static void set_access_bits_pa11(CPUHPPAState *env, HPPATLBEntry *ent,
                                  target_ulong reg)
 {
-    ent->access_id = extract32(reg, 1, 18);
+    /*
+     * The architecture manual states that if smaller than 18-bit access IDs
+     * are physically implemented in the CPU, only the appropriate number of
+     * rightmost bits of GR[r]{13..30} are stored in the TLB.  Older parisc
+     * chips (PCXS, PCXT, PCXL, PCXL2) only support 15 bit protection IDs.
+     * PCXT' (pa7200) has 18 bit protection IDs, but only 16 bit spaceids.
+     * We currently emulate PA7100 and PA7100LC CPUs, so use 15 bits here.
+     */
+    ent->access_id = extract32(reg, 1, 15);     /* 15-bit PA1.1 PIDs */
     ent->u = extract32(reg, 19, 1);
     ent->ar_pl2 = extract32(reg, 20, 2);
     ent->ar_pl1 = extract32(reg, 22, 2);

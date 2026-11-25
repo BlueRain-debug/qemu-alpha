@@ -132,6 +132,7 @@ DEF_HELPER_6(csrrw_i128, tl, env, int, tl, tl, tl, tl)
 #ifndef CONFIG_USER_ONLY
 DEF_HELPER_1(sret, tl, env)
 DEF_HELPER_1(mret, tl, env)
+DEF_HELPER_1(dret, tl, env)
 DEF_HELPER_1(mnret, tl, env)
 DEF_HELPER_1(ctr_clear, void, env)
 DEF_HELPER_1(wfi, void, env)
@@ -141,6 +142,8 @@ DEF_HELPER_1(tlb_flush_all, void, env)
 DEF_HELPER_4(ctr_add_entry, void, env, tl, tl, tl)
 /* Native Debug */
 DEF_HELPER_1(itrigger_match, void, env)
+DEF_HELPER_1(sdext_step, void, env)
+DEF_HELPER_2(sdext_ebreak, void, env, tl)
 #endif
 
 /* Hypervisor functions */
@@ -1350,6 +1353,32 @@ DEF_HELPER_5(vsm4k_vi, void, ptr, ptr, i32, env, i32)
 DEF_HELPER_4(vsm4r_vv, void, ptr, ptr, env, i32)
 DEF_HELPER_4(vsm4r_vs, void, ptr, ptr, env, i32)
 
+/* Zvabd Extension */
+DEF_HELPER_6(vabd_vv_b, void, ptr, ptr, ptr, ptr, env, i32)
+DEF_HELPER_6(vabd_vv_h, void, ptr, ptr, ptr, ptr, env, i32)
+DEF_HELPER_6(vabd_vv_w, void, ptr, ptr, ptr, ptr, env, i32)
+DEF_HELPER_6(vabd_vv_d, void, ptr, ptr, ptr, ptr, env, i32)
+DEF_HELPER_6(vabd_vx_b, void, ptr, ptr, tl, ptr, env, i32)
+DEF_HELPER_6(vabd_vx_h, void, ptr, ptr, tl, ptr, env, i32)
+DEF_HELPER_6(vabd_vx_w, void, ptr, ptr, tl, ptr, env, i32)
+DEF_HELPER_6(vabd_vx_d, void, ptr, ptr, tl, ptr, env, i32)
+DEF_HELPER_6(vabdu_vv_b, void, ptr, ptr, ptr, ptr, env, i32)
+DEF_HELPER_6(vabdu_vv_h, void, ptr, ptr, ptr, ptr, env, i32)
+DEF_HELPER_6(vabdu_vv_w, void, ptr, ptr, ptr, ptr, env, i32)
+DEF_HELPER_6(vabdu_vv_d, void, ptr, ptr, ptr, ptr, env, i32)
+DEF_HELPER_6(vabdu_vx_b, void, ptr, ptr, tl, ptr, env, i32)
+DEF_HELPER_6(vabdu_vx_h, void, ptr, ptr, tl, ptr, env, i32)
+DEF_HELPER_6(vabdu_vx_w, void, ptr, ptr, tl, ptr, env, i32)
+DEF_HELPER_6(vabdu_vx_d, void, ptr, ptr, tl, ptr, env, i32)
+DEF_HELPER_6(vwabda_vv_b, void, ptr, ptr, ptr, ptr, env, i32)
+DEF_HELPER_6(vwabda_vv_h, void, ptr, ptr, ptr, ptr, env, i32)
+DEF_HELPER_6(vwabda_vx_b, void, ptr, ptr, tl, ptr, env, i32)
+DEF_HELPER_6(vwabda_vx_h, void, ptr, ptr, tl, ptr, env, i32)
+DEF_HELPER_6(vwabdau_vv_b, void, ptr, ptr, ptr, ptr, env, i32)
+DEF_HELPER_6(vwabdau_vv_h, void, ptr, ptr, ptr, ptr, env, i32)
+DEF_HELPER_6(vwabdau_vx_b, void, ptr, ptr, tl, ptr, env, i32)
+DEF_HELPER_6(vwabdau_vx_h, void, ptr, ptr, tl, ptr, env, i32)
+
 /* CFI (zicfiss) helpers */
 #ifndef CONFIG_USER_ONLY
 DEF_HELPER_1(ssamoswap_disabled, void, env)
@@ -1358,7 +1387,12 @@ DEF_HELPER_1(ssamoswap_disabled, void, env)
 /* Zalrsc SC write probe */
 DEF_HELPER_FLAGS_3(sc_probe_write, TCG_CALL_NO_WG, void, env, tl, tl)
 
-#ifdef CONFIG_USER_ONLY
-/* Invalidate reservations overlapping a completed linux-user store. */
-DEF_HELPER_3(riscv_invalidate_reservations, void, env, tl, tl)
-#endif
+/* SiFive Custom int8 Matrix-Multiply */
+DEF_HELPER_5(sf_vqmaccu_4x8x4, void, ptr, ptr, ptr, env, i32)
+DEF_HELPER_5(sf_vqmacc_4x8x4, void, ptr, ptr, ptr, env, i32)
+DEF_HELPER_5(sf_vqmaccus_4x8x4, void, ptr, ptr, ptr, env, i32)
+DEF_HELPER_5(sf_vqmaccsu_4x8x4, void, ptr, ptr, ptr, env, i32)
+DEF_HELPER_5(sf_vqmaccu_2x8x2, void, ptr, ptr, ptr, env, i32)
+DEF_HELPER_5(sf_vqmacc_2x8x2, void, ptr, ptr, ptr, env, i32)
+DEF_HELPER_5(sf_vqmaccus_2x8x2, void, ptr, ptr, ptr, env, i32)
+DEF_HELPER_5(sf_vqmaccsu_2x8x2, void, ptr, ptr, ptr, env, i32)

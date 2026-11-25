@@ -10,12 +10,20 @@
 #define BCM2838_PERIPHERALS_H
 
 #include "hw/arm/bcm2835_peripherals.h"
+#include "hw/misc/bcm2838_rng200.h"
+#include "hw/misc/bcm2838_thermal.h"
+#include "hw/arm/bcm2838_pcie.h"
+#include "hw/net/bcm2838_genet.h"
 #include "hw/sd/sdhci.h"
 #include "hw/gpio/bcm2838_gpio.h"
 
 /* SPI */
 #define GIC_SPI_INTERRUPT_MBOX         33
 #define GIC_SPI_INTERRUPT_MPHI         40
+#define GIC_SPI_INTERRUPT_SYS_TIMER0   64
+#define GIC_SPI_INTERRUPT_SYS_TIMER1   65
+#define GIC_SPI_INTERRUPT_SYS_TIMER2   66
+#define GIC_SPI_INTERRUPT_SYS_TIMER3   67
 #define GIC_SPI_INTERRUPT_DWC2         73
 #define GIC_SPI_INTERRUPT_DMA_0        80
 #define GIC_SPI_INTERRUPT_DMA_6        86
@@ -23,6 +31,7 @@
 #define GIC_SPI_INTERRUPT_DMA_9_10     88
 #define GIC_SPI_INTERRUPT_AUX_UART1    93
 #define GIC_SPI_INTERRUPT_I2C          117
+#define GIC_SPI_INTERRUPT_SPI          118
 #define GIC_SPI_INTERRUPT_SDHOST       120
 #define GIC_SPI_INTERRUPT_UART0        121
 #define GIC_SPI_INTERRUPT_RNG200       125
@@ -51,6 +60,8 @@
 #define BCM2838_MPHI_OFFSET     0xb200
 #define BCM2838_MPHI_SIZE       0x200
 
+#define GENET_OFFSET            0x1580000
+
 #define TYPE_BCM2838_PERIPHERALS "bcm2838-peripherals"
 OBJECT_DECLARE_TYPE(BCM2838PeripheralState, BCM2838PeripheralClass,
                     BCM2838_PERIPHERALS)
@@ -64,7 +75,12 @@ struct BCM2838PeripheralState {
     MemoryRegion peri_low_mr_alias;
     MemoryRegion mphi_mr_alias;
 
+    BCM2838Rng200State rng200;
+    Bcm2838ThermalState thermal;
     SDHCIState emmc2;
+    MemoryRegion pcie_mmio_alias;
+    BCM2838PcieHostState pcie_host;
+    BCM2838GenetState genet;
     BCM2838GpioState gpio;
 
     OrIRQState mmc_irq_orgate;

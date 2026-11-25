@@ -2148,7 +2148,7 @@ static bool trans_SEV(DisasContext *s, arg_SEV *a)
      * SEV is a NOP for user-mode emulation.
      */
 #ifndef CONFIG_USER_ONLY
-    gen_helper_sev(tcg_env);
+    gen_helper_sev();
 #endif
     return true;
 }
@@ -2675,7 +2675,7 @@ static void gen_sysreg_undef(DisasContext *s, bool isread,
      */
     uint32_t syndrome;
 
-    if (isread && dc_isar_feature(aa64_ids, s) &&
+    if (isread && dc_isar_feature(aa64_idst, s) &&
         arm_cpreg_encoding_in_idspace(op0, op1, op2, crn, crm)) {
         syndrome = syn_aa64_sysregtrap(op0, op1, op2, crn, crm, rt, isread);
     } else {
@@ -3686,6 +3686,13 @@ static bool trans_STLR(DisasContext *s, arg_stlr *a)
                                 true, a->rn != 31, memop);
     do_gpr_st(s, cpu_reg(s, a->rt), clean_addr, memop, true, a->rt,
               iss_sf, a->lasr);
+    /*
+     * STLR is an RCsc store-release: the Armv8 architecture orders it
+     * before any subsequent RCsc load-acquire, which is what forbids the
+     * store-buffering litmus test.  The barrier above only orders
+     * previous accesses before the store.
+     */
+    tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC);
     return true;
 }
 
@@ -4429,6 +4436,12 @@ static bool trans_STLR_i(DisasContext *s, arg_ldapr_stlr_i *a)
     /* Store-Release semantics */
     tcg_gen_mb(TCG_MO_ALL | TCG_BAR_STRL);
     do_gpr_st(s, cpu_reg(s, a->rt), clean_addr, mop, true, a->rt, iss_sf, true);
+    /*
+     * Like STLR, STLPUR is an RCsc store-release and must be ordered
+     * before any subsequent RCsc load-acquire, so it needs a barrier
+     * after the store as well.
+     */
+    tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC);
     return true;
 }
 

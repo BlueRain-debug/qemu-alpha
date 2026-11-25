@@ -108,7 +108,6 @@ typedef struct DisasContext {
     uint8_t vex_v;  /* vex vvvv register, without 1's complement.  */
     bool vex_ndd; /* is this a 3-operand instruction? */
     bool vex_w; /* used by AVX even on 32-bit processors */
-    uint8_t popl_esp_hack; /* for correct popl with esp base handling */
     uint8_t rip_offset; /* only used in x86_64, but left for simplicity */
 
     uint8_t rex_r; /* 0 for i386, but left for simplicity */
@@ -404,6 +403,12 @@ static inline bool byte_reg_is_xH(DisasContext *s, int reg)
     return true;
 }
 
+/* Select the size of an INS/OUTS operation ("z" operand size).  */
+static inline MemOp mo_ins_outs(DisasContext *s)
+{
+    return s->dflag == MO_16 ? MO_16 : MO_32;
+}
+
 /* Select the size of a push/pop operation.  */
 static inline MemOp mo_pushpop(DisasContext *s, MemOp ot)
 {
@@ -620,7 +625,25 @@ static void gen_lea_v_seg_dest(DisasContext *s, MemOp aflag, TCGv dest, TCGv a0,
         ovr_seg = def_seg;
     }
 
-    has_base = ovr_seg >= R_FS || (ovr_seg >= 0 && ADDSEG(s));
+    switch (ovr_seg) {
+    case R_DS:
+    case R_ES:
+    case R_SS:
+        has_base = ADDSEG(s);
+        break;
+    case R_CS:
+        has_base = !CODE64(s);
+        break;
+    case R_FS:
+    case R_GS:
+        has_base = true;
+        break;
+    default:
+        assert(ovr_seg < 0);
+        has_base = false;
+        break;
+    }
+
     easize = CODE64(s) ? MO_64 : MO_32;
 
     if (has_base) {
@@ -1698,31 +1721,32 @@ static TCGv gen_shiftd_rm_T1(DisasContext *s, MemOp ot,
 /* Compute the address, with a minimum number of TCG ops.  */
 static TCGv gen_lea_modrm_1(DisasContext *s, AddressParts a, bool is_vsib)
 {
-    TCGv ea = NULL;
+    TCGv ea = (a.base >= 0 ? cpu_regs[a.base] : NULL);
 
     if (a.index >= 0 && !is_vsib) {
+        TCGv index = cpu_regs[a.index];
+
+        if (ea) {
+            tcg_gen_lea_tl(s->A0, ea, index, a.scale, a.disp);
+            return s->A0;
+        }
         if (a.scale == 0) {
-            ea = cpu_regs[a.index];
+            ea = index;
         } else {
-            tcg_gen_shli_tl(s->A0, cpu_regs[a.index], a.scale);
+            tcg_gen_shli_tl(s->A0, index, a.scale);
             ea = s->A0;
         }
-        if (a.base >= 0) {
-            tcg_gen_add_tl(s->A0, ea, cpu_regs[a.base]);
-            ea = s->A0;
-        }
-    } else if (a.base >= 0) {
-        ea = cpu_regs[a.base];
-    }
-    if (!ea) {
+    } else if (!ea) {
         if (tb_cflags(s->base.tb) & CF_PCREL && a.base == -2) {
             /* With cpu_eip ~= pc_save, the expression is pc-relative. */
             tcg_gen_addi_tl(s->A0, cpu_eip, a.disp - s->pc_save);
         } else {
             tcg_gen_movi_tl(s->A0, a.disp);
         }
-        ea = s->A0;
-    } else if (a.disp != 0) {
+        return s->A0;
+    }
+
+    if (a.disp != 0) {
         tcg_gen_addi_tl(s->A0, ea, a.disp);
         ea = s->A0;
     }
@@ -1965,7 +1989,7 @@ static void gen_popa(DisasContext *s)
     gen_stack_update(s, 8 * size);
 }
 
-static void gen_enter(DisasContext *s, int esp_addend, int level)
+static void gen_enter(DisasContext *s, uint16_t esp_addend, int level)
 {
     MemOp d_ot = mo_pushpop(s, s->dflag);
     MemOp a_ot = mo_stacksize(s);
@@ -2002,20 +2026,6 @@ static void gen_enter(DisasContext *s, int esp_addend, int level)
 
     /* Compute the final value of ESP.  */
     tcg_gen_subi_tl(s->T1, s->T1, esp_addend + size * level);
-    gen_op_mov_reg_v(s, a_ot, R_ESP, s->T1);
-}
-
-static void gen_leave(DisasContext *s)
-{
-    MemOp d_ot = mo_pushpop(s, s->dflag);
-    MemOp a_ot = mo_stacksize(s);
-
-    gen_lea_ss_ofs(s, s->A0, cpu_regs[R_EBP], 0);
-    gen_op_ld_v(s, d_ot, s->T0, s->A0);
-
-    tcg_gen_addi_tl(s->T1, cpu_regs[R_EBP], 1 << d_ot);
-
-    gen_op_mov_reg_v(s, d_ot, R_EBP, s->T0);
     gen_op_mov_reg_v(s, a_ot, R_ESP, s->T1);
 }
 

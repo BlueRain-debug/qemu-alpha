@@ -22,17 +22,14 @@
 typedef enum X86OpType {
     X86_TYPE_None,
 
-    X86_TYPE_A, /* Implicit */
     X86_TYPE_B, /* VEX.vvvv selects a GPR */
     X86_TYPE_C, /* REG in the modrm byte selects a control register */
     X86_TYPE_D, /* REG in the modrm byte selects a debug register */
     X86_TYPE_E, /* ALU modrm operand */
-    X86_TYPE_F, /* EFLAGS/RFLAGS */
     X86_TYPE_G, /* REG in the modrm byte selects a GPR */
     X86_TYPE_H, /* For AVX, VEX.vvvv selects an XMM/YMM register */
     X86_TYPE_I, /* Immediate */
     X86_TYPE_J, /* Relative offset for a jump */
-    X86_TYPE_L, /* The upper 4 bits of the immediate select a 128-bit register */
     X86_TYPE_M, /* modrm byte selects a memory operand */
     X86_TYPE_N, /* R/M in the modrm byte selects an MMX register */
     X86_TYPE_O, /* Absolute address encoded in the instruction */
@@ -43,8 +40,6 @@ typedef enum X86OpType {
     X86_TYPE_U, /* R/M in the modrm byte selects an XMM/YMM register */
     X86_TYPE_V, /* reg in the modrm byte selects an XMM/YMM register */
     X86_TYPE_W, /* XMM/YMM modrm operand */
-    X86_TYPE_X, /* string source */
-    X86_TYPE_Y, /* string destination */
 
     /* Custom */
     X86_TYPE_EM, /* modrm byte selects an ALU memory operand */
@@ -78,15 +73,11 @@ typedef enum X86OpSize {
     X86_SIZE_d,  /* 32-bit */
     X86_SIZE_dq, /* SSE/AVX 128-bit */
     X86_SIZE_p,  /* Far pointer */
-    X86_SIZE_pd, /* SSE/AVX packed double precision */
-    X86_SIZE_pi, /* MMX */
-    X86_SIZE_ps, /* SSE/AVX packed single precision */
     X86_SIZE_q,  /* 64-bit */
     X86_SIZE_qq, /* AVX 256-bit */
     X86_SIZE_s,  /* Descriptor */
     X86_SIZE_sd, /* SSE/AVX scalar double precision */
     X86_SIZE_ss, /* SSE/AVX scalar single precision */
-    X86_SIZE_si, /* 32-bit GPR */
     X86_SIZE_v,  /* 16/32/64-bit, based on operand size */
     X86_SIZE_w,  /* 16-bit */
     X86_SIZE_x,  /* 128/256-bit, based on operand size */
@@ -244,6 +235,12 @@ typedef enum X86InsnSpecial {
 
     /* Memory operand size of MOV from segment register is MO_16 */
     X86_SPECIAL_Op0_Mw,
+
+    /*
+     * If the address uses ESP as the base register, use the value
+     * of ESP after the pop.
+     */
+    X86_SPECIAL_PopESP,
 } X86InsnSpecial;
 
 /*
@@ -255,6 +252,9 @@ typedef enum X86InsnSpecial {
  */
 typedef enum X86VEXSpecial {
     X86_VEX_None,
+
+    /* SSE and AVX instructions use different encoding */
+    X86_VEX_SSEOnly,
 
     /* Legacy SSE instructions that allow unaligned operands */
     X86_VEX_SSEUnaligned,

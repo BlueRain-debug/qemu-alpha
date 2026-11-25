@@ -1,8 +1,3 @@
-cc_feat_cflags = {
-  'power8': '-mcpu=power8',
-  'power10': '-mcpu=power10',
-}
-
 tests = []
 
 # Multi arch tests
@@ -12,6 +7,12 @@ foreach t: tcg_tests['multiarch-linux-user']['tests']
     # for a given instruction. Thus, skip this test.
     if fs.stem(src) == 'test-plugin-mem-access' and 'wrapper' in setup
       continue
+    endif
+    if fs.stem(src).contains('float_conv')
+      # Ensure float NaN tests are done against a known cpu generation
+      if 'cflags' in setup
+        setup += {'cflags': setup['cflags'] + '-mcpu=power8'}
+      endif
     endif
     tests += {src: setup}
   endforeach
@@ -44,10 +45,12 @@ if 'qemu-ppc64' in emulators
     'ppc64-linux-user': {
       'cc': 'powerpc64-linux-gnu-gcc',
       'cc_dockerfile': 'debian-all-test-cross',
-      'cc_feat_cflags': cc_feat_cflags,
+      'cc_feat_cflags': {
+        'power8': '-mcpu=power8',
+        'power10': '-mcpu=power10',
+      },
       'folder': 'ppc64',
       'gdb_arch': 'ppc64',
-      'gdb_feat_version': gdb_feat_version,
       'qemu': emulators['qemu-ppc64'],
       'tests': tests,
     }

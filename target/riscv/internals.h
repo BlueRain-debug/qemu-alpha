@@ -201,10 +201,11 @@ static inline target_ulong get_xepc_mask(CPURISCVState *env)
     }
 }
 
-#ifndef CONFIG_USER_ONLY
-/* Our implementation of SysemuCPUOps::has_work */
-bool riscv_cpu_has_work(CPUState *cs);
-#endif
+extern const struct SemihostingCPUOps riscv_semihosting_ops;
+void riscv_get_dump_info(const CPUState *cs, ArchDumpInfo *info,
+                         const GuestPhysBlockList *guest_phys_blocks);
+size_t riscv_get_note_size(const CPUState *cs, int class, int machine,
+                           int nr_cpus);
 
 /* Zjpm addr masking routine */
 static inline target_ulong adjust_addr_body(CPURISCVState *env,

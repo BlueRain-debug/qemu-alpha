@@ -29,11 +29,20 @@
 
 #ifdef CONFIG_FDT
 #include <libfdt.h>
+
+/* Enough for the header, the memory reservation block and an empty root node */
+#define EMPTY_FDT_SIZE 256
 #endif
 
 #ifndef IGVM_VHT_OPTIONAL_BIT
 #define IGVM_VHT_OPTIONAL_BIT (1U << 31)
 #endif
+
+struct IgvmMemoryRegion {
+    Object parent_obj;
+    MemoryRegion mr;
+    QTAILQ_ENTRY(IgvmMemoryRegion) next;
+};
 
 /*
  * Bit 31 of the variable header type indicates that the header is
@@ -158,6 +167,8 @@ static int qigvm_directive_snp_id_block(QIgvm *ctx, const uint8_t *header_data,
 static int qigvm_initialization_guest_policy(QIgvm *ctx,
                                        const uint8_t *header_data,
                                        Error **errp);
+static int qigvm_directive_command_line(QIgvm *ctx, const uint8_t *header_data,
+                                        Error **errp);
 #ifdef CONFIG_FDT
 static int qigvm_directive_device_tree(QIgvm *ctx, const uint8_t *header_data,
                                        Error **errp);
@@ -192,6 +203,8 @@ static struct QIGVMHandler handlers[] = {
       qigvm_initialization_guest_policy },
     { IGVM_VHT_MADT, IGVM_HEADER_SECTION_DIRECTIVE,
       qigvm_directive_madt },
+    { IGVM_VHT_COMMAND_LINE, IGVM_HEADER_SECTION_DIRECTIVE,
+      qigvm_directive_command_line },
 #ifdef CONFIG_FDT
     { IGVM_VHT_DEVICE_TREE, IGVM_HEADER_SECTION_DIRECTIVE,
       qigvm_directive_device_tree },
@@ -253,10 +266,13 @@ static void *qigvm_prepare_memory(QIgvm *ctx, uint64_t addr, uint64_t size,
                                   int region_identifier, Error **errp)
 {
     ERRP_GUARD();
-    IgvmMemoryRegion *imr = NULL;
+    g_autoptr(IgvmMemoryRegion) imr = NULL;
     Int128 gpa_region_size;
+    g_autofree char *region_name = NULL;
+    uint32_t flags = 0;
     MemoryRegionSection mrs =
         memory_region_find(get_system_memory(), addr, size);
+
     if (mrs.mr) {
         if (!memory_region_is_ram(mrs.mr)) {
             memory_region_unref(mrs.mr);
@@ -268,9 +284,9 @@ static void *qigvm_prepare_memory(QIgvm *ctx, uint64_t addr, uint64_t size,
             return NULL;
         }
 
+        memory_region_unref(mrs.mr);
         gpa_region_size = int128_make64(size);
         if (int128_lt(mrs.size, gpa_region_size)) {
-            memory_region_unref(mrs.mr);
             error_setg(
                 errp,
                 "Processing of IGVM file failed: Could not prepare memory "
@@ -279,36 +295,29 @@ static void *qigvm_prepare_memory(QIgvm *ctx, uint64_t addr, uint64_t size,
             return NULL;
         }
         return qemu_map_ram_ptr(mrs.mr->ram_block, mrs.offset_within_region);
-    } else {
-        /*
-         * The region_identifier is the is the index of the IGVM directive that
-         * contains the page with the lowest GPA in the region. This will
-         * generate a unique region name.
-         */
-        g_autofree char *region_name =
-            g_strdup_printf("igvm.%X", region_identifier);
-        imr = g_new0(IgvmMemoryRegion, 1);
-        imr->mr = g_new0(MemoryRegion, 1);
-        if (ctx->machine_state->cgs &&
-            ctx->machine_state->cgs->require_guest_memfd) {
-            if (!memory_region_init_ram_guest_memfd_private(
-                    imr->mr, NULL, region_name, size, errp)) {
-                g_free(imr->mr);
-                g_free(imr);
-                return NULL;
-            }
-        } else {
-            if (!memory_region_init_ram(imr->mr, NULL, region_name, size,
-                                        errp)) {
-                g_free(imr->mr);
-                g_free(imr);
-                return NULL;
-            }
-        }
-        memory_region_add_subregion(get_system_memory(), addr, imr->mr);
-        QTAILQ_INSERT_TAIL(&ctx->cfg->memory_regions, imr, next);
-        return memory_region_get_ram_ptr(imr->mr);
     }
+
+    /*
+     * The region_identifier is the is the index of the IGVM directive that
+     * contains the page with the lowest GPA in the region. This will
+     * generate a unique region name.
+     */
+    region_name = g_strdup_printf("igvm.%X", region_identifier);
+    imr = IGVM_MEMORY_REGION(object_new(TYPE_IGVM_MEMORY_REGION));
+    if (ctx->machine_state->cgs &&
+        ctx->machine_state->cgs->require_guest_memfd) {
+        flags = RAM_GUEST_MEMFD_PRIVATE;
+    }
+    if (!memory_region_init_ram_flags_nomigrate(&imr->mr, OBJECT(imr),
+                                                region_name, size,
+                                                flags, errp)) {
+        return NULL;
+    }
+    vmstate_register_ram_global(&imr->mr);
+    memory_region_add_subregion(get_system_memory(), addr, &imr->mr);
+    object_ref(imr); /* for the list */
+    QTAILQ_INSERT_TAIL(&ctx->cfg->memory_regions, imr, next);
+    return memory_region_get_ram_ptr(&imr->mr);
 }
 
 static int qigvm_type_to_cgs_type(IgvmPageDataType memory_type, bool unmeasured,
@@ -848,6 +857,48 @@ static int qigvm_directive_snp_id_block(QIgvm *ctx, const uint8_t *header_data,
     memcpy(&ctx->id_auth->author_key[76], &igvm_id->author_public_key.qy,
             72);
 
+    if (ctx->cgsc) {
+        uint64_t policy;
+
+        if (ctx->cgsc->get_guest_policy(GUEST_POLICY_SEV, &policy, errp) < 0) {
+            return -1;
+        }
+        ctx->id_block->policy = policy;
+
+        return ctx->cgsc->set_id_block(ctx->id_block,
+                                       sizeof(struct sev_id_block),
+                                       ctx->id_auth,
+                                       sizeof(struct sev_id_authentication),
+                                       errp);
+    }
+
+    return 0;
+}
+
+static int qigvm_directive_command_line(QIgvm *ctx, const uint8_t *header_data,
+                                        Error **errp)
+{
+    const IGVM_VHS_PARAMETER *param = (const IGVM_VHS_PARAMETER *)header_data;
+    const char *cmdline = ctx->cfg->cmdline ? ctx->cfg->cmdline : "";
+    uint8_t *param_data;
+    uint32_t param_size;
+    size_t cmdline_size = strlen(cmdline) + 1;
+
+    param_data = qigvm_get_param_data(ctx, param, &param_size, errp);
+    if (!param_data) {
+        return -1;
+    }
+
+    if (cmdline_size > param_size) {
+        error_setg(errp,
+                   "IGVM: command line size %zu exceeds the %u byte "
+                   "parameter area defined in IGVM file",
+                   cmdline_size, param_size);
+        return -1;
+    }
+
+    memcpy(param_data, cmdline, cmdline_size);
+
     return 0;
 }
 
@@ -856,7 +907,7 @@ static int qigvm_directive_device_tree(QIgvm *ctx, const uint8_t *header_data,
                                        Error **errp)
 {
     const IGVM_VHS_PARAMETER *param = (const IGVM_VHS_PARAMETER *)header_data;
-    g_autofree void *fdt_packed = NULL;
+    g_autofree void *fdt = NULL;
     uint8_t *param_data;
     uint32_t param_size;
     uint32_t fdt_size;
@@ -866,20 +917,27 @@ static int qigvm_directive_device_tree(QIgvm *ctx, const uint8_t *header_data,
         return -1;
     }
 
-    if (ctx->machine_state->fdt == NULL) {
-        error_setg(errp, "IGVM: device tree not available");
-        return -1;
+    if (ctx->machine_state->fdt) {
+        fdt = g_memdup2(ctx->machine_state->fdt,
+                        fdt_totalsize(ctx->machine_state->fdt));
+    } else {
+        /*
+         * The machine doesn't build a device tree of its own.
+         * Supply an empty tree rather than rejecting the IGVM file.
+         */
+        fdt = g_malloc0(EMPTY_FDT_SIZE);
+        if (fdt_create_empty_tree(fdt, EMPTY_FDT_SIZE)) {
+            error_setg(errp, "IGVM: failed to create an empty device tree");
+            return -1;
+        }
     }
 
-    fdt_size = fdt_totalsize(ctx->machine_state->fdt);
-    fdt_packed = g_memdup2(ctx->machine_state->fdt, fdt_size);
-
-    if (fdt_pack(fdt_packed)) {
+    if (fdt_pack(fdt)) {
         error_setg(errp, "IGVM: failed to pack device tree");
         return -1;
     }
 
-    fdt_size = fdt_totalsize(fdt_packed);
+    fdt_size = fdt_totalsize(fdt);
     if (fdt_size > param_size) {
         error_setg(errp,
                    "IGVM: device tree size exceeds parameter area"
@@ -887,7 +945,7 @@ static int qigvm_directive_device_tree(QIgvm *ctx, const uint8_t *header_data,
         return -1;
     }
 
-    memcpy(param_data, fdt_packed, fdt_size);
+    memcpy(param_data, fdt, fdt_size);
 
     return 0;
 }
@@ -900,7 +958,10 @@ static int qigvm_initialization_guest_policy(QIgvm *ctx,
         (const IGVM_VHS_GUEST_POLICY *)header_data;
 
     if (guest->compatibility_mask & ctx->compatibility_mask) {
-        ctx->sev_policy = guest->policy;
+        if (ctx->cgsc) {
+            return ctx->cgsc->set_guest_policy(GUEST_POLICY_SEV,
+                                               guest->policy, errp);
+        }
     }
     return 0;
 }
@@ -1001,23 +1062,6 @@ static int qigvm_supported_platform_compat_mask(QIgvm *ctx, Error **errp)
     return 0;
 }
 
-static int qigvm_handle_policy(QIgvm *ctx, Error **errp)
-{
-    if (ctx->platform_type == IGVM_PLATFORM_TYPE_SEV_SNP) {
-        int id_block_len = 0;
-        int id_auth_len = 0;
-        if (ctx->id_block) {
-            ctx->id_block->policy = ctx->sev_policy;
-            id_block_len = sizeof(struct sev_id_block);
-            id_auth_len = sizeof(struct sev_id_authentication);
-        }
-        return ctx->cgsc->set_guest_policy(GUEST_POLICY_SEV, ctx->sev_policy,
-                                          ctx->id_block, id_block_len,
-                                          ctx->id_auth, id_auth_len, errp);
-    }
-    return 0;
-}
-
 IgvmHandle qigvm_file_init(char *filename, Error **errp)
 {
     IgvmHandle igvm;
@@ -1044,7 +1088,7 @@ int qigvm_process_file(IgvmCfg *cfg, MachineState *machine_state,
                        bool onlyVpContext, Error **errp)
 {
     int32_t header_count;
-    QIgvmParameterData *parameter;
+    QIgvmParameterData *parameter, *tmp;
     int retval = -1;
     QIgvm ctx;
 
@@ -1073,6 +1117,34 @@ int qigvm_process_file(IgvmCfg *cfg, MachineState *machine_state,
      */
     if (qigvm_supported_platform_compat_mask(&ctx, errp) < 0) {
         goto cleanup;
+    }
+
+    /*
+     * Process the initialization section first so that the guest policy is
+     * known before the directive section is handled. The SNP ID block
+     * directive embeds the guest policy into the ID block, so the policy from
+     * the guest policy initialization header must be available by then.
+     */
+    header_count =
+        igvm_header_count(ctx.cfg->file, IGVM_HEADER_SECTION_INITIALIZATION);
+    if (header_count < 0) {
+        error_setg(
+            errp,
+            "Invalid initialization header count in IGVM file. Error code: %X",
+            header_count);
+        goto cleanup;
+    }
+
+    for (ctx.current_header_index = 0;
+         ctx.current_header_index < (unsigned)header_count;
+         ctx.current_header_index++) {
+        IgvmVariableHeaderType type =
+            igvm_get_header_type(ctx.cfg->file,
+                                 IGVM_HEADER_SECTION_INITIALIZATION,
+                                 ctx.current_header_index);
+        if (qigvm_handler(&ctx, type, errp) < 0) {
+            goto cleanup;
+        }
     }
 
     header_count = igvm_header_count(ctx.cfg->file,
@@ -1108,28 +1180,6 @@ int qigvm_process_file(IgvmCfg *cfg, MachineState *machine_state,
         goto cleanup_parameters;
     }
 
-    header_count =
-        igvm_header_count(ctx.cfg->file, IGVM_HEADER_SECTION_INITIALIZATION);
-    if (header_count < 0) {
-        error_setg(
-            errp,
-            "Invalid initialization header count in IGVM file. Error code: %X",
-            header_count);
-        goto cleanup_parameters;
-    }
-
-    for (ctx.current_header_index = 0;
-         ctx.current_header_index < (unsigned)header_count;
-         ctx.current_header_index++) {
-        IgvmVariableHeaderType type =
-            igvm_get_header_type(ctx.cfg->file,
-                                 IGVM_HEADER_SECTION_INITIALIZATION,
-                                 ctx.current_header_index);
-        if (qigvm_handler(&ctx, type, errp) < 0) {
-            goto cleanup_parameters;
-        }
-    }
-
     /*
      * Contiguous pages of data with compatible flags are grouped together in
      * order to reduce the number of memory regions we create. Make sure the
@@ -1137,15 +1187,12 @@ int qigvm_process_file(IgvmCfg *cfg, MachineState *machine_state,
      */
     retval = qigvm_process_mem_page(&ctx, NULL, errp);
 
-    if (retval == 0) {
-        retval = qigvm_handle_policy(&ctx, errp);
-    }
-
 cleanup_parameters:
-    QTAILQ_FOREACH(parameter, &ctx.parameter_data, next)
+    QTAILQ_FOREACH_SAFE(parameter, &ctx.parameter_data, next, tmp)
     {
+        QTAILQ_REMOVE(&ctx.parameter_data, parameter, next);
         g_free(parameter->data);
-        parameter->data = NULL;
+        g_free(parameter);
     }
     g_free(ctx.id_block);
     g_free(ctx.id_auth);
@@ -1161,14 +1208,33 @@ void qigvm_cleanup_memory(IgvmCfg *cfg)
 {
     IgvmMemoryRegion *imr, *tmp;
 
-    QTAILQ_FOREACH_SAFE(imr, &cfg->memory_regions, next, tmp)
-    {
-        trace_qigvm_cleanup_memory(imr->mr->name);
-        memory_region_del_subregion(get_system_memory(), imr->mr);
-        vmstate_unregister_ram(imr->mr, NULL);
+    QTAILQ_FOREACH_SAFE(imr, &cfg->memory_regions, next, tmp) {
+        trace_qigvm_cleanup_memory(imr->mr.name);
         QTAILQ_REMOVE(&cfg->memory_regions, imr, next);
-        /* this triggers MemoryRegion cleanup */
-        object_unparent(OBJECT(imr->mr));
-        g_free(imr);
+        object_unref(OBJECT(imr));
     }
 }
+
+static void qigvm_memory_region_finalize(Object *obj)
+{
+    IgvmMemoryRegion *imr = IGVM_MEMORY_REGION(obj);
+
+    if (imr->mr.container) {
+        memory_region_del_subregion(imr->mr.container, &imr->mr);
+    }
+    vmstate_unregister_ram(&imr->mr, NULL);
+}
+
+static const TypeInfo qigvm_memory_region_info = {
+    .name = TYPE_IGVM_MEMORY_REGION,
+    .parent = TYPE_OBJECT,
+    .instance_size = sizeof(IgvmMemoryRegion),
+    .instance_finalize = qigvm_memory_region_finalize,
+};
+
+static void qigvm_register_types(void)
+{
+    type_register_static(&qigvm_memory_region_info);
+}
+
+type_init(qigvm_register_types);

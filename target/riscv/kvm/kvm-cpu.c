@@ -24,8 +24,10 @@
 
 #include "qemu/timer.h"
 #include "qapi/error.h"
+#include "qapi/qapi-builtin-type-infos.h"
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
+#include "qemu/target-info.h"
 #include "qapi/visitor.h"
 #include "system/system.h"
 #include "system/kvm.h"
@@ -45,9 +47,8 @@
 #include "kvm_riscv.h"
 #include "sbi_ecall_interface.h"
 #include "chardev/char-fe.h"
-#include "migration/misc.h"
 #include "system/runstate.h"
-#include "hw/riscv/numa.h"
+#include "hw/riscv/aia.h"
 
 #define PR_RISCV_V_SET_CONTROL            69
 #define PR_RISCV_V_VSTATE_CTRL_ON          2
@@ -58,6 +59,7 @@ void riscv_kvm_aplic_request(void *opaque, int irq, int level)
 }
 
 static bool cap_has_mp_state;
+static bool mp_state_reset;
 
 #define KVM_RISCV_REG_ID_U32(type, idx) (KVM_REG_RISCV | KVM_REG_SIZE_U32 | \
                                          type | idx)
@@ -110,6 +112,14 @@ static uint64_t kvm_riscv_vector_reg_id(RISCVCPU *cpu,
 #define RISCV_FP_F_REG(idx)  KVM_RISCV_REG_ID_U32(KVM_REG_RISCV_FP_F, idx)
 
 #define RISCV_FP_D_REG(idx)  KVM_RISCV_REG_ID_U64(KVM_REG_RISCV_FP_D, idx)
+
+#define RISCV_FP_F_FCSR_REG \
+    KVM_RISCV_REG_ID_U32(KVM_REG_RISCV_FP_F, \
+                         KVM_REG_RISCV_FP_F_REG(fcsr))
+
+#define RISCV_FP_D_FCSR_REG \
+    KVM_RISCV_REG_ID_U32(KVM_REG_RISCV_FP_D, \
+                         KVM_REG_RISCV_FP_D_REG(fcsr))
 
 #define RISCV_VECTOR_CSR_REG(name) \
     KVM_RISCV_REG_ID_ULONG(KVM_REG_RISCV_VECTOR, \
@@ -532,7 +542,7 @@ static void riscv_cpu_add_kvm_unavail_prop(Object *obj, const char *prop_name)
      * unknown to KVM and error out if the user attempts
      * to enable any of them.
      */
-    object_property_add(obj, prop_name, "bool",
+    object_property_add(obj, prop_name, "bool", &bool_type_info,
                         cpu_get_cfg_unavailable,
                         cpu_set_cfg_unavailable,
                         NULL, (void *)prop_name);
@@ -552,7 +562,7 @@ static void kvm_riscv_add_cpu_user_properties(Object *cpu_obj)
         misa_cfg->name = riscv_get_misa_ext_name(bit);
         misa_cfg->description = riscv_get_misa_ext_description(bit);
 
-        object_property_add(cpu_obj, misa_cfg->name, "bool",
+        object_property_add(cpu_obj, misa_cfg->name, "bool", &bool_type_info,
                             kvm_cpu_get_misa_ext_cfg,
                             kvm_cpu_set_misa_ext_cfg,
                             NULL, misa_cfg);
@@ -568,7 +578,7 @@ static void kvm_riscv_add_cpu_user_properties(Object *cpu_obj)
     for (i = 0; i < ARRAY_SIZE(kvm_multi_ext_cfgs); i++) {
         KVMCPUConfig *multi_cfg = &kvm_multi_ext_cfgs[i];
 
-        object_property_add(cpu_obj, multi_cfg->name, "bool",
+        object_property_add(cpu_obj, multi_cfg->name, "bool", &bool_type_info,
                             kvm_cpu_get_multi_ext_cfg,
                             kvm_cpu_set_multi_ext_cfg,
                             NULL, multi_cfg);
@@ -743,7 +753,8 @@ static int kvm_riscv_get_regs_fp(CPUState *cs)
             }
             env->fpr[i] = reg;
         }
-        return ret;
+        return kvm_get_one_reg(cs, RISCV_FP_D_FCSR_REG,
+                               &env->kvm_fcsr);
     }
 
     if (riscv_has_ext(env, RVF)) {
@@ -755,7 +766,8 @@ static int kvm_riscv_get_regs_fp(CPUState *cs)
             }
             env->fpr[i] = reg;
         }
-        return ret;
+        return kvm_get_one_reg(cs, RISCV_FP_F_FCSR_REG,
+                               &env->kvm_fcsr);
     }
 
     return ret;
@@ -776,7 +788,8 @@ static int kvm_riscv_put_regs_fp(CPUState *cs)
                 return ret;
             }
         }
-        return ret;
+        return kvm_set_one_reg(cs, RISCV_FP_D_FCSR_REG,
+                               &env->kvm_fcsr);
     }
 
     if (riscv_has_ext(env, RVF)) {
@@ -788,7 +801,8 @@ static int kvm_riscv_put_regs_fp(CPUState *cs)
                 return ret;
             }
         }
-        return ret;
+        return kvm_set_one_reg(cs, RISCV_FP_F_FCSR_REG,
+                               &env->kvm_fcsr);
     }
 
     return ret;
@@ -810,9 +824,34 @@ static void kvm_riscv_get_regs_timer(CPUState *cs)
     env->kvm_timer_dirty = true;
 }
 
+int kvm_riscv_check_timer_frequency(RISCVCPU *cpu)
+{
+    CPUState *cs = CPU(cpu);
+    CPURISCVState *env = &cpu->env;
+    int ret;
+    uint64_t frequency;
+
+    if (!env->kvm_timer_frequency_loaded) {
+        return 0;
+    }
+
+    ret = kvm_get_one_reg(cs, RISCV_TIMER_REG(frequency), &frequency);
+    if (ret) {
+        return ret;
+    }
+
+    if (frequency != env->kvm_timer_frequency) {
+        error_report("KVM timer frequency mismatch: source %" PRIu64
+                     " Hz, destination %" PRIu64 " Hz",
+                     env->kvm_timer_frequency, frequency);
+        return -EINVAL;
+    }
+
+    return 0;
+}
+
 static void kvm_riscv_put_regs_timer(CPUState *cs)
 {
-    uint64_t reg;
     CPURISCVState *env = &RISCV_CPU(cs)->env;
 
     if (!env->kvm_timer_dirty) {
@@ -830,18 +869,6 @@ static void kvm_riscv_put_regs_timer(CPUState *cs)
      */
     if (env->kvm_timer_state) {
         KVM_RISCV_SET_TIMER(cs, state, env->kvm_timer_state);
-    }
-
-    /*
-     * For now, migration will not work between Hosts with different timer
-     * frequency. Therefore, we should check whether they are the same here
-     * during the migration.
-     */
-    if (migration_is_running()) {
-        KVM_RISCV_GET_TIMER(cs, frequency, reg);
-        if (reg != env->kvm_timer_frequency) {
-            error_report("Dst Hosts timer frequency != Src Hosts");
-        }
     }
 
     env->kvm_timer_dirty = false;
@@ -885,6 +912,13 @@ static int kvm_riscv_get_regs_vector(CPUState *cs)
         return ret;
     }
     env->vtype = reg;
+
+    ret = kvm_get_one_reg(cs, RISCV_VECTOR_CSR_REG(vcsr), &reg);
+    if (ret) {
+        return ret;
+    }
+    env->vxrm = (reg & VCSR_VXRM) >> VCSR_VXRM_SHIFT;
+    env->vxsat = (reg & VCSR_VXSAT) >> VCSR_VXSAT_SHIFT;
 
     if (kvm_v_vlenb.supported) {
         ret = kvm_get_one_reg(cs, RISCV_VECTOR_CSR_REG(vlenb), &reg);
@@ -938,6 +972,13 @@ static int kvm_riscv_put_regs_vector(CPUState *cs)
 
     reg = env->vtype;
     ret = kvm_set_one_reg(cs, RISCV_VECTOR_CSR_REG(vtype), &reg);
+    if (ret) {
+        return ret;
+    }
+
+    reg = (env->vxrm << VCSR_VXRM_SHIFT) |
+          (env->vxsat << VCSR_VXSAT_SHIFT);
+    ret = kvm_set_one_reg(cs, RISCV_VECTOR_CSR_REG(vcsr), &reg);
     if (ret) {
         return ret;
     }
@@ -1405,9 +1446,30 @@ static int kvm_riscv_put_mp_state(CPUState *cs)
     return kvm_vcpu_ioctl(cs, KVM_SET_MP_STATE, &mp_state);
 }
 
+static int kvm_riscv_mp_state_init_received(CPUState *cs)
+{
+    struct kvm_mp_state mp_state = {
+        .mp_state = KVM_MP_STATE_INIT_RECEIVED,
+    };
+
+    if (!cap_has_mp_state || !mp_state_reset) {
+        return 0;
+    }
+
+    /* Let KVM resets the VCPU, The original MP_STATE is preserved*/
+    return kvm_vcpu_ioctl(cs, KVM_SET_MP_STATE, &mp_state);
+}
+
 int kvm_arch_put_registers(CPUState *cs, KvmPutState level, Error **errp)
 {
     int ret = 0;
+
+    if (KVM_PUT_RESET_STATE == level) {
+        ret = kvm_riscv_mp_state_init_received(cs);
+        if (ret) {
+            return ret;
+        }
+    }
 
     ret = kvm_riscv_put_regs_core(cs);
     if (ret) {
@@ -1544,7 +1606,7 @@ int kvm_arch_pre_create_vcpu(CPUState *cpu, Error **errp)
     return 0;
 }
 
-int kvm_arch_init_vcpu(CPUState *cs)
+int kvm_arch_init_vcpu(CPUState *cs, Error **errp)
 {
     int ret = 0;
     RISCVCPU *cpu = RISCV_CPU(cs);
@@ -1554,6 +1616,7 @@ int kvm_arch_init_vcpu(CPUState *cs)
     if (!object_dynamic_cast(OBJECT(cpu), TYPE_RISCV_CPU_HOST)) {
         ret = kvm_vcpu_set_machine_ids(cpu, cs);
         if (ret != 0) {
+            error_setg_errno(errp, -ret, "failed setting machine id");
             return ret;
         }
     }
@@ -1562,6 +1625,9 @@ int kvm_arch_init_vcpu(CPUState *cs)
     kvm_riscv_update_cpu_cfg_isa_ext(cpu, cs);
 
     ret = kvm_vcpu_enable_sbi_dbcn(cpu, cs);
+    if (ret < 0) {
+        error_setg_errno(errp, -ret, "failed kvm_vcpu_enable_sbi_dbcn");
+    }
 
     return ret;
 }
@@ -1585,6 +1651,11 @@ int kvm_arch_get_default_type(MachineState *ms)
 int kvm_arch_init(MachineState *ms, KVMState *s)
 {
     cap_has_mp_state = kvm_check_extension(s, KVM_CAP_MP_STATE);
+
+    if (cap_has_mp_state) {
+        mp_state_reset = !kvm_vm_enable_cap(s, KVM_CAP_RISCV_MP_STATE_RESET, 0);
+    }
+
     return 0;
 }
 
@@ -1859,7 +1930,8 @@ void kvm_arch_accel_class_init(ObjectClass *oc)
                                     "auto");
 }
 
-void kvm_riscv_aia_create(MachineState *machine, uint64_t group_shift,
+void kvm_riscv_aia_create(const RISCVAIASocket *sockets,
+                          uint32_t socket_count, uint64_t group_shift,
                           uint64_t aia_irq_num, uint64_t aia_msi_num,
                           uint64_t aplic_base, uint64_t imsic_base,
                           uint64_t guest_num)
@@ -1867,7 +1939,6 @@ void kvm_riscv_aia_create(MachineState *machine, uint64_t group_shift,
     int ret, i;
     int aia_fd = -1;
     uint64_t default_aia_mode;
-    uint64_t socket_count = riscv_socket_count(machine);
     uint64_t max_hart_per_socket = 0;
     uint64_t socket, base_hart, hart_count, socket_imsic_base, imsic_addr;
     uint64_t socket_bits, hart_bits, guest_bits;
@@ -1968,8 +2039,8 @@ void kvm_riscv_aia_create(MachineState *machine, uint64_t group_shift,
 
     for (socket = 0; socket < socket_count; socket++) {
         socket_imsic_base = imsic_base + socket * (1U << group_shift);
-        hart_count = riscv_socket_hart_count(machine, socket);
-        base_hart = riscv_socket_first_hartid(machine, socket);
+        hart_count = sockets[socket].num_harts;
+        base_hart = sockets[socket].hartid_base;
 
         if (max_hart_per_socket < hart_count) {
             max_hart_per_socket = hart_count;
@@ -2170,6 +2241,7 @@ static const TypeInfo kvm_cpu_accel_type_info = {
 
     .parent = TYPE_ACCEL_CPU,
     .class_init = kvm_cpu_accel_class_init,
+    .is_available = target_base_riscv,
     .abstract = true,
 };
 static void kvm_cpu_accel_register_types(void)

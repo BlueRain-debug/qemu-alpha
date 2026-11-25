@@ -273,32 +273,32 @@ static void r4k_helper_tlbr(CPUMIPSState *env)
     }
 }
 
-void helper_tlbwi(CPUMIPSState *env)
+void HELPER(tlbwi)(CPUMIPSState *env)
 {
     env->tlb->helper_tlbwi(env);
 }
 
-void helper_tlbwr(CPUMIPSState *env)
+void HELPER(tlbwr)(CPUMIPSState *env)
 {
     env->tlb->helper_tlbwr(env);
 }
 
-void helper_tlbp(CPUMIPSState *env)
+void HELPER(tlbp)(CPUMIPSState *env)
 {
     env->tlb->helper_tlbp(env);
 }
 
-void helper_tlbr(CPUMIPSState *env)
+void HELPER(tlbr)(CPUMIPSState *env)
 {
     env->tlb->helper_tlbr(env);
 }
 
-void helper_tlbinv(CPUMIPSState *env)
+void HELPER(tlbinv)(CPUMIPSState *env)
 {
     env->tlb->helper_tlbinv(env);
 }
 
-void helper_tlbinvf(CPUMIPSState *env)
+void HELPER(tlbinvf)(CPUMIPSState *env)
 {
     env->tlb->helper_tlbinvf(env);
 }
@@ -338,7 +338,7 @@ static void global_invalidate_tlb(CPUMIPSState *env,
     cpu_mips_tlb_flush(env);
 }
 
-void helper_ginvt(CPUMIPSState *env, target_ulong arg, uint32_t type)
+void HELPER(ginvt)(CPUMIPSState *env, target_ulong arg, uint32_t type)
 {
     bool invAll = type == 0;
     bool invVA = type == 1;
@@ -360,8 +360,9 @@ void helper_ginvt(CPUMIPSState *env, target_ulong arg, uint32_t type)
 }
 
 /* no MMU emulation */
-static int no_mmu_map_address(CPUMIPSState *env, hwaddr *physical, int *prot,
-                              target_ulong address, MMUAccessType access_type)
+static int no_mmu_map_address(const CPUMIPSState *env, hwaddr *physical,
+                              int *prot, target_ulong address,
+                              MMUAccessType access_type)
 {
     *physical = address;
     *prot = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
@@ -369,7 +370,7 @@ static int no_mmu_map_address(CPUMIPSState *env, hwaddr *physical, int *prot,
 }
 
 /* fixed mapping MMU emulation */
-static int fixed_mmu_map_address(CPUMIPSState *env, hwaddr *physical,
+static int fixed_mmu_map_address(const CPUMIPSState *env, hwaddr *physical,
                                  int *prot, target_ulong address,
                                  MMUAccessType access_type)
 {
@@ -390,7 +391,7 @@ static int fixed_mmu_map_address(CPUMIPSState *env, hwaddr *physical,
 }
 
 /* MIPS32/MIPS64 R4000-style MMU emulation */
-static int r4k_map_address(CPUMIPSState *env, hwaddr *physical, int *prot,
+static int r4k_map_address(const CPUMIPSState *env, hwaddr *physical, int *prot,
                            target_ulong address, MMUAccessType access_type)
 {
     uint16_t ASID = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;

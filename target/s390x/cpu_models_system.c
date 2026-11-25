@@ -20,6 +20,7 @@
 #include "qapi/qobject-input-visitor.h"
 #include "qobject/qdict.h"
 #include "qapi/qapi-commands-machine.h"
+#include "system/qmp-cpu.h"
 
 static void list_add_feat(const char *name, void *opaque);
 
@@ -82,7 +83,7 @@ static void create_cpu_model_list(ObjectClass *klass, void *opaque)
     QAPI_LIST_PREPEND(*cpu_list, info);
 }
 
-CpuDefinitionInfoList *qmp_query_cpu_definitions(Error **errp)
+CpuDefinitionInfoList *qmp_query_s390x_cpu_definitions(Error **errp)
 {
     struct CpuDefinitionInfoListData list_data = {
         .list = NULL,
@@ -208,9 +209,10 @@ static void cpu_info_from_model(CpuModelInfo *info, const S390CPUModel *model,
     }
 }
 
-CpuModelExpansionInfo *qmp_query_cpu_model_expansion(CpuModelExpansionType type,
-                                                      CpuModelInfo *model,
-                                                      Error **errp)
+CpuModelExpansionInfo *
+qmp_query_s390x_cpu_model_expansion(CpuModelExpansionType type,
+                                    CpuModelInfo *model,
+                                    Error **errp)
 {
     Error *err = NULL;
     CpuModelExpansionInfo *expansion_info = NULL;

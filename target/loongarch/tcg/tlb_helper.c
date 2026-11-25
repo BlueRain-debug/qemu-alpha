@@ -21,7 +21,6 @@
 #include "exec/log.h"
 #include "cpu-csr.h"
 #include "tcg/tcg_loongarch.h"
-#include "system/memory.h"
 
 typedef bool (*tlb_match)(bool global, int asid, int tlb_asid);
 
@@ -310,7 +309,7 @@ static bool loongarch_tlb_search(CPULoongArchState *env, vaddr vaddr,
     return false;
 }
 
-void helper_tlbsrch(CPULoongArchState *env)
+void HELPER(tlbsrch)(CPULoongArchState *env)
 {
     int index, match;
     CPUSysState *sys = env_sys(env);
@@ -330,7 +329,7 @@ void helper_tlbsrch(CPULoongArchState *env)
     sys->CSR_TLBIDX = FIELD_DP64(sys->CSR_TLBIDX, CSR_TLBIDX, NE, 1);
 }
 
-void helper_tlbrd(CPULoongArchState *env)
+void HELPER(tlbrd)(CPULoongArchState *env)
 {
     LoongArchTLB *tlb;
     int index;
@@ -389,7 +388,7 @@ static void update_tlb_index(CPULoongArchState *env, MMUContext *context,
     *old = new;
 }
 
-void helper_tlbwr(CPULoongArchState *env)
+void HELPER(tlbwr)(CPULoongArchState *env)
 {
     CPUSysState *sys = env_sys(env);
     int index = FIELD_EX64(sys->CSR_TLBIDX, CSR_TLBIDX, INDEX);
@@ -469,7 +468,7 @@ static int get_tlb_random_index(CPULoongArchState *env, vaddr addr,
     return index;
 }
 
-void helper_tlbfill(CPULoongArchState *env)
+void HELPER(tlbfill)(CPULoongArchState *env)
 {
     vaddr entryhi;
     int index, pagesize;
@@ -492,7 +491,7 @@ void helper_tlbfill(CPULoongArchState *env)
     fill_tlb_entry(env, env->tlb + index, &context);
 }
 
-void helper_tlbclr(CPULoongArchState *env)
+void HELPER(tlbclr)(CPULoongArchState *env)
 {
     LoongArchTLB *tlb;
     int i, index;
@@ -527,7 +526,7 @@ void helper_tlbclr(CPULoongArchState *env)
     tlb_flush(env_cpu(env));
 }
 
-void helper_tlbflush(CPULoongArchState *env)
+void HELPER(tlbflush)(CPULoongArchState *env)
 {
     int i, index;
     CPUSysState *sys = env_sys(env);
@@ -552,7 +551,7 @@ void helper_tlbflush(CPULoongArchState *env)
     tlb_flush(env_cpu(env));
 }
 
-void helper_invtlb_all(CPULoongArchState *env)
+void HELPER(invtlb_all)(CPULoongArchState *env)
 {
     for (int i = 0; i < LOONGARCH_TLB_MAX; i++) {
         env->tlb[i].tlb_misc = FIELD_DP64(env->tlb[i].tlb_misc,
@@ -561,7 +560,7 @@ void helper_invtlb_all(CPULoongArchState *env)
     tlb_flush(env_cpu(env));
 }
 
-void helper_invtlb_all_g(CPULoongArchState *env, uint32_t g)
+void HELPER(invtlb_all_g)(CPULoongArchState *env, uint32_t g)
 {
     for (int i = 0; i < LOONGARCH_TLB_MAX; i++) {
         LoongArchTLB *tlb = &env->tlb[i];
@@ -574,7 +573,7 @@ void helper_invtlb_all_g(CPULoongArchState *env, uint32_t g)
     tlb_flush(env_cpu(env));
 }
 
-void helper_invtlb_all_asid(CPULoongArchState *env, target_ulong info)
+void HELPER(invtlb_all_asid)(CPULoongArchState *env, target_ulong info)
 {
     uint16_t asid = info & R_CSR_ASID_ASID_MASK;
 
@@ -590,7 +589,7 @@ void helper_invtlb_all_asid(CPULoongArchState *env, target_ulong info)
     tlb_flush(env_cpu(env));
 }
 
-void helper_invtlb_page_asid(CPULoongArchState *env, target_ulong info,
+void HELPER(invtlb_page_asid)(CPULoongArchState *env, target_ulong info,
                              target_ulong addr)
 {
     int asid = info & 0x3ff;
@@ -604,7 +603,7 @@ void helper_invtlb_page_asid(CPULoongArchState *env, target_ulong info,
     }
 }
 
-void helper_invtlb_page_asid_or_g(CPULoongArchState *env,
+void HELPER(invtlb_page_asid_or_g)(CPULoongArchState *env,
                                   target_ulong info, target_ulong addr)
 {
     int asid = info & 0x3ff;
@@ -652,15 +651,6 @@ bool loongarch_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
             need_update = false;
         } else if (access_type != MMU_DATA_STORE && pte_access(context.pte)) {
             need_update = false;
-
-            /*
-             * FIXME: should context.prot be set without PAGE_WRITE with
-             * pte_write(context.pte) && !pte_dirty(context.pte)??
-             *
-             * Otherwise there will be no loongarch_cpu_tlb_fill() function call
-             * for MMU_DATA_STORE access_type in future since QEMU TLB with
-             * prot PAGE_WRITE is added already
-             */
         }
 
         if (need_update) {
@@ -684,6 +674,19 @@ bool loongarch_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
     if (ret == TLBRET_MATCH) {
         physical = context.physical;
         prot = context.prot;
+
+        /*
+         * Loads or instruction fetches must not cache write access to a
+         * clean PTE. The first store must enter PTW to set D, whether this
+         * translation came from the LoongArch TLB or a page table walk.
+         * Store walks have already handled D, but context.pte may still
+         * contain its old value. Direct mappings have no PTE to check.
+         */
+        if (cpu_has_ptw(env) && context.mmu_index != MMU_DA_IDX &&
+            access_type != MMU_DATA_STORE && !pte_dirty(context.pte)) {
+            prot &= ~PAGE_WRITE;
+        }
+
         tlb_set_page(cs, address & TARGET_PAGE_MASK,
                      physical & TARGET_PAGE_MASK, prot,
                      mmu_idx, TARGET_PAGE_SIZE);
@@ -703,6 +706,22 @@ bool loongarch_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
     cpu_loop_exit_restore(cs, retaddr);
 }
 
+G_NORETURN void loongarch_cpu_do_unaligned_access(CPUState *cs, vaddr vaddr,
+                                                  MMUAccessType access_type,
+                                                  int mmu_idx,
+                                                  uintptr_t retaddr)
+{
+    CPULoongArchState *env = cpu_env(cs);
+    CPUSysState *sys = env_sys(env);
+
+    /*
+     * Unaligned accesses are currently triggered by atomic instructions
+     * that impose alignment requirements on memory operands.
+     */
+    sys->CSR_BADV = vaddr;
+    do_raise_exception(env, EXCCODE_ALE, retaddr);
+}
+
 static inline uint64_t loongarch_sanitize_hw_pte(CPULoongArchState *env,
                                                  uint64_t pte)
 {
@@ -718,10 +737,9 @@ static inline uint64_t loongarch_sanitize_hw_pte(CPULoongArchState *env,
     return (pte & ~ppn_mask) | ((pte & ppn_mask) & palen_mask);
 }
 
-target_ulong helper_lddir(CPULoongArchState *env, target_ulong base,
+target_ulong HELPER(lddir)(CPULoongArchState *env, target_ulong base,
                           uint32_t level, uint32_t mem_idx)
 {
-    CPUState *cs = env_cpu(env);
     uint64_t badvaddr;
     hwaddr index, phys;
     uint64_t palen_mask = loongarch_palen_mask(env);
@@ -754,15 +772,14 @@ target_ulong helper_lddir(CPULoongArchState *env, target_ulong base,
     get_dir_base_width(env, &dir_base, &dir_width, level);
     index = (badvaddr >> dir_base) & ((1 << dir_width) - 1);
     phys = base | index << 3;
-    val = address_space_ldq_le(cs->as, phys, MEMTXATTRS_UNSPECIFIED, NULL);
+    val = cpu_ldq_le_data_ra(env, phys, GETPC());
 
     return val & palen_mask;
 }
 
-void helper_ldpte(CPULoongArchState *env, target_ulong base, target_ulong odd,
+void HELPER(ldpte)(CPULoongArchState *env, target_ulong base, target_ulong odd,
                   uint32_t mem_idx)
 {
-    CPUState *cs = env_cpu(env);
     hwaddr phys, tmp0, ptindex, ptoffset0, ptoffset1;
     CPUSysState *sys = env_sys(env);
     uint64_t pte_raw;
@@ -823,8 +840,7 @@ void helper_ldpte(CPULoongArchState *env, target_ulong base, target_ulong odd,
         ptoffset0 = ptindex << 3;
         ptoffset1 = (ptindex + 1) << 3;
         phys = base | (odd ? ptoffset1 : ptoffset0);
-        pte_raw = address_space_ldq_le(cs->as, phys,
-                                       MEMTXATTRS_UNSPECIFIED, NULL);
+        pte_raw = cpu_ldq_le_data_ra(env, phys, GETPC());
         tmp0 = loongarch_sanitize_hw_pte(env, pte_raw);
         ps = ptbase;
     }

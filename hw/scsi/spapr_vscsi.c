@@ -484,6 +484,8 @@ static int data_out_desc_size(struct srp_cmd *cmd)
 static int vscsi_preprocess_desc(vscsi_req *req)
 {
     struct srp_cmd *cmd = &req_iu(req)->srp.cmd;
+    /* bytes available for descriptors behind srp_cmd.add_data */
+    const unsigned avail = SRP_MAX_IU_LEN - offsetof(struct srp_cmd, add_data);
 
     req->cdb_offset = cmd->add_cdb_len & ~3;
 
@@ -498,16 +500,35 @@ static int vscsi_preprocess_desc(vscsi_req *req)
     case SRP_NO_DATA_DESC:
         break;
     case SRP_DATA_DESC_DIRECT:
+        if (req->cdb_offset + sizeof(struct srp_direct_buf) > avail) {
+            fprintf(stderr,
+                    "vscsi_preprocess_desc: direct desc out of bounds\n");
+            return -1;
+        }
         req->total_desc = req->local_desc = 1;
         break;
     case SRP_DATA_DESC_INDIRECT: {
-        struct srp_indirect_buf *ind_tmp = (struct srp_indirect_buf *)
-                (cmd->add_data + req->cdb_offset);
+        struct srp_indirect_buf *ind_tmp;
+
+        if (req->cdb_offset + sizeof(struct srp_indirect_buf) > avail) {
+            fprintf(stderr,
+                    "vscsi_preprocess_desc: indirect desc out of bounds\n");
+            return -1;
+        }
+        ind_tmp = (struct srp_indirect_buf *)(cmd->add_data + req->cdb_offset);
 
         req->total_desc = be32_to_cpu(ind_tmp->table_desc.len) /
                           sizeof(struct srp_direct_buf);
         req->local_desc = req->writing ? cmd->data_out_desc_cnt :
                           cmd->data_in_desc_cnt;
+
+        /* desc_list[] entries must also fit inside the IU buffer */
+        if (req->local_desc * sizeof(struct srp_direct_buf) >
+            avail - req->cdb_offset - sizeof(struct srp_indirect_buf)) {
+            fprintf(stderr,
+                    "vscsi_preprocess_desc: local_desc out of bounds\n");
+            return -1;
+        }
         break;
     }
     default:
@@ -725,7 +746,11 @@ static void vscsi_inquiry_no_target(VSCSIState *s, vscsi_req *req)
     memcpy(&resp_data[8], "QEMU    ", 8);
 
     req->writing = 0;
-    vscsi_preprocess_desc(req);
+    if (vscsi_preprocess_desc(req) < 0) {
+        vscsi_makeup_sense(s, req, HARDWARE_ERROR, 0, 0);
+        vscsi_send_rsp(s, req, CHECK_CONDITION, 0, 0);
+        return;
+    }
     rc = vscsi_srp_transfer_data(s, req, 0, resp_data, len);
     if (rc < 0) {
         vscsi_makeup_sense(s, req, HARDWARE_ERROR, 0, 0);
@@ -775,7 +800,12 @@ static void vscsi_report_luns(VSCSIState *s, vscsi_req *req)
         i += 8;
     }
 
-    vscsi_preprocess_desc(req);
+    if (vscsi_preprocess_desc(req) < 0) {
+        g_free(resp_data);
+        vscsi_makeup_sense(s, req, HARDWARE_ERROR, 0, 0);
+        vscsi_send_rsp(s, req, CHECK_CONDITION, 0, 0);
+        return;
+    }
     rc = vscsi_srp_transfer_data(s, req, 0, resp_data, len);
     g_free(resp_data);
     if (rc < 0) {
@@ -823,7 +853,10 @@ static int vscsi_queue_cmd(VSCSIState *s, vscsi_req *req)
         req->writing = (n < 1);
 
         /* Preprocess RDMA descriptors */
-        vscsi_preprocess_desc(req);
+        if (vscsi_preprocess_desc(req) < 0) {
+            scsi_req_cancel(req->sreq);
+            return 1;
+        }
 
         /* Get transfer direction and initiate transfer */
         if (n > 0) {
@@ -966,6 +999,8 @@ static int vscsi_send_adapter_info(VSCSIState *s, vscsi_req *req)
 {
     struct viosrp_adapter_info *sinfo;
     struct mad_adapter_info_data info;
+    uint16_t len, req_len;
+    uint64_t buffer;
     int rc;
 
     sinfo = &req_iu(req)->mad.adapter_info;
@@ -985,10 +1020,22 @@ static int vscsi_send_adapter_info(VSCSIState *s, vscsi_req *req)
     info.os_type = cpu_to_be32(2);
     info.port_max_txu[0] = cpu_to_be32(VSCSI_MAX_SECTORS << 9);
 
-    rc = spapr_vio_dma_write(&s->vdev, be64_to_cpu(sinfo->buffer),
-                             &info, be16_to_cpu(sinfo->common.length));
+    req_len = len = be16_to_cpu(sinfo->common.length);
+    buffer = be64_to_cpu(sinfo->buffer);
+    if (len > sizeof(info)) {
+        fprintf(stderr, "vscsi_send_adapter_info: adapter info size mismatch !\n");
+        /*
+         * Just read and populate the structure that is known.
+         * Zero rest of the structure.
+         */
+        len = sizeof(info);
+    }
+    rc = spapr_vio_dma_write(&s->vdev, buffer, &info, len);
     if (rc)  {
         fprintf(stderr, "vscsi_send_adapter_info: DMA write failure !\n");
+    }
+    if (req_len > len) {
+        spapr_vio_dma_set(&s->vdev, (buffer + len), 0, (req_len - len));
     }
 
     sinfo->common.status = rc ? cpu_to_be32(1) : 0;
@@ -1298,6 +1345,7 @@ static const TypeInfo spapr_vscsi_info = {
     .parent        = TYPE_VIO_SPAPR_DEVICE,
     .instance_size = sizeof(VSCSIState),
     .class_init    = spapr_vscsi_class_init,
+    .secure        = true,
 };
 
 static void spapr_vscsi_register_types(void)

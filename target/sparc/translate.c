@@ -101,6 +101,20 @@
 # define gen_helper_xmulx                ({ qemu_build_not_reached(); NULL; })
 # define gen_helper_xmulxhi              ({ qemu_build_not_reached(); NULL; })
 # define MAXTL_MASK                             0
+# define gen_helper_aes_eround01         ({ qemu_build_not_reached(); NULL; })
+# define gen_helper_aes_eround23         ({ qemu_build_not_reached(); NULL; })
+# define gen_helper_aes_dround01         ({ qemu_build_not_reached(); NULL; })
+# define gen_helper_aes_dround23         ({ qemu_build_not_reached(); NULL; })
+# define gen_helper_aes_eround01_l       ({ qemu_build_not_reached(); NULL; })
+# define gen_helper_aes_eround23_l       ({ qemu_build_not_reached(); NULL; })
+# define gen_helper_aes_dround01_l       ({ qemu_build_not_reached(); NULL; })
+# define gen_helper_aes_dround23_l       ({ qemu_build_not_reached(); NULL; })
+# define gen_helper_aes_kexpand0         ({ qemu_build_not_reached(); NULL; })
+# define gen_helper_aes_kexpand2         ({ qemu_build_not_reached(); NULL; })
+# define gen_helper_crc32c               ({ qemu_build_not_reached(); NULL; })
+# define gen_helper_sha1                 ({ qemu_build_not_reached(); NULL; })
+# define gen_helper_sha256               ({ qemu_build_not_reached(); NULL; })
+# define gen_helper_sha512               ({ qemu_build_not_reached(); NULL; })
 #endif
 
 #define DISAS_EXIT  DISAS_TARGET_0
@@ -1839,6 +1853,27 @@ static void gen_ld_asi(DisasContext *dc, DisasASI *da, TCGv dst, TCGv addr)
     }
 }
 
+/*
+ * On T4 and later, a block-initializing store to the first doubleword of
+ * a 32-byte block zeroes the rest of the block. glibc and Linux memset
+ * rely on this and store only one doubleword per block when zeroing.
+ */
+static void gen_blkinit_zero(DisasContext *dc, DisasASI *da, TCGv addr,
+                             MemOp size)
+{
+    TCGLabel *skip = gen_new_label();
+    TCGv t = tcg_temp_new();
+    TCGv_i64 zero = tcg_constant_i64(0);
+
+    tcg_gen_brcondi_tl(TCG_COND_TSTNE, addr, 31, skip);
+    /* A narrower store also zeroes the rest of the first doubleword. */
+    for (int i = size == MO_64 ? 8 : 0; i < 32; i += 8) {
+        tcg_gen_addi_tl(t, addr, i);
+        tcg_gen_qemu_st_i64(zero, t, da->mem_idx, MO_UQ);
+    }
+    gen_set_label(skip);
+}
+
 static void gen_st_asi(DisasContext *dc, DisasASI *da, TCGv src, TCGv addr)
 {
     switch (da->type) {
@@ -1849,12 +1884,19 @@ static void gen_st_asi(DisasContext *dc, DisasASI *da, TCGv src, TCGv addr)
         if (TARGET_LONG_BITS == 32) {
             gen_exception(dc, TT_ILL_INSN);
             break;
-        } else if (!(dc->def->features & CPU_FEATURE_HYPV)) {
-            /* Pre OpenSPARC CPUs don't have these */
+        } else if (!(dc->def->features &
+                    (CPU_FEATURE_HYPV | CPU_FEATURE_CRYPTO))) {
+            /*
+             * Pre-OpenSPARC CPUs lack block-init stores. Crypto
+             * instructions imply T4 or later, which has them.
+             */
             gen_exception(dc, TT_ILL_INSN);
             break;
         }
         /* In OpenSPARC T1+ CPUs TWINX ASIs in store are ST_BLKINIT_ ASIs */
+        if (dc->def->features & CPU_FEATURE_CRYPTO) {
+            gen_blkinit_zero(dc, da, addr, da->memop & MO_SIZE);
+        }
         /* fall through */
 
     case GET_ASI_DIRECT:
@@ -2152,6 +2194,17 @@ static void gen_stf_asi(DisasContext *dc, DisasASI *da, MemOp orig_size,
             break;
         default:
             g_assert_not_reached();
+        }
+        break;
+
+    case GET_ASI_DTWINX:
+        /* stdfa with a block-initializing ASI, T4 and later */
+        if (orig_size == MO_64 && (dc->def->features & CPU_FEATURE_CRYPTO)) {
+            gen_blkinit_zero(dc, da, addr, MO_64);
+            d64 = gen_load_fpr_D(dc, rd);
+            tcg_gen_qemu_st_i64(d64, addr, da->mem_idx, memop | MO_ALIGN);
+        } else {
+            gen_exception(dc, TT_ILL_INSN);
         }
         break;
 
@@ -2507,6 +2560,7 @@ static int extract_qfpreg(DisasContext *dc, int x)
 # define avail_VIS3(C)    ((C)->def->features & CPU_FEATURE_VIS3)
 # define avail_VIS3B(C)   avail_VIS3(C)
 # define avail_VIS4(C)    ((C)->def->features & CPU_FEATURE_VIS4)
+# define avail_CRYPTO(C)  ((C)->def->features & CPU_FEATURE_CRYPTO)
 #else
 # define avail_32(C)      true
 # define avail_ASR17(C)   ((C)->def->features & CPU_FEATURE_ASR17)
@@ -2524,6 +2578,7 @@ static int extract_qfpreg(DisasContext *dc, int x)
 # define avail_VIS3(C)    false
 # define avail_VIS3B(C)   false
 # define avail_VIS4(C)    false
+# define avail_CRYPTO(C)  false
 #endif
 
 /*
@@ -3019,6 +3074,21 @@ static TCGv do_rdstrand_status(DisasContext *dc, TCGv dst)
 }
 
 TRANS(RDSTRAND_STATUS, HYPV, do_rd_special, true, a->rd, do_rdstrand_status)
+
+/* CFR bits (OSA 2011, 5.5.11) */
+#define CFR_AES         (1 << 0)
+#define CFR_SHA1        (1 << 5)
+#define CFR_SHA256      (1 << 6)
+#define CFR_SHA512      (1 << 7)
+#define CFR_CRC32C      (1 << 11)
+
+static TCGv do_rdcfr(DisasContext *dc, TCGv dst)
+{
+    return tcg_constant_tl(CFR_AES | CFR_CRC32C | CFR_SHA1 |
+                           CFR_SHA256 | CFR_SHA512);
+}
+
+TRANS(RDCFR, CRYPTO, do_rd_special, true, a->rd, do_rdcfr)
 
 static TCGv do_rdpsr(DisasContext *dc, TCGv dst)
 {
@@ -5395,6 +5465,18 @@ static bool do_dddd(DisasContext *dc, arg_r_r_r_r *a,
     return advance_pc(dc);
 }
 
+/* SHA helpers update fixed registers in the lower FPR bank. */
+static bool do_sha(DisasContext *dc, void (*func)(TCGv_env))
+{
+    if (gen_trap_ifnofpu(dc)) {
+        return true;
+    }
+
+    func(tcg_env);
+    gen_update_fprs_dirty(dc, 0);
+    return advance_pc(dc);
+}
+
 TRANS(PDIST, VIS1, do_dddd, a, gen_helper_pdist)
 TRANS(FMADDd, FMAF, do_dddd, a, gen_op_fmaddd)
 TRANS(FMSUBd, FMAF, do_dddd, a, gen_op_fmsubd)
@@ -5402,6 +5484,44 @@ TRANS(FNMSUBd, FMAF, do_dddd, a, gen_op_fnmsubd)
 TRANS(FNMADDd, FMAF, do_dddd, a, gen_op_fnmaddd)
 TRANS(FPMADDX, IMA, do_dddd, a, gen_op_fpmaddx)
 TRANS(FPMADDXHI, IMA, do_dddd, a, gen_op_fpmaddxhi)
+TRANS(AES_EROUND01, CRYPTO, do_dddd, a, gen_helper_aes_eround01)
+TRANS(AES_EROUND23, CRYPTO, do_dddd, a, gen_helper_aes_eround23)
+TRANS(AES_DROUND01, CRYPTO, do_dddd, a, gen_helper_aes_dround01)
+TRANS(AES_DROUND23, CRYPTO, do_dddd, a, gen_helper_aes_dround23)
+TRANS(AES_EROUND01_L, CRYPTO, do_dddd, a, gen_helper_aes_eround01_l)
+TRANS(AES_EROUND23_L, CRYPTO, do_dddd, a, gen_helper_aes_eround23_l)
+TRANS(AES_DROUND01_L, CRYPTO, do_dddd, a, gen_helper_aes_dround01_l)
+TRANS(AES_DROUND23_L, CRYPTO, do_dddd, a, gen_helper_aes_dround23_l)
+TRANS(AES_KEXPAND0, CRYPTO, do_ddd, a, gen_helper_aes_kexpand0)
+TRANS(AES_KEXPAND2, CRYPTO, do_ddd, a, gen_helper_aes_kexpand2)
+TRANS(CRC32C, CRYPTO, do_ddd, a, gen_helper_crc32c)
+TRANS(SHA1, CRYPTO, do_sha, gen_helper_sha1)
+TRANS(SHA256, CRYPTO, do_sha, gen_helper_sha256)
+TRANS(SHA512, CRYPTO, do_sha, gen_helper_sha512)
+
+/* AES key expansion with RCON selected by the 5-bit immediate in imm */
+static bool trans_AES_KEXPAND1(DisasContext *dc, arg_r_r_i_r *a)
+{
+#ifdef TARGET_SPARC64
+    TCGv_i64 dst, src1, src2;
+
+    if (!avail_CRYPTO(dc)) {
+        return false;
+    }
+    if (gen_trap_ifnofpu(dc)) {
+        return true;
+    }
+
+    dst = tcg_temp_new_i64();
+    src1 = gen_load_fpr_D(dc, a->rs1);
+    src2 = gen_load_fpr_D(dc, a->rs2);
+    gen_helper_aes_kexpand1(dst, src1, src2, tcg_constant_i32(a->imm));
+    gen_store_fpr_D(dc, a->rd, dst);
+    return advance_pc(dc);
+#else
+    return false;
+#endif
+}
 
 static bool trans_FALIGNDATAi(DisasContext *dc, arg_r_r_r *a)
 {

@@ -2398,12 +2398,9 @@ static int32_t scsi_disk_dma_command(SCSIRequest *req, uint8_t *buf)
     }
 }
 
-static void scsi_disk_reset(DeviceState *dev)
+static void scsi_disk_refresh_max_lba(SCSIDiskState *s)
 {
-    SCSIDiskState *s = DO_UPCAST(SCSIDiskState, qdev.qdev, dev);
     uint64_t nb_sectors;
-
-    scsi_device_purge_requests(&s->qdev, SENSE_CODE(RESET));
 
     blk_get_geometry(s->qdev.conf.blk, &nb_sectors);
 
@@ -2412,6 +2409,15 @@ static void scsi_disk_reset(DeviceState *dev)
         nb_sectors--;
     }
     s->qdev.max_lba = nb_sectors;
+}
+
+static void scsi_disk_reset(DeviceState *dev)
+{
+    SCSIDiskState *s = DO_UPCAST(SCSIDiskState, qdev.qdev, dev);
+
+    scsi_device_purge_requests(&s->qdev, SENSE_CODE(RESET));
+
+    scsi_disk_refresh_max_lba(s);
     /* reset tray statuses */
     s->tray_locked = 0;
     s->tray_open = 0;
@@ -2436,6 +2442,8 @@ static void scsi_disk_drained_end(void *opaque)
 static void scsi_disk_resize_cb(void *opaque)
 {
     SCSIDiskState *s = opaque;
+
+    scsi_disk_refresh_max_lba(s);
 
     /* SPC lists this sense code as available only for
      * direct-access devices.
@@ -2761,20 +2769,45 @@ static SCSIRequest *scsi_new_request(SCSIDevice *d, uint32_t tag, uint32_t lun,
  * fails because the destination may have already preempted and we need to get
  * the reservation back.
  */
+static void scsi_block_migration_failed(SCSIDiskState *s)
+{
+    SCSIDevice *d = &s->qdev;
+    Error *local_err = NULL;
+
+    if (!scsi_generic_pr_state_preempt(d, &local_err)) {
+        /* MIG_EVENT_FAILED cannot fail, so just warn */
+        error_prepend(&local_err, "scsi-block migration rollback: ");
+        warn_report_err(local_err);
+    }
+}
+
+/*
+ * Unregister keys on the source after migration since the destination has
+ * preempted and taken over. This cleanup is not necessary at the SCSI level
+ * but multipathd tracks registered keys and must be informed that this host no
+ * longer wishes to be registered.
+ */
+static void scsi_block_migration_done(SCSIDiskState *s)
+{
+    SCSIDevice *d = &s->qdev;
+    Error *local_err = NULL;
+
+    if (!scsi_generic_pr_state_cleanup(d, &local_err)) {
+        error_prepend(&local_err, "scsi-block migration done: ");
+        warn_report_err(local_err);
+    }
+}
+
 static int scsi_block_migration_notifier(NotifierWithReturn *notifier,
                                          MigrationEvent *e, Error **errp)
 {
-    if (e->type == MIG_EVENT_FAILED) {
-        SCSIDiskState *s =
-            container_of(notifier, SCSIDiskState, migration_notifier);
-        SCSIDevice *d = &s->qdev;
-        Error *local_err = NULL;
+    SCSIDiskState *s =
+        container_of(notifier, SCSIDiskState, migration_notifier);
 
-        if (!scsi_generic_pr_state_preempt(d, &local_err)) {
-            /* MIG_EVENT_FAILED cannot fail, so just warn */
-            error_prepend(&local_err, "scsi-block migration rollback: ");
-            warn_report_err(local_err);
-        }
+    if (e->type == MIG_EVENT_DONE) {
+        scsi_block_migration_done(s);
+    } else if (e->type == MIG_EVENT_FAILED) {
+        scsi_block_migration_failed(s);
     }
     return 0;
 }
@@ -3345,6 +3378,7 @@ static const TypeInfo scsi_hd_info = {
     .name          = "scsi-hd",
     .parent        = TYPE_SCSI_DISK_BASE,
     .class_init    = scsi_hd_class_initfn,
+    .secure        = true,
 };
 
 static const Property scsi_cd_properties[] = {
@@ -3388,6 +3422,7 @@ static const TypeInfo scsi_cd_info = {
     .name          = "scsi-cd",
     .parent        = TYPE_SCSI_DISK_BASE,
     .class_init    = scsi_cd_class_initfn,
+    .secure        = true,
 };
 
 #ifdef __linux__
@@ -3430,6 +3465,7 @@ static const TypeInfo scsi_block_info = {
     .name          = "scsi-block",
     .parent        = TYPE_SCSI_DISK_BASE,
     .class_init    = scsi_block_class_initfn,
+    .secure        = true,
 };
 #endif
 

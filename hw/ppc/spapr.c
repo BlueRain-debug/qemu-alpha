@@ -1068,6 +1068,7 @@ static void spapr_dt_rtas(SpaprMachineState *spapr, void *fdt)
                           RTAS_ERROR_LOG_MAX));
     _FDT(fdt_setprop_cell(fdt, rtas, "rtas-event-scan-rate",
                           RTAS_EVENT_SCAN_RATE));
+    _FDT(fdt_setprop_cell(fdt, rtas, "rtas-version", RTAS_VERSION));
 
     g_assert(msi_nonbroken);
     _FDT(fdt_setprop(fdt, rtas, "ibm,change-msix-capable", NULL, 0));
@@ -4750,6 +4751,7 @@ static void spapr_machine_latest_class_options(MachineClass *mc)
         .name = MACHINE_VER_TYPE_NAME("pseries", __VA_ARGS__),       \
         .parent = TYPE_SPAPR_MACHINE,                                \
         .class_init = MACHINE_VER_SYM(class_init, spapr, __VA_ARGS__), \
+        .secure = true,                                              \
     };                                                               \
     static void MACHINE_VER_SYM(register, spapr, __VA_ARGS__)(void)  \
     {                                                                \

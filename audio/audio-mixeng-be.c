@@ -78,7 +78,7 @@ static int audio_validate_settings (const struct audsettings *as)
 {
     int invalid;
 
-    invalid = as->nchannels < 1;
+    invalid = as->nchannels < 1 || as->nchannels > 16;
 
     switch (as->fmt) {
     case AUDIO_FORMAT_S8:
@@ -94,7 +94,7 @@ static int audio_validate_settings (const struct audsettings *as)
         break;
     }
 
-    invalid |= as->freq <= 0;
+    invalid |= as->freq <= 0 || as->freq > 384000;
     return invalid ? -1 : 0;
 }
 
@@ -1179,7 +1179,7 @@ void audio_run(AudioMixengBackend *s, const char *msg)
     audio_run_in(s);
     audio_run_capture(s);
 
-    if (trace_event_get_state(TRACE_AUDIO_RUN_POLL)) {
+    if (trace_event_get_state_backends(TRACE_AUDIO_RUN_POLL)) {
         /* Convert seconds to microseconds for trace event */
         int64_t elapsed_us = g_timer_elapsed(s->run_timer, NULL) * MICROSECONDS_PER_SECOND;
         trace_audio_run_poll(msg, elapsed_us);

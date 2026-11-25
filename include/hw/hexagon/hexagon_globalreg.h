@@ -33,6 +33,10 @@ struct HexagonGlobalRegState {
     /* Global performance cycle counter base */
     uint64_t g_pcycle_base;
 
+    /* Global performance cycle counter clock state */
+    int64_t pcycle_start_ns;
+    bool pcycle_running;
+
     /* Properties for global register reset values */
     uint32_t boot_evb;           /* Boot Exception Vector Base (HEX_SREG_EVB) */
     uint64_t config_table_addr;  /* Configuration table base */
@@ -55,7 +59,14 @@ uint32_t hexagon_globalreg_masked_value(HexagonGlobalRegState *s, uint32_t reg,
 void hexagon_globalreg_write_masked(HexagonGlobalRegState *s, uint32_t reg,
                                     uint32_t value);
 
+/*
+ * SYSCFG, without the BQL: for the translator, which asks for it on every
+ * translation block lookup and can't afford to contend for the lock.
+ */
+uint32_t hexagon_globalreg_read_syscfg_unlocked(HexagonGlobalRegState *s);
+
 /* Global performance cycle counter access */
+uint64_t hexagon_globalreg_read_pcycle(HexagonGlobalRegState *s);
 uint64_t hexagon_globalreg_get_pcycle_base(HexagonGlobalRegState *s);
 void hexagon_globalreg_set_pcycle_base(HexagonGlobalRegState *s,
                                        uint64_t value);

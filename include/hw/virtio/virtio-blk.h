@@ -47,6 +47,7 @@ struct VirtIOBlkConf
     bool report_discard_granularity;
     uint32_t max_discard_sectors;
     uint32_t max_write_zeroes_sectors;
+    uint32_t max_append_sectors;
     bool x_enable_wce_if_config_wce;
 };
 
@@ -98,6 +99,7 @@ typedef struct MultiReqBuffer {
     VirtIOBlockReq *reqs[VIRTIO_BLK_MAX_MERGE_REQS];
     unsigned int num_reqs;
     bool is_write;
+    bool is_fua;
 } MultiReqBuffer;
 
 typedef struct VirtIOBlkClass {

@@ -18,6 +18,7 @@
 #include "qapi/qapi-commands-accelerator.h"
 #include "qapi/qapi-commands-machine.h"
 #include "qobject/qobject.h"
+#include "qapi/qapi-type-infos-common.h"
 #include "qapi/qobject-input-visitor.h"
 #include "qapi/type-helpers.h"
 #include "qemu/uuid.h"
@@ -27,6 +28,7 @@
 #include "system/hostmem.h"
 #include "system/hw_accel.h"
 #include "system/numa.h"
+#include "system/qmp-cpu.h"
 #include "system/ramlist.h"
 #include "system/runstate.h"
 #include "system/system.h"
@@ -91,6 +93,63 @@ CpuInfoFastList *qmp_query_cpus_fast(Error **errp)
     }
 
     return head;
+}
+
+CpuDefinitionInfoList *qmp_query_cpu_definitions(Error **errp)
+{
+    switch (target_arch()) {
+    case SYS_EMU_TARGET_AARCH64:
+    case SYS_EMU_TARGET_ARM:
+        return qmp_query_arm_cpu_definitions(errp);
+    case SYS_EMU_TARGET_I386:
+    case SYS_EMU_TARGET_X86_64:
+        return qmp_query_i386_cpu_definitions(errp);
+    case SYS_EMU_TARGET_LOONGARCH64:
+        return qmp_query_loongarch_cpu_definitions(errp);
+    case SYS_EMU_TARGET_MIPS:
+    case SYS_EMU_TARGET_MIPS64:
+    case SYS_EMU_TARGET_MIPS64EL:
+    case SYS_EMU_TARGET_MIPSEL:
+        return qmp_query_mips_cpu_definitions(errp);
+    case SYS_EMU_TARGET_PPC:
+    case SYS_EMU_TARGET_PPC64:
+        return qmp_query_ppc_cpu_definitions(errp);
+    case SYS_EMU_TARGET_RISCV32:
+    case SYS_EMU_TARGET_RISCV64:
+        return qmp_query_riscv_cpu_definitions(errp);
+    case SYS_EMU_TARGET_S390X:
+        return qmp_query_s390x_cpu_definitions(errp);
+    default:
+        error_setg(errp,
+                   "CPU model definitions are not supported on this target");
+        return NULL;
+    }
+}
+
+CpuModelExpansionInfo *
+qmp_query_cpu_model_expansion(CpuModelExpansionType type,
+                              CpuModelInfo *model,
+                              Error **errp)
+{
+    switch (target_arch()) {
+    case SYS_EMU_TARGET_AARCH64:
+    case SYS_EMU_TARGET_ARM:
+        return qmp_query_arm_cpu_model_expansion(type, model, errp);
+    case SYS_EMU_TARGET_I386:
+    case SYS_EMU_TARGET_X86_64:
+        return qmp_query_i386_cpu_model_expansion(type, model, errp);
+    case SYS_EMU_TARGET_LOONGARCH64:
+        return qmp_query_loongarch_cpu_model_expansion(type, model, errp);
+    case SYS_EMU_TARGET_RISCV32:
+    case SYS_EMU_TARGET_RISCV64:
+        return qmp_query_riscv_cpu_model_expansion(type, model, errp);
+    case SYS_EMU_TARGET_S390X:
+        return qmp_query_s390x_cpu_model_expansion(type, model, errp);
+    default:
+        error_setg(errp,
+                   "CPU model expansion is not supported on this target");
+        return NULL;
+    }
 }
 
 MachineInfoList *qmp_query_machines(bool has_compat_props, bool compat_props,
@@ -220,7 +279,8 @@ static int query_memdev(Object *obj, void *opaque)
         } else {
             m->has_reserve = true;
         }
-        m->policy = object_property_get_enum(obj, "policy", "HostMemPolicy",
+        m->policy = object_property_get_enum(obj, "policy",
+                                             &HostMemPolicy_type_info,
                                              &error_abort);
         host_nodes = object_property_get_qobject(obj,
                                                  "host-nodes",

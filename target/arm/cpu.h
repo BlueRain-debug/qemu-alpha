@@ -65,7 +65,9 @@
 #define EXCP_VINMI          27
 #define EXCP_VFNMI          28
 #define EXCP_MON_TRAP       29   /* AArch32 trap to Monitor mode */
-/* NB: add new EXCP_ defines to the array in arm_log_exception() too */
+/* NB: add new EXCP_ defines to the array in arm_exception_name() too */
+
+const char *arm_exception_name(int excp);
 
 #define ARMV7M_EXCP_RESET   1
 #define ARMV7M_EXCP_NMI     2
@@ -814,10 +816,12 @@ typedef struct CPUArchState {
     const struct arm_boot_info *boot_info;
     /* Store GICv3CPUState to access from this struct */
     void *gicv3state;
-    /* Similarly, for a GICv5Common */
-    void *gicv5state;
-    /* For GICv5, this CPU's IAFFID */
-    uint64_t gicv5_iaffid;
+    /* Information the GICv5 IRS passes to us */
+    struct {
+        void *gicv5state; /* GICv5Common struct */
+        uint64_t iaffid; /* this CPU's IAFFID */
+        uint32_t cpuidx; /* GIC IRS-internal index of this CPU */
+    } gicv5;
 #else /* CONFIG_USER_ONLY */
     /* For usermode syscall translation.  */
     bool eabi;
@@ -1076,10 +1080,11 @@ struct ArchCPU {
     /* Uniprocessor system with MP extensions */
     bool mp_is_up;
 
-    /* True if we tried kvm_arm_host_cpu_features() during CPU instance_init
+    /*
+     * Set if we tried *_set_cpu_features_from_host() during CPU instance_init
      * and the probe failed (so we need to report the error in realize)
      */
-    bool host_cpu_probe_failed;
+    Error *host_cpu_probe_err;
 
     /* QOM property to indicate we should use the back-compat CNTFRQ default */
     bool backcompat_cntfrq;
@@ -1126,14 +1131,18 @@ struct ArchCPU {
         uint64_t reset_pmcr_el0;
         uint64_t idregs[NUM_ID_IDX];
     } isar;
-    uint64_t midr;
-    uint32_t revidr;
     uint32_t reset_fpsid;
     uint64_t ctr;
     uint32_t reset_sctlr;
     uint64_t pmceid0;
     uint64_t pmceid1;
-    uint64_t mp_affinity; /* MP ID without feature bits */
+    /*
+     * MP ID without feature bits, ie. Aff0..Aff3 only
+     * used to store the corresponding property value for TCG vcpus.
+     * The MPIDR_EL1 value (affinity + feature bits) is stored in a
+     * consistent manner in isar.idregs[MPIDR_EL1_IDX].
+     */
+    uint64_t mp_affinity;
     uint64_t reset_cbar;
     uint32_t reset_auxcr;
     bool reset_hivecs;
@@ -1814,6 +1823,8 @@ static inline void xpsr_write(CPUARMState *env, uint32_t val, uint32_t mask)
 #define SCR_EASE              (1ULL << 19)
 #define SCR_NMEA              (1ULL << 20)
 #define SCR_FIEN              (1ULL << 21)
+#define SCR_TID3              (1ULL << 22)
+#define SCR_TID5              (1ULL << 23)
 #define SCR_ENSCXT            (1ULL << 25)
 #define SCR_ATA               (1ULL << 26)
 #define SCR_FGTEN             (1ULL << 27)

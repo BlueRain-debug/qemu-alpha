@@ -261,8 +261,6 @@ static void tap_send(void *opaque)
 
     while (true) {
         uint8_t *buf = s->buf;
-        uint8_t min_pkt[ETH_ZLEN];
-        size_t min_pktsz = sizeof(min_pkt);
 
         size = tap_read_packet(s->fd, s->buf, sizeof(s->buf));
         if (size <= 0) {
@@ -277,13 +275,6 @@ static void tap_send(void *opaque)
         if (s->host_vnet_hdr_len && !s->using_vnet_hdr) {
             buf  += s->host_vnet_hdr_len;
             size -= s->host_vnet_hdr_len;
-        }
-
-        if (net_peer_needs_padding(&s->nc)) {
-            if (eth_pad_short_frame(min_pkt, &min_pktsz, buf, size)) {
-                buf = min_pkt;
-                size = min_pktsz;
-            }
         }
 
         size = qemu_send_packet_async(&s->nc, buf, size, tap_send_completed);
@@ -446,6 +437,13 @@ int tap_get_fd(NetClientState *nc)
     return s->fd;
 }
 
+static int tap_get_mtu(NetClientState *nc)
+{
+    TAPState *s = container_of(nc, TAPState, nc);
+    assert(nc->info->type == NET_CLIENT_DRIVER_TAP);
+    return tap_fd_get_mtu(s->fd);
+}
+
 /*
  * tap_get_vhost_net() can return NULL if a tap net-device backend is
  * created with 'vhost=off' option, 'vhostforce=off' or no vhost or
@@ -490,8 +488,6 @@ static bool tap_post_load(void *opaque, int version_id, Error **errp)
     ERRP_GUARD();
     TAPState *s = opaque;
 
-    tap_read_poll(s, true);
-
     if (s->fd < 0) {
         error_setg(errp, "FD was not loaded during incoming migration");
         return false;
@@ -503,6 +499,7 @@ static bool tap_post_load(void *opaque, int version_id, Error **errp)
         return false;
     }
 
+    tap_read_poll(s, true);
     return true;
 }
 
@@ -608,6 +605,7 @@ static NetClientInfo net_tap_info = {
     .set_steering_ebpf = tap_set_steering_ebpf,
     .is_wait_incoming = tap_is_wait_incoming,
     .get_vhost_net = tap_get_vhost_net,
+    .get_mtu = tap_get_mtu,
 };
 
 static TAPState *new_tap(NetClientState *peer,
@@ -620,9 +618,12 @@ static TAPState *new_tap(NetClientState *peer,
     TAPState *s = TAP_NETDEV(object_new(TYPE_TAP_NETDEV));
 
     qemu_net_client_setup(&s->nc, &net_tap_info, peer, model, name,
-                          tap_net_client_destructor, true);
+                          tap_net_client_destructor, true, true);
 
     s->queue_index = queue_index;
+
+    s->enable_poll_on_resume = false;
+    s->vmstate = qemu_add_vm_change_state_handler(tap_vm_state_change, s);
 
     if (has_permit_local_migration) {
         s->permit_local_migration = permit_local_migration;
@@ -969,9 +970,6 @@ static bool net_init_tap_one(const NetdevTapOptions *tap, NetClientState *peer,
     int sndbuf =
         (tap->has_sndbuf && tap->sndbuf) ? MIN(tap->sndbuf, INT_MAX) : INT_MAX;
 
-    s->enable_poll_on_resume = false;
-    s->vmstate = qemu_add_vm_change_state_handler(tap_vm_state_change, s);
-
     if (!tap_set_sndbuf(fd, sndbuf, sndbuf_required ? errp : NULL) &&
         sndbuf_required) {
         goto failed;
@@ -997,7 +995,7 @@ static bool net_init_tap_one(const NetdevTapOptions *tap, NetClientState *peer,
     s->vhostfd = vhostfd;
     s->vhost_busyloop_timeout = tap->has_poll_us ? tap->poll_us : 0;
     if (!tap_setup_vhost(s, errp)) {
-        return false;
+        goto failed;
     }
 
     return true;
@@ -1245,7 +1243,9 @@ int net_init_tap(const Netdev *netdev, const char *name,
     return 0;
 
 fail:
-    close(fd);
+    if (fd != -1) {
+        close(fd);
+    }
     net_free_fds(fds, queues);
     net_free_fds(vhost_fds, queues);
     return -1;

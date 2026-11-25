@@ -1116,6 +1116,8 @@ static void virtio_crypto_device_unrealize(DeviceState *dev)
     VirtIOCryptoQueue *q;
     int i;
 
+    cryptodev_backend_drain_requests(vcrypto->cryptodev);
+
     for (i = 0; i < vcrypto->max_queues; i++) {
         virtio_delete_queue(vcrypto->vqs[i].dataq);
         q = &vcrypto->vqs[i];
@@ -1313,6 +1315,7 @@ static const TypeInfo virtio_crypto_info = {
     .instance_size = sizeof(VirtIOCrypto),
     .instance_init = virtio_crypto_instance_init,
     .class_init = virtio_crypto_class_init,
+    .secure = true,
 };
 
 static void virtio_register_types(void)

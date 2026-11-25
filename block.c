@@ -524,6 +524,21 @@ bool bdrv_uses_whitelist(void)
     return use_bdrv_whitelist;
 }
 
+static void bdrv_help_format_print(void *opaque, const char *name)
+{
+    if (bdrv_format_is_whitelisted(name, false)) {
+        printf("%s\n", name);
+    } else {
+        printf("%s (read-only)\n", name);
+    }
+}
+
+void bdrv_show_help(void)
+{
+      printf("Available blockdev drivers:\n");
+      bdrv_iterate_format(bdrv_help_format_print, NULL, true);
+}
+
 typedef struct CreateCo {
     BlockDriver *drv;
     char *filename;
@@ -5174,12 +5189,23 @@ static void GRAPH_UNLOCKED bdrv_close(BlockDriverState *bs)
 {
     BdrvAioNotifier *ban, *ban_next;
     BdrvChild *child, *next;
+    int ret;
 
     GLOBAL_STATE_CODE();
     assert(!bs->refcnt);
 
     bdrv_drained_begin(bs); /* complete I/O */
-    bdrv_flush(bs);
+    ret = bdrv_flush(bs);
+    if (ret < 0) {
+        const char *name;
+        if (bs->filename[0]) {
+            name = bs->filename;
+        } else {
+            name = bdrv_get_node_name(bs);
+        }
+        error_report("Failed flush for '%s' during close: %s", name,
+                     strerror(-ret));
+    }
     bdrv_drain(bs); /* in case flush left pending I/O */
 
     if (bs->drv) {
@@ -5536,12 +5562,16 @@ int bdrv_replace_child_bs(BdrvChild *child, BlockDriverState *new_bs,
     Transaction *tran = tran_new();
     g_autoptr(GSList) refresh_list = NULL;
     BlockDriverState *old_bs = child->bs;
+    int64_t old_len;
 
     GLOBAL_STATE_CODE();
 
     bdrv_ref(old_bs);
     bdrv_drained_begin(old_bs);
     bdrv_drained_begin(new_bs);
+
+    old_len = bdrv_getlength(old_bs);
+
     bdrv_graph_wrlock();
 
     bdrv_replace_child_tran(child, new_bs, tran);
@@ -5554,6 +5584,16 @@ int bdrv_replace_child_bs(BdrvChild *child, BlockDriverState *new_bs,
     tran_finalize(tran, ret);
 
     bdrv_graph_wrunlock();
+
+    /* A parent caching the child size has to learn that it changed */
+    if (ret == 0) {
+        int64_t new_len = bdrv_getlength(new_bs);
+
+        if (new_len >= 0 && new_len != old_len) {
+            bdrv_child_notify_resize(child);
+        }
+    }
+
     bdrv_drained_end(old_bs);
     bdrv_drained_end(new_bs);
     bdrv_unref(old_bs);

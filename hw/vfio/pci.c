@@ -76,7 +76,10 @@ static bool vfio_notifier_init(VFIOPCIDevice *vdev, EventNotifier *e,
     }
 
     fd = event_notifier_get_fd(e);
-    vfio_cpr_save_vector_fd(vdev, name, nr, fd);
+    if (!vfio_cpr_save_vector_fd(vdev, name, nr, fd, errp)) {
+        event_notifier_cleanup(e);
+        return false;
+    }
     return true;
 }
 
@@ -1623,6 +1626,7 @@ static void vfio_pci_fixup_msix_region(VFIOPCIDevice *vdev)
                                   vdev->msix->table_bar, 0, 0);
         } else {
             region->mmaps[0].offset = end;
+            region->mmaps[0].fd_offset += end;
             region->mmaps[0].size = region->size - end;
             trace_vfio_msix_fixup(vdev->vbasedev.name,
                               vdev->msix->table_bar, region->mmaps[0].offset,
@@ -1649,6 +1653,7 @@ static void vfio_pci_fixup_msix_region(VFIOPCIDevice *vdev)
                               region->mmaps[0].offset + region->mmaps[0].size);
 
         region->mmaps[1].offset = end;
+        region->mmaps[1].fd_offset += end;
         region->mmaps[1].size = region->size - end;
         trace_vfio_msix_fixup(vdev->vbasedev.name,
                               vdev->msix->table_bar, region->mmaps[1].offset,
@@ -4110,6 +4115,7 @@ static const TypeInfo vfio_pci_info = {
     .class_init = vfio_pci_class_init,
     .instance_init = vfio_pci_init,
     .instance_finalize = vfio_pci_finalize,
+    .secure = true,
 };
 
 static const Property vfio_pci_nohotplug_properties[] = {
@@ -4146,6 +4152,7 @@ static const TypeInfo vfio_pci_nohotplug_info = {
     .parent = TYPE_VFIO_PCI,
     .instance_size = sizeof(VFIOPCIDevice),
     .class_init = vfio_pci_nohotplug_class_init,
+    .secure = true,
 };
 
 static void register_vfio_pci_dev_type(void)

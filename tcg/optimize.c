@@ -1704,7 +1704,7 @@ static bool fold_deposit(OptContext *ctx, TCGOp *op)
                                           ti_const_val(t2)));
     }
 
-    width = 8 * tcg_type_size(ctx->type);
+    width = tcg_type_bits(ctx->type);
     type_mask = MAKE_64BIT_MASK(0, width);
     len_mask = MAKE_64BIT_MASK(0, len);
 
@@ -2106,6 +2106,68 @@ static bool fold_extu(OptContext *ctx, TCGOp *op)
     return fold_masks_zo(ctx, op, z_mask, o_mask);
 }
 
+static bool fold_shift(OptContext *ctx, TCGOp *op);
+static bool fold_lea(OptContext *ctx, TCGOp *op)
+{
+    TCGArg sh = op->args[3];
+    TCGArg imm = op->args[4];
+    int var_mask = 0;
+
+    if (arg_is_const(op->args[1])) {
+        imm += arg_const_val(op->args[1]);
+    } else {
+        var_mask |= 1;
+    }
+    if (arg_is_const(op->args[2])) {
+        imm += arg_const_val(op->args[2]) << sh;
+    } else {
+        var_mask |= 2;
+    }
+
+    switch (var_mask) {
+    case 0:
+        return tcg_opt_gen_movi(ctx, op, op->args[0], imm);
+
+    case 1:
+        if (imm == 0) {
+            return tcg_opt_gen_mov(ctx, op, op->args[0], op->args[1]);
+        }
+        op->opc = INDEX_op_add;
+        op->args[2] = arg_new_constant(ctx, imm);
+        break;
+
+    case 2:
+        if (sh == 0) {
+            if (imm == 0) {
+                return tcg_opt_gen_mov(ctx, op, op->args[0], op->args[2]);
+            }
+            op->opc = INDEX_op_add;
+            op->args[1] = op->args[2];
+            op->args[2] = arg_new_constant(ctx, imm);
+            break;
+        }
+        if (imm == 0) {
+            op->opc = INDEX_op_shl;
+            op->args[1] = op->args[2];
+            op->args[2] = arg_new_constant(ctx, sh);
+            return fold_shift(ctx, op);
+        }
+
+        /* If arg1 was not already 0, fold the immediates. */
+        if (arg_const_val(op->args[1]) != 0) {
+            if (TCG_TARGET_lea_imm_valid(ctx->type, imm)) {
+                op->args[1] = arg_new_constant(ctx, 0);
+                op->args[4] = imm;
+            } else {
+                op->args[1] = arg_new_constant(ctx, imm);
+                op->args[4] = 0;
+            }
+        }
+        break;
+    }
+    return finish_folding(ctx, op);
+}
+
 static bool fold_mb(OptContext *ctx, TCGOp *op)
 {
     /* Eliminate duplicate and redundant fence instructions.  */
@@ -2218,7 +2280,6 @@ static bool fold_mul_highpart(OptContext *ctx, TCGOp *op)
     return finish_folding(ctx, op);
 }
 
-static bool fold_shift(OptContext *ctx, TCGOp *op);
 static bool fold_multiply2(OptContext *ctx, TCGOp *op)
 {
     swap_commutative(op->args[0], &op->args[2], &op->args[3]);
@@ -2279,7 +2340,7 @@ static bool fold_multiply2(OptContext *ctx, TCGOp *op)
                 op->args[0] = rh;
                 op->args[1] = rl;
                 op->args[2] =
-                    arg_new_constant(ctx, tcg_type_size(ctx->type) * 8 - 1);
+                    arg_new_constant(ctx, tcg_type_bits(ctx->type) - 1);
                 return fold_shift(ctx, op);
             default:
                 break;
@@ -2703,17 +2764,26 @@ static bool fold_shift(OptContext *ctx, TCGOp *op)
         z_mask = do_constant_folding(op->opc, ctx->type, z_mask, sh);
         o_mask = do_constant_folding(op->opc, ctx->type, o_mask, sh);
 
-        if (op->opc == INDEX_op_shr) {
+        switch (op->opc) {
+        case INDEX_op_shr:
+        case INDEX_op_rotl:
+        case INDEX_op_rotr:
             /*
-             * Logical right shift will force the sign bit zero.
+             * Logical right shift will force the sign bit zero, and
+             * a rotate may move bits unrelated to the sign into it.
              * Don't bother computing s_mask and let fold_masks
              * recompute from z_mask.
              */
             return fold_masks_zo(ctx, op, z_mask, o_mask);
-        }
 
-        s_mask = do_constant_folding(op->opc, ctx->type, s_mask, sh);
-        return fold_masks_zos(ctx, op, z_mask, o_mask, s_mask);
+        case INDEX_op_sar:
+        case INDEX_op_shl:
+            s_mask = do_constant_folding(op->opc, ctx->type, s_mask, sh);
+            return fold_masks_zos(ctx, op, z_mask, o_mask, s_mask);
+
+        default:
+            g_assert_not_reached();
+        }
     }
 
     switch (op->opc) {
@@ -3210,6 +3280,9 @@ void tcg_optimize(TCGContext *s)
         case INDEX_op_st:
         case INDEX_op_st_vec:
             done = fold_tcg_st_memcopy(&ctx, op);
+            break;
+        case INDEX_op_lea:
+            done = fold_lea(&ctx, op);
             break;
         case INDEX_op_mb:
             done = fold_mb(&ctx, op);

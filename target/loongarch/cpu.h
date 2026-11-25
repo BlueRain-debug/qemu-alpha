@@ -302,6 +302,7 @@ enum loongarch_features {
     LOONGARCH_FEATURE_STEALTIME,
     LOONGARCH_FEATURE_PTW,
     LOONGARCH_FEATURE_MSGINT,
+    LOONGARCH_FEATURE_PV_PREEMPT,
 };
 
 typedef struct  LoongArchBT {
@@ -320,6 +321,9 @@ typedef struct CPUTimerState {
     int irq;
     CPUState *cs;
 } CPUTimerState;
+
+#define VM_LEVEL0   0
+#define VM_LEVELS   1
 
 #define CPU_VENDOR_LOONGSON   "Loongson"
 #define CPU_MODEL_3A5000      "3A5000"
@@ -425,7 +429,7 @@ typedef struct CPUArchState {
     /* Fields up to this point are cleared by a CPU reset */
     struct {} end_reset_fields;
 
-    CPUSysState sys_states[1];
+    CPUSysState sys_states[VM_LEVELS];
     uint32_t cpucfg[21];
     uint32_t pv_features;
     uint64_t vendor_id;
@@ -436,7 +440,8 @@ typedef struct CPUArchState {
     AddressSpace *address_space_iocsr;
     uint32_t mp_state;
 #endif
-    CPUSysState *sys_state;
+    int vm_level;
+    unsigned int irq_nr;
 } CPULoongArchState;
 
 typedef struct LoongArchCPUTopo {
@@ -464,6 +469,7 @@ struct ArchCPU {
     OnOffAuto msgint;
     OnOffAuto kvm_pv_ipi;
     OnOffAuto kvm_steal_time;
+    OnOffAuto kvm_pv_preempt;
     int32_t socket_id;  /* socket-id of this CPU */
     int32_t core_id;    /* core-id of this CPU */
     int32_t thread_id;  /* thread-id of this CPU */
@@ -504,12 +510,14 @@ struct LoongArchCPUClass {
 
 static inline CPUSysState *env_sys(CPULoongArchState *env)
 {
-    return env->sys_state;
+    return &env->sys_states[env->vm_level];
 }
 
-static inline void set_sys_state(CPULoongArchState *env, CPUSysState *sys)
+static inline void set_sys(CPULoongArchState *env, int vm_level)
 {
-    env->sys_state = sys;
+    if (vm_level >= 0 && vm_level <  VM_LEVELS) {
+        env->vm_level = vm_level;
+    }
 }
 
 static inline CPUTimerState *env_timer(CPULoongArchState *env)
@@ -532,6 +540,12 @@ static inline bool is_va32(CPULoongArchState *env)
         va32 = true;
     }
     return va32;
+}
+
+static inline bool cpu_has_msgint(CPULoongArchState *env)
+{
+
+    return FIELD_EX32(env->cpucfg[1], CPUCFG1, MSG_INT);
 }
 
 static inline void set_pc(CPULoongArchState *env, uint64_t value)

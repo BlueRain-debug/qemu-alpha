@@ -48,9 +48,11 @@ def main():
         "Emit instruction implementations that can be fed to idef-parser"
     )
     parser.add_argument("semantics", help="semantics file")
+    parser.add_argument("overrides_hmx", help="HMX overrides file")
     parser.add_argument("out", help="output file")
     args = parser.parse_args()
     hex_common.read_semantics_file(args.semantics)
+    hex_common.read_overrides_file(args.overrides_hmx)
     hex_common.calculate_attribs()
     hex_common.init_registers()
     tagregs = hex_common.get_tagregs()
@@ -62,11 +64,16 @@ def main():
         for tag in hex_common.tags:
             if hex_common.tag_ignore(tag):
                 continue
+            ## Skip instructions that explicitly request no idef-parser
+            if "A_NO_IDEF_PARSER" in hex_common.attribdict[tag]:
+                continue
             ## Skip the priv instructions
             if "A_PRIV" in hex_common.attribdict[tag]:
                 continue
             ## Skip the guest instructions
             if "A_GUEST" in hex_common.attribdict[tag]:
+                continue
+            if "A_ATOMIC" in hex_common.attribdict[tag]:
                 continue
             ## Skip instructions that saturate in a ternary expression
             if tag in {"S2_asr_r_r_sat", "S2_asl_r_r_sat"}:
@@ -75,7 +82,7 @@ def main():
             if tag in {"S4_vrcrotate_acc", "S4_vrcrotate"}:
                 continue
             ## Skip trap instructions
-            if tag in {"J2_trap0", "J2_trap1"}:
+            if tag in {"J2_trap0", "J2_trap1", "J2_trap2"}:
                 continue
             ## Skip 128-bit instructions
             if tag in {"A7_croundd_ri", "A7_croundd_rr"}:
@@ -111,6 +118,10 @@ def main():
             if tag.startswith("Y"):
                 continue
             if tag.startswith("V6_"):
+                continue
+            ## Skip the HMX instructions implemented by an override
+            if ("A_HMX" in hex_common.attribdict[tag] and
+                hex_common.skip_qemu_helper(tag)):
                 continue
             if ( tag.startswith("F") and
                  tag not in {

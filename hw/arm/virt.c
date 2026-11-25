@@ -60,7 +60,6 @@
 #include "qemu/main-loop.h"
 #include "hw/pci/pci_bus.h"
 #include "hw/pci-host/gpex.h"
-#include "hw/pci-bridge/pci_expander_bridge.h"
 #include "hw/virtio/virtio-pci.h"
 #include "hw/core/sysbus-fdt.h"
 #include "hw/core/platform-bus.h"
@@ -75,7 +74,7 @@
 #include "whpx_arm.h"
 #include "hw/firmware/smbios.h"
 #include "qapi/visitor.h"
-#include "qapi/qapi-visit-common.h"
+#include "qapi/qapi-type-infos-common.h"
 #include "qobject/qlist.h"
 #include "standard-headers/linux/input.h"
 #include "hw/arm/smmuv3.h"
@@ -138,6 +137,7 @@ static void arm_virt_compat_default_set(MachineClass *mc)
         .parent = TYPE_VIRT_BOARD_MACHINE, \
         .class_init = MACHINE_VER_SYM(class_init, virt, __VA_ARGS__), \
         .is_available = target_base_arm, \
+        .secure = true, \
     }; \
     static void MACHINE_VER_SYM(register, virt, __VA_ARGS__)(void) \
     { \
@@ -348,6 +348,21 @@ unsigned int virt_get_caches(const VirtMachineState *vms, CPUCoreCaches *caches)
     ARMCPU *armcpu = ARM_CPU(qemu_get_cpu(0)); /* assume homogeneous CPUs */
     ARMISARegisters *isar = &armcpu->isar;
     uint32_t clidr = GET_IDREG(isar, CLIDR);
+
+    /*
+     * Commit f669de70011 ("hw/arm/virt: add cache hierarchy to device tree")
+     * read the CLIDR value from the isar array. However, in KVM mode, we failed
+     * to initialize that register value from host and the resulting bug is that
+     * we have always read 0.
+     *
+     * Soon we will initialize all writable isar.idreg[] from host, including
+     * CLIDR_EL1 but we will need to handle compat properly and also extend the
+     * support to unified L1 cache. For now do not pretend we have something
+     * different from 0.
+     */
+    if (kvm_enabled()) {
+        clidr = 0;
+    }
 
     for (int cache_level = 1; cache_level <= CLIDR_CTYPE_MAX_CACHE_LEVEL;
          cache_level++) {
@@ -2355,8 +2370,10 @@ static void create_tag_ram(MemoryRegion *tag_sysmem,
 {
     MemoryRegion *tagram = g_new(MemoryRegion, 1);
 
-    memory_region_init_ram(tagram, NULL, name, size / 32, &error_fatal);
-    memory_region_add_subregion(tag_sysmem, base / 32, tagram);
+    /* We store 2 granules in 1 byte. */
+    memory_region_init_ram(tagram, NULL, name, size / (2 * TAG_GRANULE),
+                           &error_fatal);
+    memory_region_add_subregion(tag_sysmem, base / (2 * TAG_GRANULE), tagram);
 }
 
 static void create_secure_ram(VirtMachineState *vms,
@@ -4194,21 +4211,16 @@ bool virt_is_acpi_enabled(const VirtMachineState *vms)
     return true;
 }
 
-static void virt_get_acpi(Object *obj, Visitor *v, const char *name,
-                          void *opaque, Error **errp)
+static int virt_get_acpi(Object *obj, Error **errp)
 {
     VirtMachineState *vms = VIRT_MACHINE(obj);
-    OnOffAuto acpi = vms->acpi;
-
-    visit_type_OnOffAuto(v, name, &acpi, errp);
+    return vms->acpi;
 }
 
-static void virt_set_acpi(Object *obj, Visitor *v, const char *name,
-                          void *opaque, Error **errp)
+static void virt_set_acpi(Object *obj, int value, Error **errp)
 {
     VirtMachineState *vms = VIRT_MACHINE(obj);
-
-    visit_type_OnOffAuto(v, name, &vms->acpi, errp);
+    vms->acpi = value;
 }
 
 static bool virt_get_ras(Object *obj, Error **errp)
@@ -4837,9 +4849,9 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
     mc->default_ram_id = "mach-virt.ram";
     mc->default_nic = "virtio-net-pci";
 
-    object_class_property_add(oc, "acpi", "OnOffAuto",
-        virt_get_acpi, virt_set_acpi,
-        NULL, NULL);
+    object_class_property_add_enum(oc, "acpi", "OnOffAuto",
+                                   &OnOffAuto_type_info, virt_get_acpi,
+                                   virt_set_acpi);
     object_class_property_set_description(oc, "acpi",
         "Enable ACPI");
     object_class_property_add_bool(oc, "winrt-sdhci-dma",
@@ -4975,17 +4987,19 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
                                           "memory region for PCI MMIO");
 
     object_class_property_add(oc, "highmem-mmio-size", "size",
-                                   virt_get_highmem_mmio_size,
-                                   virt_set_highmem_mmio_size,
-                                   NULL, NULL);
+                              &size_type_info,
+                              virt_get_highmem_mmio_size,
+                              virt_set_highmem_mmio_size,
+                              NULL, NULL);
     object_class_property_set_description(oc, "highmem-mmio-size",
                                           "Set the high memory region size "
                                           "for PCI MMIO");
 
     object_class_property_add(oc, "virtio-mmio-transports", "uint8",
-                                   virt_get_virtio_transports,
-                                   virt_set_virtio_transports,
-                                   NULL, NULL);
+                              &uint8_type_info,
+                              virt_get_virtio_transports,
+                              virt_set_virtio_transports,
+                              NULL, NULL);
     object_class_property_set_description(oc, "virtio-mmio-transports",
                                           "Set the number of virtio-mmio transports to instantiate");
 

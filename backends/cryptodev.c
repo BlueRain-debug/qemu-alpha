@@ -25,6 +25,7 @@
 #include "system/cryptodev.h"
 #include "system/stats.h"
 #include "qapi/error.h"
+#include "qapi/qapi-builtin-type-infos.h"
 #include "qapi/qapi-commands-cryptodev.h"
 #include "qapi/qapi-types-stats.h"
 #include "qapi/visitor.h"
@@ -259,6 +260,25 @@ static void cryptodev_backend_throttle_timer_cb(void *opaque)
                                     THROTTLE_WRITE)) {
             break;
         }
+    }
+}
+
+void cryptodev_backend_drain_requests(CryptoDevBackend *backend)
+{
+    CryptoDevBackendOpInfo *opinfo, *tmp;
+
+    /* Cancels pending timer, prevent it from firing during or after drain */
+    if (throttle_enabled(&backend->tc)) {
+        throttle_timers_detach_aio_context(&backend->tt);
+    }
+
+    QTAILQ_FOREACH_SAFE(opinfo, &backend->opinfos, next, tmp) {
+        QTAILQ_REMOVE(&backend->opinfos, opinfo, next);
+        cryptodev_backend_operation(backend, opinfo);
+    }
+
+    if (throttle_enabled(&backend->tc)) {
+        throttle_timers_attach_aio_context(&backend->tt, qemu_get_aio_context());
     }
 }
 
@@ -622,15 +642,15 @@ cryptodev_backend_class_init(ObjectClass *oc, const void *data)
     ucc->prepare_delete = cryptodev_backend_prepare_delete;
 
     QTAILQ_INIT(&crypto_clients);
-    object_class_property_add(oc, "queues", "uint32",
+    object_class_property_add(oc, "queues", "uint32", &uint32_type_info,
                               cryptodev_backend_get_queues,
                               cryptodev_backend_set_queues,
                               NULL, NULL);
-    object_class_property_add(oc, "throttle-bps", "uint64",
+    object_class_property_add(oc, "throttle-bps", "uint64", &uint64_type_info,
                               cryptodev_backend_get_bps,
                               cryptodev_backend_set_bps,
                               NULL, NULL);
-    object_class_property_add(oc, "throttle-ops", "uint64",
+    object_class_property_add(oc, "throttle-ops", "uint64", &uint64_type_info,
                               cryptodev_backend_get_ops,
                               cryptodev_backend_set_ops,
                               NULL, NULL);

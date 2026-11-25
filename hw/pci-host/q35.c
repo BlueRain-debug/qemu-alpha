@@ -35,6 +35,7 @@
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
+#include "qapi/qapi-builtin-type-infos.h"
 #include "qapi/visitor.h"
 #include "qemu/module.h"
 
@@ -227,18 +228,22 @@ static void q35_host_initfn(Object *obj)
                          Q35_PCI_HOST_HOLE64_SIZE_DEFAULT);
 
     object_property_add(obj, PCI_HOST_PROP_PCI_HOLE_START, "uint32",
+                        &uint32_type_info,
                         q35_host_get_pci_hole_start,
                         NULL, NULL, NULL);
 
     object_property_add(obj, PCI_HOST_PROP_PCI_HOLE_END, "uint32",
+                        &uint32_type_info,
                         q35_host_get_pci_hole_end,
                         NULL, NULL, NULL);
 
     object_property_add(obj, PCI_HOST_PROP_PCI_HOLE64_START, "uint64",
+                        &uint64_type_info,
                         q35_host_get_pci_hole64_start,
                         NULL, NULL, NULL);
 
     object_property_add(obj, PCI_HOST_PROP_PCI_HOLE64_END, "uint64",
+                        &uint64_type_info,
                         q35_host_get_pci_hole64_end,
                         NULL, NULL, NULL);
 
@@ -268,6 +273,7 @@ static const TypeInfo q35_host_info = {
     .instance_size = sizeof(Q35PCIHost),
     .instance_init = q35_host_initfn,
     .class_init = q35_host_class_init,
+    .secure = true,
 };
 
 /****************************************************************************
@@ -718,6 +724,7 @@ static const TypeInfo mch_info = {
     .parent = TYPE_PCI_DEVICE,
     .instance_size = sizeof(MCHPCIState),
     .class_init = mch_class_init,
+    .secure = true,
     .interfaces = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { },

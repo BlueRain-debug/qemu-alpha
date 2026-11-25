@@ -534,6 +534,23 @@ static inline void xhci_dma_write_u32s(XHCIState *xhci, dma_addr_t addr,
     }
 }
 
+static bool xhci_read_dcbaa(XHCIState *xhci, unsigned int slotid,
+                            dma_addr_t *octx)
+{
+    dma_addr_t dcbaap = xhci_addr64(xhci->dcbaap_low, xhci->dcbaap_high);
+    uint64_t poctx;
+
+    if (ldq_le_dma(xhci->as, dcbaap + 8 * slotid, &poctx,
+                   MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: DMA memory access failed!\n",
+                      __func__);
+        xhci_die(xhci);
+        return false;
+    }
+    *octx = xhci_mask64(poctx);
+    return true;
+}
+
 static XHCIPort *xhci_lookup_port(XHCIState *xhci, struct USBPort *uport)
 {
     int index;
@@ -2103,8 +2120,7 @@ static TRBCCode xhci_address_slot(XHCIState *xhci, unsigned int slotid,
     XHCISlot *slot;
     USBPort *uport;
     USBDevice *dev;
-    dma_addr_t ictx, octx, dcbaap;
-    uint64_t poctx;
+    dma_addr_t ictx, octx;
     uint32_t ictl_ctx[2];
     uint32_t slot_ctx[4];
     uint32_t ep0_ctx[5];
@@ -2113,10 +2129,10 @@ static TRBCCode xhci_address_slot(XHCIState *xhci, unsigned int slotid,
 
     assert(slotid >= 1 && slotid <= xhci->numslots);
 
-    dcbaap = xhci_addr64(xhci->dcbaap_low, xhci->dcbaap_high);
-    ldq_le_dma(xhci->as, dcbaap + 8 * slotid, &poctx, MEMTXATTRS_UNSPECIFIED);
+    if (!xhci_read_dcbaa(xhci, slotid, &octx)) {
+        return CC_TRB_ERROR;
+    }
     ictx = xhci_mask64(pictx);
-    octx = xhci_mask64(poctx);
 
     DPRINTF("xhci: input context at "DMA_ADDR_FMT"\n", ictx);
     DPRINTF("xhci: output context at "DMA_ADDR_FMT"\n", octx);
@@ -3251,49 +3267,73 @@ static const MemoryRegionOps xhci_doorbell_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+static bool xhci_engage_reentrancy_guard(XHCIState *xhci)
+{
+    bool prev_engaged = xhci->parent.mem_reentrancy_guard.engaged_in_io;
+
+    xhci->parent.mem_reentrancy_guard.engaged_in_io = true;
+    return prev_engaged;
+}
+
+static void xhci_restore_reentrancy_guard(XHCIState *xhci, bool engaged)
+{
+    xhci->parent.mem_reentrancy_guard.engaged_in_io = engaged;
+}
+
 static void xhci_attach(USBPort *usbport)
 {
     XHCIState *xhci = usbport->opaque;
     XHCIPort *port = xhci_lookup_port(xhci, usbport);
+    bool prev_engaged = xhci_engage_reentrancy_guard(xhci);
 
     xhci_port_update(port, 0);
+    xhci_restore_reentrancy_guard(xhci, prev_engaged);
 }
 
 static void xhci_detach(USBPort *usbport)
 {
     XHCIState *xhci = usbport->opaque;
     XHCIPort *port = xhci_lookup_port(xhci, usbport);
+    bool prev_engaged = xhci_engage_reentrancy_guard(xhci);
 
     xhci_detach_slot(xhci, usbport);
     xhci_port_update(port, 1);
+    xhci_restore_reentrancy_guard(xhci, prev_engaged);
 }
 
 static void xhci_wakeup(USBPort *usbport)
 {
     XHCIState *xhci = usbport->opaque;
     XHCIPort *port = xhci_lookup_port(xhci, usbport);
+    bool prev_engaged;
 
     assert(port);
     if (get_field(port->portsc, PORTSC_PLS) != PLS_U3) {
         return;
     }
+    prev_engaged = xhci_engage_reentrancy_guard(xhci);
     set_field(&port->portsc, PLS_RESUME, PORTSC_PLS);
     xhci_port_notify(port, PORTSC_PLC);
+    xhci_restore_reentrancy_guard(xhci, prev_engaged);
 }
 
 static void xhci_complete(USBPort *port, USBPacket *packet)
 {
     XHCITransfer *xfer = container_of(packet, XHCITransfer, packet);
+    XHCIState *xhci = xfer->epctx->xhci;
+    bool prev_engaged;
 
     if (packet->status == USB_RET_REMOVE_FROM_QUEUE) {
         xhci_ep_nuke_one_xfer(xfer, 0);
         return;
     }
+    prev_engaged = xhci_engage_reentrancy_guard(xhci);
     xhci_try_complete_packet(xfer);
     xhci_kick_epctx(xfer->epctx, xfer->streamid);
     if (xfer->complete) {
         xhci_ep_free_xfer(xfer);
     }
+    xhci_restore_reentrancy_guard(xhci, prev_engaged);
 }
 
 static void xhci_child_detach(USBPort *uport, USBDevice *child)
@@ -3345,6 +3385,7 @@ static void xhci_wakeup_endpoint(USBBus *bus, USBEndpoint *ep,
 {
     XHCIState *xhci = container_of(bus, XHCIState, bus);
     int slotid;
+    bool prev_engaged;
 
     DPRINTF("%s\n", __func__);
     slotid = ep->dev->addr;
@@ -3353,7 +3394,9 @@ static void xhci_wakeup_endpoint(USBBus *bus, USBEndpoint *ep,
         DPRINTF("%s: oops, no slot for dev %d\n", __func__, ep->dev->addr);
         return;
     }
+    prev_engaged = xhci_engage_reentrancy_guard(xhci);
     xhci_kick_ep(xhci, slotid, xhci_find_epid(ep), stream);
+    xhci_restore_reentrancy_guard(xhci, prev_engaged);
 }
 
 static USBBusOps xhci_bus_ops = {
@@ -3495,24 +3538,21 @@ static int usb_xhci_post_load(void *opaque, int version_id)
     XHCIState *xhci = opaque;
     XHCISlot *slot;
     XHCIEPContext *epctx;
-    dma_addr_t dcbaap, pctx;
+    dma_addr_t pctx;
     uint32_t slot_ctx[4];
     uint32_t ep_ctx[5];
     int slotid, epid, state;
-    uint64_t addr;
-
-    dcbaap = xhci_addr64(xhci->dcbaap_low, xhci->dcbaap_high);
 
     for (slotid = 1; slotid <= xhci->numslots; slotid++) {
         slot = &xhci->slots[slotid-1];
         if (!slot->addressed) {
             continue;
         }
-        ldq_le_dma(xhci->as, dcbaap + 8 * slotid, &addr, MEMTXATTRS_UNSPECIFIED);
-        slot->ctx = xhci_mask64(addr);
-
-        xhci_dma_read_u32s(xhci, slot->ctx, slot_ctx, sizeof(slot_ctx));
-        slot->uport = xhci_lookup_uport(xhci, slot_ctx);
+        slot->uport = NULL;
+        if (xhci_read_dcbaa(xhci, slotid, &slot->ctx)) {
+            xhci_dma_read_u32s(xhci, slot->ctx, slot_ctx, sizeof(slot_ctx));
+            slot->uport = xhci_lookup_uport(xhci, slot_ctx);
+        }
         if (!slot->uport) {
             /* should not happen, but may trigger on guest bugs */
             slot->enabled = 0;
@@ -3678,6 +3718,7 @@ static const TypeInfo xhci_info = {
     .parent        = TYPE_DEVICE,
     .instance_size = sizeof(XHCIState),
     .class_init    = xhci_class_init,
+    .secure        = true,
 };
 
 static void xhci_register_types(void)

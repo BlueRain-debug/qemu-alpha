@@ -31,6 +31,40 @@ DEF_HELPER_FLAGS_4(vacsh_pred, TCG_CALL_NO_RWG_SE, s32, env, s64, s64, s64)
 DEF_HELPER_FLAGS_2(cabacdecbin_val, TCG_CALL_NO_RWG_SE, s64, s64, s64)
 DEF_HELPER_FLAGS_2(cabacdecbin_pred, TCG_CALL_NO_RWG_SE, s32, s64, s64)
 
+/* HLX helpers */
+DEF_HELPER_5(hlx_load_vec, void, env, ptr, tl, i32, i32)
+DEF_HELPER_5(hlx_store_vec, void, env, tl, ptr, i32, i32)
+DEF_HELPER_1(hlx_commit_store, void, env)
+DEF_HELPER_FLAGS_2(hlx_trace_op, TCG_CALL_NO_RWG, void, env, i32)
+
+/* GVec helpers for signed-to-unsigned MO_16 saturation. */
+DEF_HELPER_FLAGS_4(hlx_gvec_ushsat_add16, TCG_CALL_NO_RWG,
+                   void, ptr, ptr, ptr, i32)
+DEF_HELPER_FLAGS_4(hlx_gvec_ushsat_sub16, TCG_CALL_NO_RWG,
+                   void, ptr, ptr, ptr, i32)
+DEF_HELPER_FLAGS_3(hlx_gvec_abs_uh_sat16, TCG_CALL_NO_RWG, void, ptr, ptr, i32)
+
+/* GVec helpers for MO_16 averages. */
+DEF_HELPER_FLAGS_4(hlx_gvec_avg_sh16, TCG_CALL_NO_RWG,
+                   void, ptr, ptr, ptr, i32)
+DEF_HELPER_FLAGS_4(hlx_gvec_avg_sh16_rnd, TCG_CALL_NO_RWG,
+                   void, ptr, ptr, ptr, i32)
+DEF_HELPER_FLAGS_4(hlx_gvec_avg_uh16, TCG_CALL_NO_RWG,
+                   void, ptr, ptr, ptr, i32)
+DEF_HELPER_FLAGS_4(hlx_gvec_avg_uh16_rnd, TCG_CALL_NO_RWG,
+                   void, ptr, ptr, ptr, i32)
+
+/* GVec helpers for MO_16 absolute differences. */
+DEF_HELPER_FLAGS_4(hlx_gvec_absdiff_sh16, TCG_CALL_NO_RWG,
+                   void, ptr, ptr, ptr, i32)
+DEF_HELPER_FLAGS_4(hlx_gvec_absdiff_uh16, TCG_CALL_NO_RWG,
+                   void, ptr, ptr, ptr, i32)
+
+/* GVec helper for a halfword arithmetic shift by 15. */
+DEF_HELPER_FLAGS_3(hlx_gvec_sari15_h16, TCG_CALL_NO_RWG, void, ptr, ptr, i32)
+
+DEF_HELPER_1(mxclracc, void, env)
+
 /* Floating point */
 DEF_HELPER_3(conv_sf2df, f64, env, f32, i32)
 DEF_HELPER_3(conv_df2sf, f32, env, f64, i32)
@@ -60,6 +94,11 @@ DEF_HELPER_3(conv_df2ud_chop, i64, env, f64, i32)
 DEF_HELPER_3(conv_df2d_chop, s64, env, f64, i32)
 DEF_HELPER_4(sfadd, f32, env, f32, f32, i32)
 DEF_HELPER_4(sfsub, f32, env, f32, f32, i32)
+DEF_HELPER_4(vsfadd, i64, env, i64, i64, i32)
+DEF_HELPER_4(vsfsub, i64, env, i64, i64, i32)
+DEF_HELPER_4(vsfmpy, i64, env, i64, i64, i32)
+DEF_HELPER_5(vsffma, i64, env, i64, i64, i64, i32)
+DEF_HELPER_5(vsffms, i64, env, i64, i64, i64, i32)
 DEF_HELPER_4(sfcmpeq, s32, env, f32, f32, i32)
 DEF_HELPER_4(sfcmpgt, s32, env, f32, f32, i32)
 DEF_HELPER_4(sfcmpge, s32, env, f32, f32, i32)
@@ -130,15 +169,22 @@ DEF_HELPER_2(getimask, i32, env, i32)
 DEF_HELPER_3(setimask, void, env, i32, i32)
 DEF_HELPER_2(sreg_read, i32, env, i32)
 DEF_HELPER_2(sreg_read_pair, i64, env, i32)
+DEF_HELPER_2(upcycle_read, i32, env, i32)
+DEF_HELPER_1(upcycle_read_pair, i64, env)
 DEF_HELPER_2(greg_read, i32, env, i32)
 DEF_HELPER_2(greg_read_pair, i64, env, i32)
 DEF_HELPER_3(sreg_write_masked, void, env, i32, i32)
 DEF_HELPER_3(setprio, void, env, i32, i32)
 DEF_HELPER_2(start, void, env, i32)
 DEF_HELPER_1(stop, void, env)
-DEF_HELPER_2(wait, void, env, i32)
+DEF_HELPER_1(wait, void, env)
 DEF_HELPER_2(resume, void, env, i32)
 DEF_HELPER_1(resched, void, env)
 DEF_HELPER_3(modify_ssr, void, env, i32, i32)
+DEF_HELPER_3(modify_ccr, void, env, i32, i32)
 DEF_HELPER_1(pending_interrupt, void, env)
+DEF_HELPER_2(tlbinvasid, void, env, i32)
 #endif
+DEF_HELPER_2(hlx_copy_live_to_future, void, env, i32)
+DEF_HELPER_2(hlx_copy_live_to_tmp,    void, env, i32)
+DEF_HELPER_2(hlx_commit_reg,          void, env, i32)

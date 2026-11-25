@@ -802,6 +802,14 @@ The ability to instrument QEMU helper functions with vCPU-aware trace
 points was removed in 7.0.
 
 
+``unavailable`` state no longer reported for trace events (removed in 11.2)
+'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+Trace events are now unconditionally built-in to all QEMU builds,
+so the concept of an 'unavailable' trace event no longer exists.
+The ``TraceEventState`` value ``unavailable`` can thus never
+be reported and has been removed from the schema.
+
 Human Monitor Protocol (HMP) commands
 -------------------------------------
 
@@ -1037,6 +1045,13 @@ The 'any' CPU type was introduced back in 2018 and was around since the
 initial RISC-V QEMU port. Its usage was always been unclear: users don't know
 what to expect from a CPU called 'any', and in fact the CPU does not do anything
 special that isn't already done by the default CPUs rv32/rv64.
+
+RISC-V CPU properties which start with capital 'Z' (removed in 10.1)
+''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+All RISC-V CPU properties which start with capital 'Z' have been removed.
+They were wrongly added with capital 'Z' in the past. CPU properties
+with lower-case names are used instead.
 
 Power8E and Power8NVL CPUs (removed in 11.1)
 ''''''''''''''''''''''''''''''''''''''''''''

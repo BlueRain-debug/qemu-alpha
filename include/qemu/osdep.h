@@ -252,6 +252,14 @@ extern "C" {
 
 
 /*
+ * Merely casting to (void) is not sufficient for functions
+ * annotated with the "warn_unused_result" attribute
+ */
+#define ignore_value(x) \
+    (__extension__ ({ __typeof__(x) __x = (x); (void) __x; }))
+
+
+/*
  * For mingw, as of v6.0.0, the function implementing the assert macro is
  * not marked as noreturn, so the compiler cannot delete code following an
  * assert(false) as unused.  We rely on this within the code base to delete
@@ -528,6 +536,15 @@ void QEMU_ERROR("code path is reachable")
  */
 #define QEMU_IS_ARRAY(x) (!__builtin_types_compatible_p(typeof(x), \
                                                         typeof(&(x)[0])))
+/**
+ * ARRAY_SIZE() - Return the number of elements of an array
+ * @x: the array
+ *
+ * For bounds-checked lookups in arrays of strings, see
+ * STR_ARRAY_ELEM_OR_NULL() in "qemu/cutils.h".
+ *
+ * Note: fails to build if @x is a pointer.
+ */
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(x) ((sizeof(x) / sizeof((x)[0])) + \
                        QEMU_BUILD_BUG_ON_ZERO(!QEMU_IS_ARRAY(x)))

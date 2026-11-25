@@ -32,6 +32,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
 #include "qapi/error.h"
+#include "qapi/qapi-builtin-type-infos.h"
 #include "migration/vmstate.h"
 #include "qapi/visitor.h"
 #include "qemu/error-report.h"
@@ -352,6 +353,7 @@ static const TypeInfo i440fx_info = {
     .parent        = TYPE_PCI_DEVICE,
     .instance_size = sizeof(PCII440FXState),
     .class_init    = i440fx_class_init,
+    .secure        = true,
     .interfaces = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { },
@@ -388,18 +390,22 @@ static void i440fx_pcihost_class_init(ObjectClass *klass, const void *data)
     dc->user_creatable = false;
 
     object_class_property_add(klass, PCI_HOST_PROP_PCI_HOLE_START, "uint32",
+                              &uint32_type_info,
                               i440fx_pcihost_get_pci_hole_start,
                               NULL, NULL, NULL);
 
     object_class_property_add(klass, PCI_HOST_PROP_PCI_HOLE_END, "uint32",
+                              &uint32_type_info,
                               i440fx_pcihost_get_pci_hole_end,
                               NULL, NULL, NULL);
 
     object_class_property_add(klass, PCI_HOST_PROP_PCI_HOLE64_START, "uint64",
+                              &uint64_type_info,
                               i440fx_pcihost_get_pci_hole64_start,
                               NULL, NULL, NULL);
 
     object_class_property_add(klass, PCI_HOST_PROP_PCI_HOLE64_END, "uint64",
+                              &uint64_type_info,
                               i440fx_pcihost_get_pci_hole64_end,
                               NULL, NULL, NULL);
 }
@@ -410,6 +416,7 @@ static const TypeInfo i440fx_pcihost_info = {
     .instance_size = sizeof(I440FXState),
     .instance_init = i440fx_pcihost_initfn,
     .class_init    = i440fx_pcihost_class_init,
+    .secure        = true,
 };
 
 static void i440fx_register_types(void)

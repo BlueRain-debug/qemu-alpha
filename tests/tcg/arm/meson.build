@@ -1,6 +1,3 @@
-cc = 'arm-linux-gnueabihf-gcc'
-cc_dockerfile = 'debian-all-test-cross'
-
 subdir('system')
 
 tests = []
@@ -42,6 +39,7 @@ tests += {
   'neon-widen-saturate.c': {
     'cflags': ['-march=armv7-a', '-mfpu=neon', '-fno-tree-vectorize'],
   },
+  'test-arm-opt-ror.c': {'cflags': ['-marm']},
 }
 
 # Vector SHA1
@@ -71,8 +69,8 @@ tests += {
 if 'qemu-arm' in emulators
   tcg_tests += {
     'arm-linux-user': {
-      'cc': cc,
-      'cc_dockerfile': cc_dockerfile,
+      'cc': 'arm-linux-gnueabihf-gcc',
+      'cc_dockerfile': 'debian-all-test-cross',
       'folder': 'arm',
       'gdb_arch': 'arm',
       'qemu': emulators['qemu-arm'],

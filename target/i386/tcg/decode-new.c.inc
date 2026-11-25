@@ -73,14 +73,16 @@
  * the V/U/H/W types to P/N/P/Q if there is no prefix, as well as changing
  * "x" to "q" if there is no prefix.
  *
- * In addition, the ss/ps/sd/pd types are sometimes mushed together as "x"
- * if the difference is expressed via prefixes.  Individual instructions
+ * In addition, the ss/sd types are sometimes mushed together as "x"
+ * if the difference is expressed via prefixes; individual instructions
  * are separated by prefix in the generator functions.
  *
  * There is a custom size "xh" used to address half of a SSE/AVX operand.
  * This points to a 64-bit operand for SSE operations, 128-bit operand
  * for 256-bit AVX operands, etc.  It is used for conversion operations
  * such as VCVTPH2PS or VCVTSS2SD.
+ *
+ * pi/ps/pd are simply written as "q" or "x".
  *
  * There are a couple cases in which instructions (e.g. MOVD) write the
  * whole XMM or MM register but are established incorrectly in the manual
@@ -120,7 +122,8 @@
  *
  *    (*)  AMD lists VPBLENDVB as related to SSE4.1 PBLENDVB, which may
  *         explain why it is considered exception class 4.  However,
- *         Intel says that VEX-only instructions should be in class 6...
+ *         the two have different encodings (in 0F38 for SSE, in 0F3A
+ *         for AVX).
  *
  *    (+)  Not found in Intel's table 2-16
  *
@@ -250,6 +253,7 @@
 #define vex2_rep3 .vex_class = 2, .vex_special = X86_VEX_REPScalar,
 #define vex3 .vex_class = 3,
 #define vex4 .vex_class = 4,
+#define sse4 .vex_class = 4, .vex_special = X86_VEX_SSEOnly,
 #define vex4_unal .vex_class = 4, .vex_special = X86_VEX_SSEUnaligned,
 #define vex4_rep5 .vex_class = 4, .vex_special = X86_VEX_REPScalar,
 #define vex5 .vex_class = 5,
@@ -688,7 +692,7 @@ static void decode_0FBC(DisasContext *s, CPUX86State *env, X86OpEntry *entry, ui
         X86_OP_ENTRYwr(TZCNT, G,v, E,v, zextT0), /* 0xf3 */
         X86_OP_ENTRY2(BSF,    G,v, E,v, zextT1), /* 0xf2 */
     };
-    if (!(s->cpuid_ext3_features & CPUID_EXT3_ABM)) {
+    if (!(s->cpuid_7_0_ebx_features & CPUID_7_0_EBX_BMI1)) {
         *entry = opcodes_0FBC[0];
     } else {
         *entry = *decode_by_prefix(s, opcodes_0FBC);
@@ -703,7 +707,7 @@ static void decode_0FBD(DisasContext *s, CPUX86State *env, X86OpEntry *entry, ui
         X86_OP_ENTRYwr(LZCNT, G,v, E,v, zextT0), /* 0xf3 */
         X86_OP_ENTRY2(BSR,    G,v, E,v, zextT1), /* 0xf2 */
     };
-    if (!(s->cpuid_7_0_ebx_features & CPUID_7_0_EBX_BMI1)) {
+    if (!(s->cpuid_ext3_features & CPUID_EXT3_ABM)) {
         *entry = opcodes_0FBD[0];
     } else {
         *entry = *decode_by_prefix(s, opcodes_0FBD);
@@ -732,10 +736,10 @@ static const X86OpEntry opcodes_0F38_00toEF[240] = {
     [0x06] = X86_OP_ENTRY3(PHSUBD,    V,x,  H,x,   W,x,  vex4 cpuid(SSSE3) mmx avx2_256 p_00_66),
     [0x07] = X86_OP_ENTRY3(PHSUBSW,   V,x,  H,x,   W,x,  vex4 cpuid(SSSE3) mmx avx2_256 p_00_66),
 
-    [0x10] = X86_OP_ENTRY2(PBLENDVB,  V,x,         W,x,  vex4 cpuid(SSE41) avx2_256 p_66),
+    [0x10] = X86_OP_ENTRY2(PBLENDVB,  V,x,         W,x,  sse4 cpuid(SSE41) p_66),
     [0x13] = X86_OP_ENTRY2(VCVTPH2PS, V,x,         W,xh, vex11 chk(W0) cpuid(F16C) p_66),
-    [0x14] = X86_OP_ENTRY2(BLENDVPS,  V,x,         W,x,  vex4 cpuid(SSE41) p_66),
-    [0x15] = X86_OP_ENTRY2(BLENDVPD,  V,x,         W,x,  vex4 cpuid(SSE41) p_66),
+    [0x14] = X86_OP_ENTRY2(BLENDVPS,  V,x,         W,x,  sse4 cpuid(SSE41) p_66),
+    [0x15] = X86_OP_ENTRY2(BLENDVPD,  V,x,         W,x,  sse4 cpuid(SSE41) p_66),
     /* Listed incorrectly as type 4 */
     [0x16] = X86_OP_ENTRY3(VPERMD,    V,qq, H,qq,      W,qq,  vex6 chk(W0) cpuid(AVX2) p_66), /* vpermps */
     [0x17] = X86_OP_ENTRY3(VPTEST,    None,None, V,x,  W,x,   vex4 cpuid(SSE41) p_66),
@@ -832,31 +836,31 @@ static const X86OpEntry opcodes_0F38_00toEF[240] = {
 
     /* Should be exception type 2 or 3 but they do not have legacy SSE equivalents? */
     [0x98] = X86_OP_ENTRY3(VFMADD132Px,  V,x,  H,x, W,x,  vex6 cpuid(FMA) p_66),
-    [0x99] = X86_OP_ENTRY3(VFMADD132Sx,  V,x,  H,x, W,x,  vex6 cpuid(FMA) p_66),
+    [0x99] = X86_OP_ENTRY3(VFMADD132Sx,  V,x,  H,x, W,x,  vex6 vex_lig cpuid(FMA) p_66),
     [0x9a] = X86_OP_ENTRY3(VFMSUB132Px,  V,x,  H,x, W,x,  vex6 cpuid(FMA) p_66),
-    [0x9b] = X86_OP_ENTRY3(VFMSUB132Sx,  V,x,  H,x, W,x,  vex6 cpuid(FMA) p_66),
+    [0x9b] = X86_OP_ENTRY3(VFMSUB132Sx,  V,x,  H,x, W,x,  vex6 vex_lig cpuid(FMA) p_66),
     [0x9c] = X86_OP_ENTRY3(VFNMADD132Px, V,x,  H,x, W,x,  vex6 cpuid(FMA) p_66),
-    [0x9d] = X86_OP_ENTRY3(VFNMADD132Sx, V,x,  H,x, W,x,  vex6 cpuid(FMA) p_66),
+    [0x9d] = X86_OP_ENTRY3(VFNMADD132Sx, V,x,  H,x, W,x,  vex6 vex_lig cpuid(FMA) p_66),
     [0x9e] = X86_OP_ENTRY3(VFNMSUB132Px, V,x,  H,x, W,x,  vex6 cpuid(FMA) p_66),
-    [0x9f] = X86_OP_ENTRY3(VFNMSUB132Sx, V,x,  H,x, W,x,  vex6 cpuid(FMA) p_66),
+    [0x9f] = X86_OP_ENTRY3(VFNMSUB132Sx, V,x,  H,x, W,x,  vex6 vex_lig cpuid(FMA) p_66),
 
     [0xa8] = X86_OP_ENTRY3(VFMADD213Px,  V,x,  H,x, W,x,  vex6 cpuid(FMA) p_66),
-    [0xa9] = X86_OP_ENTRY3(VFMADD213Sx,  V,x,  H,x, W,x,  vex6 cpuid(FMA) p_66),
+    [0xa9] = X86_OP_ENTRY3(VFMADD213Sx,  V,x,  H,x, W,x,  vex6 vex_lig cpuid(FMA) p_66),
     [0xaa] = X86_OP_ENTRY3(VFMSUB213Px,  V,x,  H,x, W,x,  vex6 cpuid(FMA) p_66),
-    [0xab] = X86_OP_ENTRY3(VFMSUB213Sx,  V,x,  H,x, W,x,  vex6 cpuid(FMA) p_66),
+    [0xab] = X86_OP_ENTRY3(VFMSUB213Sx,  V,x,  H,x, W,x,  vex6 vex_lig cpuid(FMA) p_66),
     [0xac] = X86_OP_ENTRY3(VFNMADD213Px, V,x,  H,x, W,x,  vex6 cpuid(FMA) p_66),
-    [0xad] = X86_OP_ENTRY3(VFNMADD213Sx, V,x,  H,x, W,x,  vex6 cpuid(FMA) p_66),
+    [0xad] = X86_OP_ENTRY3(VFNMADD213Sx, V,x,  H,x, W,x,  vex6 vex_lig cpuid(FMA) p_66),
     [0xae] = X86_OP_ENTRY3(VFNMSUB213Px, V,x,  H,x, W,x,  vex6 cpuid(FMA) p_66),
-    [0xaf] = X86_OP_ENTRY3(VFNMSUB213Sx, V,x,  H,x, W,x,  vex6 cpuid(FMA) p_66),
+    [0xaf] = X86_OP_ENTRY3(VFNMSUB213Sx, V,x,  H,x, W,x,  vex6 vex_lig cpuid(FMA) p_66),
 
     [0xb8] = X86_OP_ENTRY3(VFMADD231Px,  V,x,  H,x, W,x,  vex6 cpuid(FMA) p_66),
-    [0xb9] = X86_OP_ENTRY3(VFMADD231Sx,  V,x,  H,x, W,x,  vex6 cpuid(FMA) p_66),
+    [0xb9] = X86_OP_ENTRY3(VFMADD231Sx,  V,x,  H,x, W,x,  vex6 vex_lig cpuid(FMA) p_66),
     [0xba] = X86_OP_ENTRY3(VFMSUB231Px,  V,x,  H,x, W,x,  vex6 cpuid(FMA) p_66),
-    [0xbb] = X86_OP_ENTRY3(VFMSUB231Sx,  V,x,  H,x, W,x,  vex6 cpuid(FMA) p_66),
+    [0xbb] = X86_OP_ENTRY3(VFMSUB231Sx,  V,x,  H,x, W,x,  vex6 vex_lig cpuid(FMA) p_66),
     [0xbc] = X86_OP_ENTRY3(VFNMADD231Px, V,x,  H,x, W,x,  vex6 cpuid(FMA) p_66),
-    [0xbd] = X86_OP_ENTRY3(VFNMADD231Sx, V,x,  H,x, W,x,  vex6 cpuid(FMA) p_66),
+    [0xbd] = X86_OP_ENTRY3(VFNMADD231Sx, V,x,  H,x, W,x,  vex6 vex_lig cpuid(FMA) p_66),
     [0xbe] = X86_OP_ENTRY3(VFNMSUB231Px, V,x,  H,x, W,x,  vex6 cpuid(FMA) p_66),
-    [0xbf] = X86_OP_ENTRY3(VFNMSUB231Sx, V,x,  H,x, W,x,  vex6 cpuid(FMA) p_66),
+    [0xbf] = X86_OP_ENTRY3(VFNMSUB231Sx, V,x,  H,x, W,x,  vex6 vex_lig cpuid(FMA) p_66),
 
     [0xc8] = X86_OP_ENTRY2(SHA1NEXTE,   V,dq, W,dq, cpuid(SHA_NI)),
     [0xc9] = X86_OP_ENTRY2(SHA1MSG1,    V,dq, W,dq, cpuid(SHA_NI)),
@@ -1062,7 +1066,7 @@ static void decode_0F10(DisasContext *s, CPUX86State *env, X86OpEntry *entry, ui
     static const X86OpEntry opcodes_0F10_reg[4] = {
         X86_OP_ENTRY3(MOVDQ,   V,x,  None,None, W,x, vex4_unal), /* MOVUPS */
         X86_OP_ENTRY3(MOVDQ,   V,x,  None,None, W,x, vex4_unal), /* MOVUPD */
-        X86_OP_ENTRY3(VMOVSS,  V,x,  H,x,       W,x, vex5),
+        X86_OP_ENTRY3(VMOVSS,  V,x,  H,x,       W,x, vex5 vex_lig),
         X86_OP_ENTRY3(VMOVLPx, V,x,  H,x,       W,x, vex5), /* MOVSD */
     };
 
@@ -1085,7 +1089,7 @@ static void decode_0F11(DisasContext *s, CPUX86State *env, X86OpEntry *entry, ui
     static const X86OpEntry opcodes_0F11_reg[4] = {
         X86_OP_ENTRY3(MOVDQ,   W,x,  None,None, V,x, vex4_unal), /* MOVUPS */
         X86_OP_ENTRY3(MOVDQ,   W,x,  None,None, V,x, vex4_unal), /* MOVUPD */
-        X86_OP_ENTRY3(VMOVSS,  W,x,  H,x,       V,x, vex5),
+        X86_OP_ENTRY3(VMOVSS,  W,x,  H,x,       V,x, vex5 vex_lig),
         X86_OP_ENTRY3(VMOVLPx, W,x,  H,x,       V,q, vex5), /* MOVSD */
     };
 
@@ -1164,8 +1168,8 @@ static void decode_0F2A(DisasContext *s, CPUX86State *env, X86OpEntry *entry, ui
     static const X86OpEntry opcodes_0F2A[4] = {
         X86_OP_ENTRY3(CVTPI2Px,  V,x,  None,None, Q,q),
         X86_OP_ENTRY3(CVTPI2Px,  V,x,  None,None, Q,q),
-        X86_OP_ENTRY3(VCVTSI2Sx, V,x,  H,x, E,y,        vex3),
-        X86_OP_ENTRY3(VCVTSI2Sx, V,x,  H,x, E,y,        vex3),
+        X86_OP_ENTRY3(VCVTSI2Sx, V,x,  H,x, E,y,        vex3 vex_lig),
+        X86_OP_ENTRY3(VCVTSI2Sx, V,x,  H,x, E,y,        vex3 vex_lig),
     };
     *entry = *decode_by_prefix(s, opcodes_0F2A);
 }
@@ -1189,8 +1193,8 @@ static void decode_0F2C(DisasContext *s, CPUX86State *env, X86OpEntry *entry, ui
         /* Listed as ps/pd in the manual, but CVTTPS2PI only reads 64-bit.  */
         X86_OP_ENTRY3(CVTTPx2PI,  P,q,  None,None, W,q),
         X86_OP_ENTRY3(CVTTPx2PI,  P,q,  None,None, W,dq),
-        X86_OP_ENTRY3(VCVTTSx2SI, G,y,  None,None, W,ss, vex3),
-        X86_OP_ENTRY3(VCVTTSx2SI, G,y,  None,None, W,sd, vex3),
+        X86_OP_ENTRY3(VCVTTSx2SI, G,y,  None,None, W,ss, vex3 vex_lig),
+        X86_OP_ENTRY3(VCVTTSx2SI, G,y,  None,None, W,sd, vex3 vex_lig),
     };
     *entry = *decode_by_prefix(s, opcodes_0F2C);
 }
@@ -1201,8 +1205,8 @@ static void decode_0F2D(DisasContext *s, CPUX86State *env, X86OpEntry *entry, ui
         /* Listed as ps/pd in the manual, but CVTPS2PI only reads 64-bit.  */
         X86_OP_ENTRY3(CVTPx2PI,  P,q,  None,None, W,q),
         X86_OP_ENTRY3(CVTPx2PI,  P,q,  None,None, W,dq),
-        X86_OP_ENTRY3(VCVTSx2SI, G,y,  None,None, W,ss, vex3),
-        X86_OP_ENTRY3(VCVTSx2SI, G,y,  None,None, W,sd, vex3),
+        X86_OP_ENTRY3(VCVTSx2SI, G,y,  None,None, W,ss, vex3 vex_lig),
+        X86_OP_ENTRY3(VCVTSx2SI, G,y,  None,None, W,sd, vex3 vex_lig),
     };
     *entry = *decode_by_prefix(s, opcodes_0F2D);
 }
@@ -1450,8 +1454,8 @@ static const X86OpEntry opcodes_0F[256] = {
     [0x2B] = X86_OP_GROUP0(0F2B),
     [0x2C] = X86_OP_GROUP0(0F2C),
     [0x2D] = X86_OP_GROUP0(0F2D),
-    [0x2E] = X86_OP_GROUP3(VxCOMISx,   None,None, V,x, W,x,  vex3 p_00_66), /* VUCOMISS/SD */
-    [0x2F] = X86_OP_GROUP3(VxCOMISx,   None,None, V,x, W,x,  vex3 p_00_66), /* VCOMISS/SD */
+    [0x2E] = X86_OP_GROUP3(VxCOMISx,   None,None, V,x, W,x,  vex3 vex_lig p_00_66), /* VUCOMISS/SD */
+    [0x2F] = X86_OP_GROUP3(VxCOMISx,   None,None, V,x, W,x,  vex3 vex_lig p_00_66), /* VCOMISS/SD */
 
     [0x38] = X86_OP_GROUP0(0F38),
     [0x3a] = X86_OP_GROUP0(0F3A),
@@ -1615,8 +1619,7 @@ static void decode_group1A(DisasContext *s, CPUX86State *env, X86OpEntry *entry,
         *entry = UNKNOWN_OPCODE;
     } else {
         entry->gen = gen_POP;
-        /* The address must use the value of ESP after the pop.  */
-        s->popl_esp_hack = 1 << mo_pushpop(s, s->dflag);
+        entry->special = X86_SPECIAL_PopESP;
     }
 }
 
@@ -1811,10 +1814,10 @@ static const X86OpEntry opcodes_root[256] = {
     [0xA1] = X86_OP_ENTRY3(MOV, 0,v, O,v, None, None), /* rAX, Ov */
     [0xA2] = X86_OP_ENTRY3(MOV, O,b, 0,b, None, None), /* Ob, AL */
     [0xA3] = X86_OP_ENTRY3(MOV, O,v, 0,v, None, None), /* Ov, rAX */
-    [0xA4] = X86_OP_ENTRYrr(MOVS, Y,b, X,b),
-    [0xA5] = X86_OP_ENTRYrr(MOVS, Y,v, X,v),
-    [0xA6] = X86_OP_ENTRYrr(CMPS, Y,b, X,b),
-    [0xA7] = X86_OP_ENTRYrr(CMPS, Y,v, X,v),
+    [0xA4] = X86_OP_ENTRY0(MOVS),
+    [0xA5] = X86_OP_ENTRY0(MOVS),
+    [0xA6] = X86_OP_ENTRY0(CMPS),
+    [0xA7] = X86_OP_ENTRY0(CMPS),
 
     [0xB0] = X86_OP_ENTRY3(MOV, LoBits,b, I,b, None, None),
     [0xB1] = X86_OP_ENTRY3(MOV, LoBits,b, I,b, None, None),
@@ -1917,10 +1920,10 @@ static const X86OpEntry opcodes_root[256] = {
     [0x69] = X86_OP_ENTRY3(IMUL3, G,v, E,v, I,z, sextT0),
     [0x6A] = X86_OP_ENTRYr(PUSH, I,b),
     [0x6B] = X86_OP_ENTRY3(IMUL3, G,v, E,v, I,b, sextT0),
-    [0x6C] = X86_OP_ENTRYrr(INS, Y,b, 2,w), /* DX */
-    [0x6D] = X86_OP_ENTRYrr(INS, Y,z, 2,w), /* DX */
-    [0x6E] = X86_OP_ENTRYrr(OUTS, X,b, 2,w), /* DX */
-    [0x6F] = X86_OP_ENTRYrr(OUTS, X,z, 2,w), /* DX */
+    [0x6C] = X86_OP_ENTRYr(INS, 2,w), /* DX */
+    [0x6D] = X86_OP_ENTRYr(INS, 2,w), /* DX */
+    [0x6E] = X86_OP_ENTRYr(OUTS, 2,w), /* DX */
+    [0x6F] = X86_OP_ENTRYr(OUTS, 2,w), /* DX */
 
     [0x78] = X86_OP_ENTRYr(Jcc, J,b),
     [0x79] = X86_OP_ENTRYr(Jcc, J,b),
@@ -1952,13 +1955,13 @@ static const X86OpEntry opcodes_root[256] = {
 
     [0xA8] = X86_OP_ENTRYrr(TEST, 0,b, I,b),   /* AL, Ib */
     [0xA9] = X86_OP_ENTRYrr(TEST, 0,v, I,z),   /* rAX, Iz */
-    [0xAA] = X86_OP_ENTRYwr(STOS, Y,b, 0,b),
-    [0xAB] = X86_OP_ENTRYwr(STOS, Y,v, 0,v),
+    [0xAA] = X86_OP_ENTRYr(STOS, 0,b),
+    [0xAB] = X86_OP_ENTRYr(STOS, 0,v),
     /* Manual writeback because REP LODS (!) has to write EAX/RAX after every LODS.  */
-    [0xAC] = X86_OP_ENTRYr(LODS, X,b),
-    [0xAD] = X86_OP_ENTRYr(LODS, X,v),
-    [0xAE] = X86_OP_ENTRYrr(SCAS, 0,b, Y,b),
-    [0xAF] = X86_OP_ENTRYrr(SCAS, 0,v, Y,v),
+    [0xAC] = X86_OP_ENTRY0(LODS),
+    [0xAD] = X86_OP_ENTRY0(LODS),
+    [0xAE] = X86_OP_ENTRYr(SCAS, 0,b),
+    [0xAF] = X86_OP_ENTRYr(SCAS, 0,v),
 
     [0xB8] = X86_OP_ENTRYwr(MOV, LoBits,v, I,v),
     [0xB9] = X86_OP_ENTRYwr(MOV, LoBits,v, I,v),
@@ -1969,8 +1972,8 @@ static const X86OpEntry opcodes_root[256] = {
     [0xBE] = X86_OP_ENTRYwr(MOV, LoBits,v, I,v),
     [0xBF] = X86_OP_ENTRYwr(MOV, LoBits,v, I,v),
 
-    [0xC8] = X86_OP_ENTRYrr(ENTER, I,w, I,b),
-    [0xC9] = X86_OP_ENTRY1(LEAVE, A,d64),
+    [0xC8] = X86_OP_ENTRYrr(ENTER, I_unsigned, w, I, b),
+    [0xC9] = X86_OP_ENTRY0(LEAVE),
     [0xCA] = X86_OP_ENTRYr(RETF,  I,w),
     [0xCB] = X86_OP_ENTRY0(RETF),
     [0xCC] = X86_OP_ENTRY0(INT3),
@@ -2108,9 +2111,6 @@ static void decode_EVEX4cc(DisasContext *s, CPUX86State *env, X86OpEntry *entry,
 
     if (s->prefix & PREFIX_REPNZ) {
         *entry = setcc;
-        if (EVEX_APX_ND(s)) {
-            entry->s1 = X86_SIZE_q; /* optimization for zu */
-        }
     } else {
         *entry = (EVEX_APX_ND(s) ? cfcmov_nd1 : cfcmov_nd0)[EVEX_APX_NF(s)][mod == 3];
     }
@@ -2360,8 +2360,8 @@ static void decode_modrm(DisasContext *s, CPUX86State *env,
         }
 
         /* For correct popl handling with esp.  */
-        if (base == R_ESP && s->popl_esp_hack) {
-            disp += s->popl_esp_hack;
+        if (base == R_ESP && decode->e.special == X86_SPECIAL_PopESP) {
+            disp += 1 << mo_pushpop(s, s->dflag);
         }
         if (base == R_EBP || base == R_ESP) {
             def_seg = R_SS;
@@ -2426,6 +2426,12 @@ static void decode_modrm(DisasContext *s, CPUX86State *env,
     decode->mem = (AddressParts){ def_seg, base, index, scale, disp };
 }
 
+static bool is_mmx(const DisasContext *s, const X86OpEntry *e)
+{
+    return (e->special == X86_SPECIAL_MMX &&
+            !(s->prefix & (PREFIX_REPZ | PREFIX_REPNZ | PREFIX_DATA)));
+}
+
 static bool decode_op_size(DisasContext *s, X86OpEntry *e, X86OpSize size, MemOp *ot)
 {
     switch (size) {
@@ -2444,7 +2450,6 @@ static bool decode_op_size(DisasContext *s, X86OpEntry *e, X86OpSize size, MemOp
         *ot = s->dflag;
         return true;
 
-    case X86_SIZE_pi: /* MMX */
     case X86_SIZE_q:  /* 64-bit */
     case X86_SIZE_sd: /* SSE/AVX scalar double precision */
         *ot = MO_64;
@@ -2471,8 +2476,7 @@ static bool decode_op_size(DisasContext *s, X86OpEntry *e, X86OpSize size, MemOp
         return true;
 
     case X86_SIZE_dq: /* SSE/AVX 128-bit */
-        if (e->special == X86_SPECIAL_MMX &&
-            !(s->prefix & (PREFIX_DATA | PREFIX_REPZ | PREFIX_REPNZ))) {
+        if (is_mmx(s, e)) {
             *ot = MO_64;
             return true;
         }
@@ -2490,14 +2494,10 @@ static bool decode_op_size(DisasContext *s, X86OpEntry *e, X86OpSize size, MemOp
         return true;
 
     case X86_SIZE_x:  /* 128/256-bit, based on operand size */
-        if (e->special == X86_SPECIAL_MMX &&
-            !(s->prefix & (PREFIX_DATA | PREFIX_REPZ | PREFIX_REPNZ))) {
+        if (is_mmx(s, e)) {
             *ot = MO_64;
             return true;
         }
-        /* fall through */
-    case X86_SIZE_ps: /* SSE/AVX packed single precision */
-    case X86_SIZE_pd: /* SSE/AVX packed double precision */
         *ot = s->vex_l ? MO_256 : MO_128;
         return true;
 
@@ -2548,10 +2548,6 @@ static bool decode_op(DisasContext *s, CPUX86State *env, X86DecodedInsn *decode,
 {
     switch (type) {
     case X86_TYPE_None:  /* Implicit or absent */
-    case X86_TYPE_A:  /* Implicit */
-    case X86_TYPE_F:  /* EFLAGS/RFLAGS */
-    case X86_TYPE_X:  /* string source */
-    case X86_TYPE_Y:  /* string destination */
         break;
 
     case X86_TYPE_B:  /* VEX.vvvv selects a GPR, else use modrm */
@@ -2607,8 +2603,7 @@ static bool decode_op(DisasContext *s, CPUX86State *env, X86DecodedInsn *decode,
         goto get_reg;
 
     case X86_TYPE_V:  /* reg in the modrm byte selects an XMM/YMM register */
-        if (decode->e.special == X86_SPECIAL_MMX &&
-            !(s->prefix & (PREFIX_DATA | PREFIX_REPZ | PREFIX_REPNZ))) {
+        if (is_mmx(s, &decode->e)) {
             op->unit = X86_OP_MMX;
         } else {
             op->unit = X86_OP_SSE;
@@ -2627,8 +2622,7 @@ static bool decode_op(DisasContext *s, CPUX86State *env, X86DecodedInsn *decode,
         goto get_modrm;
 
     case X86_TYPE_W:  /* XMM/YMM modrm operand */
-        if (decode->e.special == X86_SPECIAL_MMX &&
-            !(s->prefix & (PREFIX_DATA | PREFIX_REPZ | PREFIX_REPNZ))) {
+        if (is_mmx(s, &decode->e)) {
             op->unit = X86_OP_MMX;
         } else {
             op->unit = X86_OP_SSE;
@@ -2640,8 +2634,7 @@ static bool decode_op(DisasContext *s, CPUX86State *env, X86DecodedInsn *decode,
         goto get_modrm_reg;
 
     case X86_TYPE_U:  /* R/M in the modrm byte selects an XMM/YMM register */
-        if (decode->e.special == X86_SPECIAL_MMX &&
-            !(s->prefix & (PREFIX_DATA | PREFIX_REPZ | PREFIX_REPNZ))) {
+        if (is_mmx(s, &decode->e)) {
             op->unit = X86_OP_MMX;
         } else {
             op->unit = X86_OP_SSE;
@@ -2715,10 +2708,6 @@ static bool decode_op(DisasContext *s, CPUX86State *env, X86DecodedInsn *decode,
     case X86_TYPE_I_unsigned:  /* Immediate */
         op->unit = X86_OP_IMM;
         decode->immediate = op->imm = insn_get(env, s, op->ot);
-        break;
-
-    case X86_TYPE_L:  /* The upper 4 bits of the immediate select a 128-bit register */
-        op->n = insn_get(env, s, op->ot) >> 4;
         break;
 
     case X86_TYPE_2op:
@@ -2836,8 +2825,7 @@ static bool extract_evex_params(DisasContext *s, X86DecodedInsn *decode)
 }
 
 
-static bool decode_ops(DisasContext *s, CPUX86State *env, X86DecodeFunc decode_func,
-                       X86DecodedInsn *decode)
+static bool decode_ops(DisasContext *s, CPUX86State *env, X86DecodedInsn *decode)
 {
     X86OpEntry *e = &decode->e;
 
@@ -3112,13 +3100,17 @@ static bool validate_vex(DisasContext *s, X86DecodedInsn *decode)
         assert(e->vex_class == 1 || e->vex_class == 2 || e->vex_class == 4);
         if (s->prefix & (PREFIX_REPZ | PREFIX_REPNZ)) {
             e->vex_class = e->vex_class < 4 ? 3 : 5;
-            if (s->vex_l) {
-                goto illegal;
-            }
+            s->vex_l = 0;
             assert(e->op2 == X86_TYPE_W && e->s2 == X86_SIZE_x);
             if ((s->modrm >> 6) != 3) {
                 e->s2 = s->prefix & PREFIX_REPNZ ? X86_SIZE_sd : X86_SIZE_ss;
             }
+        }
+        break;
+
+    case X86_VEX_SSEOnly:
+        if (s->prefix & PREFIX_VEX) {
+            goto illegal;
         }
         break;
 
@@ -3141,12 +3133,15 @@ static bool validate_vex(DisasContext *s, X86DecodedInsn *decode)
     case 4:
     case 5:
     case 7:
-        if (s->prefix & PREFIX_VEX) {
+        if (is_mmx(s, e)) {
+            if (s->prefix & PREFIX_VEX) {
+                goto illegal;
+            }
+        } else if (s->prefix & PREFIX_VEX) {
             if (!(s->flags & HF_AVX_EN_MASK)) {
                 goto illegal;
             }
-        } else if (e->special != X86_SPECIAL_MMX ||
-                   (s->prefix & (PREFIX_REPZ | PREFIX_REPNZ | PREFIX_DATA))) {
+        } else {
             if (!(s->flags & HF_OSFXSR_MASK)) {
                 goto illegal;
             }
@@ -3292,7 +3287,6 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
 
     s->pc = s->base.pc_next;
     s->override = -1;
-    s->popl_esp_hack = 0;
 #ifdef TARGET_X86_64
     s->rex_r = 0;
     s->rex_x = 0;
@@ -3611,7 +3605,7 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
         }
     }
 
-    if (!decode_ops(s, env, decode_func, &decode)) {
+    if (!decode_ops(s, env, &decode)) {
         goto illegal_op;
     }
     if (!validate_cr0_exceptions(s, &decode)) {
@@ -3701,8 +3695,7 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
         }
     }
 
-    if (decode.e.special == X86_SPECIAL_MMX &&
-        !(s->prefix & (PREFIX_REPZ | PREFIX_REPNZ | PREFIX_DATA))) {
+    if (is_mmx(s, &decode.e)) {
         gen_helper_enter_mmx(tcg_env);
     }
 

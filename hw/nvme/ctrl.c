@@ -203,6 +203,7 @@
 #include "qemu/units.h"
 #include "qemu/range.h"
 #include "qapi/error.h"
+#include "qapi/qapi-builtin-type-infos.h"
 #include "qapi/visitor.h"
 #include "system/system.h"
 #include "system/block-backend.h"
@@ -1379,11 +1380,17 @@ static uint16_t nvme_tx(NvmeCtrl *n, NvmeSg *sg, void *ptr, uint32_t len,
     if (sg->flags & NVME_SG_DMA) {
         const MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
         dma_addr_t residual;
+        MemTxResult res;
 
         if (dir == NVME_TX_DIRECTION_TO_DEVICE) {
-            dma_buf_write(ptr, len, &residual, &sg->qsg, attrs);
+            res = dma_buf_write(ptr, len, &residual, &sg->qsg, attrs);
         } else {
-            dma_buf_read(ptr, len, &residual, &sg->qsg, attrs);
+            res = dma_buf_read(ptr, len, &residual, &sg->qsg, attrs);
+        }
+
+        if (unlikely(res != MEMTX_OK)) {
+            trace_pci_nvme_err_data_transfer(res);
+            return NVME_DATA_TRAS_ERROR;
         }
 
         if (unlikely(residual)) {
@@ -2031,10 +2038,19 @@ enum {
 static uint16_t nvme_zrm_open_flags(NvmeCtrl *n, NvmeNamespace *ns,
                                     NvmeZone *zone, int flags)
 {
+    NvmeZoneState state = nvme_get_zone_state(zone);
+
+    bool zrwaa =
+        (flags & NVME_ZRM_ZRWA) && !(zone->d.za & NVME_ZA_ZRWA_VALID);
+
     int act = 0;
     uint16_t status;
 
-    switch (nvme_get_zone_state(zone)) {
+    if (zrwaa && state != NVME_ZONE_STATE_EMPTY) {
+        return NVME_INVALID_ZONE_OP | NVME_DNR;
+    }
+
+    switch (state) {
     case NVME_ZONE_STATE_EMPTY:
         act = 1;
 
@@ -2044,8 +2060,7 @@ static uint16_t nvme_zrm_open_flags(NvmeCtrl *n, NvmeNamespace *ns,
         if (n->params.auto_transition_zones) {
             nvme_zrm_auto_transition_zone(ns);
         }
-        status = nvme_zns_check_resources(ns, act, 1,
-                                          (flags & NVME_ZRM_ZRWA) ? 1 : 0);
+        status = nvme_zns_check_resources(ns, act, 1, zrwaa);
         if (status) {
             return status;
         }
@@ -2073,7 +2088,7 @@ static uint16_t nvme_zrm_open_flags(NvmeCtrl *n, NvmeNamespace *ns,
         /* fallthrough */
 
     case NVME_ZONE_STATE_EXPLICITLY_OPEN:
-        if (flags & NVME_ZRM_ZRWA) {
+        if (zrwaa) {
             ns->zns.numzrwa--;
 
             zone->d.za |= NVME_ZA_ZRWA_VALID;
@@ -3277,6 +3292,11 @@ static void nvme_do_copy(NvmeCopyAIOCB *iocb)
         status = NVME_INVALID_FIELD | NVME_DNR;
         goto invalid;
     } else if (snsid != dnsid) {
+        if (sns->lbaf.ds != dns->lbaf.ds) {
+            status = NVME_CMD_INCOMP_NS_OR_FMT | NVME_DNR;
+            goto invalid;
+        }
+
         if (!NVME_ID_NS_DPS_TYPE(sns->id_ns.dps) &&
             !NVME_ID_NS_DPS_TYPE(dns->id_ns.dps)) {
             if (!nvme_copy_matching_ns_format(sns, dns, false)) {
@@ -3748,6 +3768,7 @@ static void nvme_do_write_fdp(NvmeCtrl *n, NvmeRequest *req, uint64_t slba,
         !nvme_parse_pid(ns, pid, &ph, &rg)) {
         ph = 0;
         rg = 0;
+        pid = 0;
     }
 
     ruhid = ns->fdp.phs[ph];
@@ -3779,7 +3800,7 @@ static uint16_t nvme_do_write(NvmeCtrl *n, NvmeRequest *req, bool append,
     uint64_t data_size = nvme_l2b(ns, nlb);
     uint64_t mapped_size = data_size;
     uint64_t data_offset;
-    NvmeZone *zone;
+    NvmeZone *zone = NULL;
     NvmeZonedResult *res = (NvmeZonedResult *)&req->cqe;
     BlockBackend *blk = ns->blkconf.blk;
     uint16_t status;
@@ -3872,10 +3893,6 @@ static uint16_t nvme_do_write(NvmeCtrl *n, NvmeRequest *req, bool append,
         if (status) {
             goto invalid;
         }
-
-        if (!(zone->d.za & NVME_ZA_ZRWA_VALID)) {
-            zone->w_ptr += nlb;
-        }
     } else if (ns->endgrp && ns->endgrp->fdp.enabled) {
         nvme_do_write_fdp(n, req, slba, nlb);
     }
@@ -3883,7 +3900,13 @@ static uint16_t nvme_do_write(NvmeCtrl *n, NvmeRequest *req, bool append,
     data_offset = nvme_l2b(ns, slba);
 
     if (NVME_ID_NS_DPS_TYPE(ns->id_ns.dps)) {
-        return nvme_dif_rw(n, req);
+        status = nvme_dif_rw(n, req);
+
+        if (status != NVME_NO_COMPLETE) {
+            return status;
+        }
+
+        goto out;
     }
 
     if (!wrz) {
@@ -3899,6 +3922,11 @@ static uint16_t nvme_do_write(NvmeCtrl *n, NvmeRequest *req, bool append,
         req->aiocb = blk_aio_pwrite_zeroes(blk, data_offset, data_size,
                                            BDRV_REQ_MAY_UNMAP, nvme_rw_cb,
                                            req);
+    }
+
+out:
+    if (ns->params.zoned && !(zone->d.za & NVME_ZA_ZRWA_VALID)) {
+        zone->w_ptr += nlb;
     }
 
     return NVME_NO_COMPLETE;
@@ -4258,7 +4286,8 @@ static uint16_t nvme_zone_mgmt_send_zrwa_flush(NvmeCtrl *n, NvmeZone *zone,
         return NVME_INVALID_FIELD | NVME_DNR;
     }
 
-    if (elba < wp || elba > wp + ns->zns.zrwas) {
+    if (elba < wp || elba >= wp + ns->zns.zrwas ||
+        elba >= nvme_zone_wr_boundary(zone)) {
         return NVME_ZONE_BOUNDARY_ERROR | NVME_DNR;
     }
 
@@ -4782,15 +4811,17 @@ static void nvme_cq_notifier(EventNotifier *e)
 {
     NvmeCQueue *cq = container_of(e, NvmeCQueue, notifier);
     NvmeCtrl *n = cq->ctrl;
+    bool pending = cq->tail != cq->head;
 
     if (!event_notifier_test_and_clear(e)) {
         return;
     }
 
+    nvme_update_cq_eventidx(cq);
     nvme_update_cq_head(cq);
 
     if (cq->tail == cq->head) {
-        if (cq->irq_enabled) {
+        if (cq->irq_enabled && pending) {
             n->cq_pending--;
         }
 
@@ -6627,7 +6658,9 @@ static uint16_t nvme_set_feature_fdp_events(NvmeCtrl *n, NvmeNamespace *ns,
     g_autofree uint8_t *events = NULL;
     NvmeRuHandle *ruh = NULL;
 
-    assert(ns);
+    if (!ns) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
 
     if (!n->subsys || !n->subsys->endgrp.fdp.enabled) {
         return NVME_FDP_DISABLED | NVME_DNR;
@@ -8133,6 +8166,10 @@ static void nvme_ctrl_reset(NvmeCtrl *n, NvmeResetType rst)
     stl_le_p(&n->bar.intmc, 0);
     stl_le_p(&n->bar.cc, 0);
 
+    n->cq_pending = 0;
+    n->irq_status = 0;
+    nvme_irq_check(n);
+
     n->dbbuf_dbs = 0;
     n->dbbuf_eis = 0;
     n->dbbuf_enabled = false;
@@ -8564,6 +8601,7 @@ static void nvme_process_db(NvmeCtrl *n, hwaddr addr, int val)
 
         uint16_t new_head = val & 0xffff;
         NvmeCQueue *cq;
+        bool pending;
 
         qid = (addr - (0x1000 + (1 << 2))) >> 3;
         if (unlikely(nvme_check_cqid(n, qid))) {
@@ -8618,17 +8656,20 @@ static void nvme_process_db(NvmeCtrl *n, hwaddr addr, int val)
             qemu_bh_schedule(cq->bh);
         }
 
+        pending = cq->tail != cq->head;
         cq->head = new_head;
         if (!qid && n->dbbuf_enabled) {
             stl_le_pci_dma(pci, cq->db_addr, cq->head, MEMTXATTRS_UNSPECIFIED);
         }
 
         if (cq->tail == cq->head) {
-            if (cq->irq_enabled) {
+            if (cq->irq_enabled && pending) {
                 n->cq_pending--;
             }
 
             nvme_irq_deassert(n, cq);
+        } else if (n->dbbuf_enabled) {
+            nvme_update_cq_eventidx(cq);
         }
     } else {
         /* Submission queue doorbell write */
@@ -10613,6 +10654,7 @@ static void nvme_instance_init(Object *obj)
                                   DEVICE(obj));
 
     object_property_add(obj, "smart_critical_warning", "uint8",
+                        &uint8_type_info,
                         nvme_get_smart_warning,
                         nvme_set_smart_warning, NULL, NULL);
 }

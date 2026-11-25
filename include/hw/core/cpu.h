@@ -98,6 +98,9 @@ struct AccelCPUClass;
 /* see sysemu-cpu-ops.h */
 struct SysemuCPUOps;
 
+/* see semihosting/common-semi.h */
+struct SemihostingCPUOps;
+
 /**
  * CPUClass:
  * @class_by_name: Callback to map -cpu command line model name to an
@@ -105,6 +108,7 @@ struct SysemuCPUOps;
  * @list_cpus: list available CPU models and flags.
  * @parse_features: Callback to parse command line arguments.
  * @reset_dump_flags: #CPUDumpFlags to use for reset logging.
+ * @exception_name: Callback for getting architecture exception name.
  * @memory_rw_debug: Callback for GDB memory access.
  * @dump_state: Callback for dumping state.
  * @query_cpu_fast:
@@ -175,6 +179,7 @@ struct CPUClass {
     const char * (*gdb_arch_name)(CPUState *cpu);
     const char * (*gdb_get_core_xml_file)(CPUState *cpu);
 
+    const char *(*exception_name)(int exception);
     void (*disas_set_info)(const CPUState *cpu, disassemble_info *info);
 
     const char *deprecation_note;
@@ -183,8 +188,13 @@ struct CPUClass {
     /* when system emulation is not available, this pointer is NULL */
     const struct SysemuCPUOps *sysemu_ops;
 
+#ifdef CONFIG_TCG
     /* when TCG is not available, this pointer is NULL */
     const TCGCPUOps *tcg_ops;
+
+    /* when target does not implement semihosting, this pointer is NULL */
+    const struct SemihostingCPUOps *semi_ops;
+#endif
 
     /*
      * Keep non-pointer data at the end to minimize holes.
@@ -601,7 +611,7 @@ QEMU_BUILD_BUG_ON(offsetof(CPUState, neg) !=
  * Return the CPUArchState associated with the CPU.
  */
 #define cpu_env(cpu) _Generic(cpu, \
-    /* We validate that CPUArchState follows CPUState in target-info-stub.c */ \
+    /* We validate that CPUArchState follows CPUState in target-info-def.c */ \
     CPUState *: \
         (CPUArchState *)((cpu) + 1), \
     const CPUState *: \
@@ -692,6 +702,30 @@ int cpu_write_elf32_note(WriteCoreDumpFunction f, CPUState *cpu,
  */
 int cpu_write_elf32_qemunote(WriteCoreDumpFunction f, CPUState *cpu,
                              void *opaque);
+
+/**
+ * cpu_get_dump_info:
+ * @cpu: The CPU whose dump information is to be obtained
+ * @info: Where to write endianness, class and architecture
+ * @guest_phys_blocks: guest physical memory blocks to be dumped
+ *
+ * Returns: 0 on success, -1 if guest memory can't be dumped.
+ */
+int cpu_get_dump_info(const CPUState *cpu, ArchDumpInfo *info,
+                      const GuestPhysBlockList *guest_phys_blocks);
+
+/**
+ * cpu_get_note_size:
+ * @cpu: The CPU whose memory is to be dumped
+ * @class: ELF class reported by cpu_get_dump_info()
+ * @machine: ELF machine reported by cpu_get_dump_info()
+ * @nr_cpus: Number of CPUs to be dumped
+ *
+ * Returns: size of the ELF notes needed to dump @nr_cpus CPUs,
+ * or -1 if not supported.
+ */
+ssize_t cpu_get_note_size(const CPUState *cpu, int class, int machine,
+                          int nr_cpus);
 
 /**
  * cpu_memory_rw_debug:

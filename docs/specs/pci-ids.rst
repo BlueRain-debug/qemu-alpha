@@ -46,8 +46,13 @@ maintained as part of the virtio specification.
   upstream merge or shipping a distro/product) to avoid conflicts.
 
 1af4:1100
-  Used as PCI Subsystem ID for existing hardware devices emulated
-  by QEMU.
+  Used as PCI Subsystem ID for existing hardware devices emulated by
+  QEMU, such as the intel chipset devices.  Also used for virtio
+  devices and generic pci class devices (1b36:00xx, see below).
+
+1af4:1101
+  PCI Subsystem ID for OSMates (github.com/osmates), will be used
+  for virtio devices and pci class devices (xhci, nvme).
 
 1af4:1110
   ivshmem device (:doc:`ivshmem-spec`)
@@ -100,6 +105,10 @@ PCI devices (other than virtio):
   PCI UFS device (``-device ufs``)
 1b36:0014
   PCI RISC-V IOMMU device
+1b36:0015
+  PCIe Upstream Switch Port (``-device pcie-upstream-port``)
+1b36:0016
+  PCIe Downstream Switch Port (``-device pcie-downstream-port``)
 
 All these devices are documented in :doc:`index`.
 
