@@ -43,7 +43,7 @@ struct JensenQVision {
     QVisionPort standard;
     QVisionPort extra[11];
     uint8_t registers[65536];
-    uint8_t board_control, setup, select;
+    uint8_t board_control, setup, select, video_enable, option_select;
     uint8_t dac_command[3], cursor_ram[256], cursor_palette[12];
     uint8_t dac_address, dac_component;
     uint16_t cursor_x, cursor_y;
@@ -66,6 +66,12 @@ static bool qvision_selected(JensenQVision *s)
     return (s->board_control & 1) && (s->select & 15) == (s->setup & 15);
 }
 
+static bool qvision_vga_enabled(JensenQVision *s)
+{
+    return qvision_selected(s) && (s->video_enable & 8) &&
+           (s->option_select & 1);
+}
+
 static bool qvision_packed(JensenQVision *s)
 {
     return s->vga.gr[0x40] & 1;
@@ -75,7 +81,7 @@ static void qvision_update_map(JensenQVision *s)
 {
     uint64_t base = (uint64_t)s->vga.gr[0x48] << 20 |
                     (uint64_t)(s->vga.gr[0x49] & 15) << 28;
-    bool enable = qvision_selected(s) && base >= MiB;
+    bool enable = qvision_vga_enabled(s) && base >= MiB;
 
     memory_region_transaction_begin();
     memory_region_set_enabled(&s->highmap, false);
@@ -220,6 +226,15 @@ static uint8_t qvision_read_byte(JensenQVision *s, unsigned port)
     if (!qvision_selected(s)) {
         return 0xff;
     }
+    if (port == 0x46e8) {
+        return s->video_enable;
+    }
+    if (port == 0x0102) {
+        return s->option_select;
+    }
+    if (port >= 0x3b0 && port <= 0x3df && !qvision_vga_enabled(s)) {
+        return 0xff;
+    }
     switch (dac) {
     case 4: case 7:
         return s->dac_address;
@@ -260,6 +275,24 @@ static void qvision_write_byte(JensenQVision *s, unsigned port, uint8_t value)
         return;
     }
     if (!qvision_selected(s)) {
+        return;
+    }
+    if (port == 0x46e8 || port == 0x0102) {
+        /*
+         * The original ROM disables this board with 46E8=06 before probing
+         * the other CRTC ports, then restores it with 46E8=0E. The CPQ3011
+         * setup sequence uses 46E8=10, 0102=01, 46E8=08. These control ports
+         * must remain accessible while the VGA I/O and memory are disabled.
+         */
+        if (port == 0x46e8) {
+            s->video_enable = value;
+        } else {
+            s->option_select = value;
+        }
+        qvision_update_map(s);
+        return;
+    }
+    if (port >= 0x3b0 && port <= 0x3df && !qvision_vga_enabled(s)) {
         return;
     }
     switch (dac) {
@@ -368,7 +401,7 @@ static uint64_t qvision_memory_read(void *opaque, hwaddr addr, unsigned size)
 {
     JensenQVision *s = opaque;
 
-    return qvision_selected(s) ? vga_mem_readb(&s->vga, addr) : 0xff;
+    return qvision_vga_enabled(s) ? vga_mem_readb(&s->vga, addr) : 0xff;
 }
 
 static void qvision_memory_write(void *opaque, hwaddr addr,
@@ -376,7 +409,7 @@ static void qvision_memory_write(void *opaque, hwaddr addr,
 {
     JensenQVision *s = opaque;
 
-    if (qvision_selected(s)) {
+    if (qvision_vga_enabled(s)) {
         vga_mem_writeb(&s->vga, addr, value);
     }
 }
@@ -434,6 +467,8 @@ static void qvision_reset(DeviceState *dev)
     memset(s->cursor_palette, 0, sizeof(s->cursor_palette));
     s->board_control = 1;
     s->setup = 0x10;
+    s->video_enable = 8;
+    s->option_select = 1;
     s->select = s->dac_address = s->dac_component = 0;
     s->cursor_x = s->cursor_y = 0;
     s->cursor_old_enabled = false;

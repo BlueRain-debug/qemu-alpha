@@ -40,6 +40,27 @@ def check(qemu, rom, root):
         expect(io.inb(0x1c80) == 0x0e, 'product ID is read-only')
         expect(io.inb(0x1c84) == 1, 'primary board enabled')
         expect(io.inb(0x1c85) == 0x10, 'primary controller and extended ROM')
+        io.outb(0x3c2, 1)
+        io.outb(0x3d4, 0x0f)
+        io.outb(0x3d5, 0x33)
+        io.outb(0x46e8, 6)
+        for crtc in (0x3d4, 0x3b4):
+            io.outb(crtc, 0x0f)
+            io.outb(crtc + 1, 0x5a)
+            expect(io.inb(crtc + 1) == 0xff,
+                   f'ROM other-adapter probe ignores disabled CRTC {crtc:#x}')
+        expect(io.inb(0x46e8) == 6, 'disabled video enable remains accessible')
+        io.outb(0x46e8, 14)
+        expect(io.inb(0x3d5) == 0x33, 'disabled CRTC writes do not alter state')
+        io.outb(0x46e8, 16)
+        io.outb(0x0102, 1)
+        expect(io.inb(0x0102) == 1 and io.inb(0x3ce) == 0xff,
+               'setup mode keeps option register accessible and VGA disabled')
+        io.outb(0x46e8, 8)
+        io.outb(0x0102, 0)
+        expect(io.inb(0x3ce) == 0xff, 'option-select command disable')
+        io.outb(0x0102, 1)
+        expect(io.inb(0x3ce) != 0xff, 'option-select command re-enable')
         expect(io.read(memory(0xc0000)) == int.from_bytes(rom.read_bytes()[:4],
                                                         'little'),
                'original ROM visible through EISA memory')
@@ -63,6 +84,12 @@ def check(qemu, rom, root):
                'old high-address window removed')
         expect(io.read(memory(0x500000)) == 0x89abcdef,
                'VRAM preserved when high-address window moves')
+        io.outb(0x46e8, 6)
+        expect(io.read(memory(0x500000)) == 0xffffffff,
+               'video disable removes high-address window')
+        io.outb(0x46e8, 14)
+        expect(io.read(memory(0x500000)) == 0x89abcdef,
+               'video re-enable preserves framebuffer contents')
         io.outb(0x83c4, 2)
         expect(io.inb(0x3ce) == 0xff, 'unselected VGA ports float high')
         expect(io.read(memory(0x500000)) == 0xffffffff,
@@ -111,6 +138,8 @@ def check(qemu, rom, root):
         io.vm.command('system_reset')
         expect(read_gc(0x0c) == 0x37 and io.inb(0x1c85) == 0x10,
                'reset restores controller identification and setup')
+        expect(io.inb(0x46e8) == 8 and io.inb(0x0102) == 1,
+               'reset restores VGA video and option-select enables')
         expect(io.read(memory(0x500000)) == 0xffffffff,
                'reset disables old framebuffer mapping')
         expect(io.inb(0x83c6) == 0 and io.read(local) == 0x9d,
