@@ -410,14 +410,15 @@ static uint8_t aha_read_byte(JensenAha1742 *s, unsigned reg)
         return s->mailbox_out >> ((reg - 0x50) * 8);
     }
     if (reg == 0x56) {
-        return s->count ? s->done[s->head].status : 0;
+        return s->count ? s->done[s->head].status : s->regs[reg];
     }
     if (reg == 0x57) {
         return (s->hard_reset ? 1 : 0) | (s->count ? 2 : 0) |
                (!s->out_full && s->count + s->active < AHA_QUEUE_SIZE ? 4 : 0);
     }
     if (reg >= 0x58 && reg <= 0x5b) {
-        return s->count ? s->done[s->head].mailbox >> ((reg - 0x58) * 8) : 0;
+        return s->count ? s->done[s->head].mailbox >> ((reg - 0x58) * 8) :
+                         s->regs[reg];
     }
     if (reg == 0x5c) {
         return 0; /* Immediate reset consumes host-ready synchronously. */
@@ -476,6 +477,13 @@ static void aha_write_byte(JensenAha1742 *s, unsigned reg, uint8_t value)
             s->hard_reset = false;
             if ((value & 0x40) && s->count) {
                 qemu_set_irq(s->irq, 0);
+                /*
+                 * G2CNTRL clears the pending interrupt, not its data latches
+                 * (510208-00A, 4-22). SRM acknowledges before reading G2INTST.
+                 * Keep the last result until another completion or reset.
+                 */
+                s->regs[0x56] = s->done[s->head].status;
+                stl_le_p(s->regs + 0x58, s->done[s->head].mailbox);
                 s->head = (s->head + 1) % AHA_QUEUE_SIZE;
                 s->count--;
                 aha_update_irq(s);
