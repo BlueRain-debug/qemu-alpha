@@ -1,5 +1,9 @@
 # See docs/devel/tracing.rst for syntax documentation.
 
+jensen_qvision_read(uint64_t port, uint64_t value, unsigned size) "port=0x%"PRIx64" value=0x%"PRIx64" size=%u"
+jensen_qvision_write(uint64_t port, uint64_t value, unsigned size) "port=0x%"PRIx64" value=0x%"PRIx64" size=%u"
+jensen_qvision_map(uint64_t base, bool enabled) "base=0x%"PRIx64" enabled=%d"
+
 # rmc.c
 es40_rmc_write(uint32_t addr, uint32_t val) "addr=0x%x val=0x%x "
 es40_rmc_read(uint32_t addr, uint32_t val) "addr=0x%x val=0x%x "

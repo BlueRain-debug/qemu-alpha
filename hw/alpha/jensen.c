@@ -78,6 +78,9 @@ struct JensenMachineState {
     uint8_t nmi_control, nmi_extended, nmi_mask;
     bool keyboard_locked;
     bool s3_928;
+    bool qvision;
+    uint32_t qvision_slot;
+    char *qvision_romfile;
     uint32_t s3_vram_mb;
     char *s3_romfile;
     PFlashCFI01 *flash[2];
@@ -415,12 +418,23 @@ static void jensen_io_write_byte(JensenMachineState *s, hwaddr port,
 
 static uint64_t jensen_local_read(void *opaque, hwaddr addr, unsigned size)
 {
+    JensenMachineState *s = opaque;
+
+    if (s->qvision && ((addr >> 9) & 0xffff) == 0x102) {
+        return s->rtc->cmos_data[0x69];
+    }
     return jensen_io_read_byte(opaque, (addr >> 9) & 0xffff);
 }
 
 static void jensen_local_write(void *opaque, hwaddr addr,
                                uint64_t value, unsigned size)
 {
+    JensenMachineState *s = opaque;
+
+    if (s->qvision && ((addr >> 9) & 0xffff) == 0x102) {
+        s->rtc->cmos_data[0x69] = value;
+        return;
+    }
     jensen_io_write_byte(opaque, (addr >> 9) & 0xffff, value);
 }
 
@@ -877,7 +891,9 @@ static void jensen_init(MachineState *machine)
     /* VL82C106 control register 0 is also accessible at port 0x102 (24-9). */
     memory_region_init_io(&s->chipctrl0, OBJECT(s), &jensen_reg_ops,
                           &s->rtc->cmos_data[0x69], "jensen-chipctrl0", 1);
-    memory_region_add_subregion(&s->isa_io, 0x102, &s->chipctrl0);
+    if (!s->qvision) {
+        memory_region_add_subregion(&s->isa_io, 0x102, &s->chipctrl0);
+    }
     kbd = isa_create_simple(bus, TYPE_I8042);
     s->kbd = I8042(kbd);
     address_space_init(&s->kbd_command_as, &s->kbd->io[1],
@@ -895,8 +911,20 @@ static void jensen_init(MachineState *machine)
         error_report("s3-romfile requires s3-928=on");
         exit(EXIT_FAILURE);
     }
+    if ((s->qvision && s->s3_928) ||
+        (s->qvision_romfile && !s->qvision) ||
+        (s->qvision && !s->qvision_romfile)) {
+        error_report("QVision requires qvision=on,qvision-romfile=... "
+                     "and is mutually exclusive with s3-928");
+        exit(EXIT_FAILURE);
+    }
     if (machine->enable_graphics) {
-        if (s->s3_928) {
+        if (s->qvision) {
+            vga = isa_new("jensen-qvision-1024");
+            qdev_prop_set_uint32(DEVICE(vga), "slot", s->qvision_slot);
+            qdev_prop_set_string(DEVICE(vga), "romfile", s->qvision_romfile);
+            isa_realize_and_unref(vga, bus, &error_fatal);
+        } else if (s->s3_928) {
             vga = isa_new("jensen-s3-928");
             qdev_prop_set_uint32(DEVICE(vga), "vram-size-mb", s->s3_vram_mb);
             isa_realize_and_unref(vga, bus, &error_fatal);
@@ -904,7 +932,7 @@ static void jensen_init(MachineState *machine)
             vga = isa_vga_init(bus);
         }
     }
-    if (vga) {
+    if (vga && !s->qvision) {
         const char *vga_bios = !s->s3_928 && vga_interface_type == VGA_CIRRUS ?
                                "vgabios-cirrus.bin" : "vgabios.bin";
 
@@ -1075,9 +1103,68 @@ static void jensen_set_s3_romfile(Object *obj, const char *value, Error **errp)
     s->s3_romfile = *value ? g_strdup(value) : NULL;
 }
 
+static bool jensen_get_qvision(Object *obj, Error **errp)
+{
+    return JENSEN_MACHINE(obj)->qvision;
+}
+
+static void jensen_set_qvision(Object *obj, bool value, Error **errp)
+{
+    JensenMachineState *s = JENSEN_MACHINE(obj);
+
+    if (s->cpu) {
+        error_setg(errp, "qvision must be set before machine initialization");
+        return;
+    }
+    s->qvision = value;
+}
+
+static char *jensen_get_qvision_romfile(Object *obj, Error **errp)
+{
+    return g_strdup(JENSEN_MACHINE(obj)->qvision_romfile ?: "");
+}
+
+static void jensen_set_qvision_romfile(Object *obj, const char *value,
+                                       Error **errp)
+{
+    JensenMachineState *s = JENSEN_MACHINE(obj);
+
+    if (s->cpu) {
+        error_setg(errp, "qvision-romfile must precede machine initialization");
+        return;
+    }
+    g_free(s->qvision_romfile);
+    s->qvision_romfile = *value ? g_strdup(value) : NULL;
+}
+
+static void jensen_get_qvision_slot(Object *obj, Visitor *v,
+                                    const char *name, void *opaque, Error **errp)
+{
+    uint32_t value = JENSEN_MACHINE(obj)->qvision_slot;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void jensen_set_qvision_slot(Object *obj, Visitor *v,
+                                    const char *name, void *opaque, Error **errp)
+{
+    JensenMachineState *s = JENSEN_MACHINE(obj);
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    if (s->cpu || value < 1 || value > 6) {
+        error_setg(errp, "qvision-slot must be 1..6 before initialization");
+        return;
+    }
+    s->qvision_slot = value;
+}
+
 static void jensen_instance_init(Object *obj)
 {
     JENSEN_MACHINE(obj)->s3_vram_mb = 2;
+    JENSEN_MACHINE(obj)->qvision_slot = 1;
 }
 
 static void jensen_finalize(Object *obj)
@@ -1089,6 +1176,7 @@ static void jensen_finalize(Object *obj)
     }
     g_free(s->rtc_ram_file);
     g_free(s->s3_romfile);
+    g_free(s->qvision_romfile);
 }
 
 static void jensen_class_init(ObjectClass *oc, const void *data)
@@ -1127,6 +1215,20 @@ static void jensen_class_init(ObjectClass *oc, const void *data)
                                   jensen_set_s3_romfile);
     object_class_property_set_description(oc, "s3-romfile",
         "Optional original 86C928 VGA option ROM (requires s3-928=on)");
+    object_class_property_add_bool(oc, "qvision", jensen_get_qvision,
+                                   jensen_set_qvision);
+    object_class_property_set_description(oc, "qvision",
+        "Experimental EISA QVision 1024/E graphics (default: off)");
+    object_class_property_add_str(oc, "qvision-romfile",
+                                  jensen_get_qvision_romfile,
+                                  jensen_set_qvision_romfile);
+    object_class_property_set_description(oc, "qvision-romfile",
+        "Original 32 KiB QVision ROM bank (required with qvision=on)");
+    object_class_property_add(oc, "qvision-slot", "uint32",
+                              jensen_get_qvision_slot, jensen_set_qvision_slot,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "qvision-slot",
+        "QVision EISA slot, 1..6 (default: 1)");
     object_class_property_add_bool(oc, "keyboard-locked",
                                    jensen_get_keyboard_locked,
                                    jensen_set_keyboard_locked);
