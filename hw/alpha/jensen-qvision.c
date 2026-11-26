@@ -46,6 +46,7 @@ struct JensenQVision {
     uint8_t board_control, setup, select, video_enable, option_select;
     uint8_t dac_command[3], cursor_ram[256], cursor_palette[12];
     uint8_t dac_address, dac_component;
+    uint8_t pattern[8], pattern_count;
     uint16_t cursor_x, cursor_y;
     int cursor_old_y;
     bool cursor_old_enabled;
@@ -215,6 +216,76 @@ static int qvision_dac_register(unsigned port)
     }
 }
 
+static uint32_t qvision_engine_reg(JensenQVision *s, unsigned port,
+                                  unsigned size)
+{
+    uint32_t value = 0;
+
+    for (unsigned i = 0; i < size; i++) {
+        value |= (uint32_t)s->registers[port + i] << (i * 8);
+    }
+    return value;
+}
+
+static uint8_t qvision_rop(unsigned rop, uint8_t source, uint8_t dest)
+{
+    return ((rop & 1) ? ~source & ~dest : 0) |
+           ((rop & 2) ? ~source & dest : 0) |
+           ((rop & 4) ? source & ~dest : 0) |
+           ((rop & 8) ? source & dest : 0);
+}
+
+/*
+ * Synchronous 8-bit solid-pattern subset of the Triton datapath. Unsupported
+ * sources/masks remain unexecuted and are reported at command submission.
+ */
+static bool qvision_solid_blt(JensenQVision *s, uint8_t command)
+{
+    VGACommonState *vga = &s->vga;
+    uint8_t datapath = vga->gr[0x5a], color = s->pattern[0];
+    unsigned width = qvision_engine_reg(s, 0x23c2, 2);
+    unsigned height = qvision_engine_reg(s, 0x23c4, 2);
+    unsigned pitch = qvision_engine_reg(s, 0x23ce, 2) * 4;
+    uint32_t start = qvision_engine_reg(s, 0x63cc, 4);
+    int direction = command & 0x40 ? -1 : 1;
+    uint8_t mask = (datapath & 4) ? 0xff : vga->gr[8];
+
+    if (!qvision_vga_enabled(s) || !qvision_packed(s) ||
+        (s->registers[0x63ca] & 0x1f) != 3 ||
+        !(vga->gr[0x10] & 8) || (datapath & 0x33) != 2 ||
+        (datapath & 0x0c) > 4 || vga->sr[2] != 0xff ||
+        ((datapath & 0xc0) != 0 && (datapath & 0xc0) != 0xc0) ||
+        s->pattern_count != 8 ||
+        (command & ~0x41) ||
+        (uint64_t)width * height > 16 * MiB) {
+        return false;
+    }
+    for (unsigned i = 1; i < 8; i++) {
+        if (s->pattern[i] != color) {
+            return false;
+        }
+    }
+    if (s->registers[0x33cf] & 0x80) {
+        /* XY destination; pitch is programmed in doublewords. */
+        start = (start >> 16) * pitch + (start & 0xffff);
+    }
+    for (unsigned y = 0; y < height; y++) {
+        uint32_t row = start + direction * y * pitch;
+
+        for (unsigned x = 0; x < width; x++) {
+            uint32_t offset = (row + direction * x) & (vga->vram_size - 1);
+            uint8_t dest = vga->vram_ptr[offset];
+            uint8_t value = (datapath & 0xc0) ?
+                qvision_rop(s->registers[0x33c7], color, dest) : color;
+
+            vga->vram_ptr[offset] = (dest & ~mask) | (value & mask);
+        }
+    }
+    memory_region_set_dirty(&vga->vram, 0, vga->vram_size);
+    s->registers[0x33ce] &= ~1;
+    return true;
+}
+
 static uint8_t qvision_read_byte(JensenQVision *s, unsigned port)
 {
     VGACommonState *vga = &s->vga;
@@ -332,7 +403,8 @@ static void qvision_write_byte(JensenQVision *s, unsigned port, uint8_t value)
         if (index != 0x0f && (vga->gr[0x0f] & 15) != 5) {
             return;
         }
-        /* AVGA display enable is not part of the BitBLT register lock.
+        /*
+         * AVGA display enable is not part of the BitBLT register lock.
          * The original Xdec driver enables GR40 after the GR0F password,
          * before setting GR10 bit 3 to access the drawing configuration.
          */
@@ -344,6 +416,11 @@ static void qvision_write_byte(JensenQVision *s, unsigned port, uint8_t value)
             qvision_update_map(s);
         }
         vga->full_update_gfx = vga->full_update_text = true;
+        return;
+    }
+    if (port == 0x3c5 && vga->sr_index == 2 && qvision_packed(s)) {
+        /* AVGA extends the VGA sequencer's pixel write mask to eight bits. */
+        vga->sr[2] = value;
         return;
     }
     /* Stopping the VGA sequencer also drops AVGA and the high-address map.
@@ -363,7 +440,39 @@ static void qvision_write_byte(JensenQVision *s, unsigned port, uint8_t value)
         return;
     }
     s->registers[port] = value;
-    if ((port & 0xfff0) != 0x63c0 && port != 0x0102 && port != 0x46e8) {
+    if (port >= 0x33ca && port <= 0x33cd) {
+        /*
+         * Triton loads eight pattern bytes through two sequential groups
+         * of the same four ports. Only uniform eight-byte patterns are
+         * executable by the current solid-fill subset.
+         */
+        if (s->pattern_count == 8 ||
+            port != 0x33ca + (s->pattern_count & 3)) {
+            s->pattern_count = 0;
+        }
+        if (port == 0x33ca + (s->pattern_count & 3)) {
+            s->pattern[s->pattern_count++] = value;
+        }
+        return;
+    }
+    if (port == 0x63ca) {
+        s->registers[port] &= ~0xc0; /* Busy bits are read-only. */
+        return;
+    }
+    if (port == 0x33ce && (value & 1)) {
+        if (!qvision_solid_blt(s, value)) {
+            qemu_log_mask(LOG_UNIMP,
+                          "QVision: unsupported BitBLT command=%02x "
+                          "control=%02x datapath=%02x\n", value,
+                          s->registers[0x63ca], vga->gr[0x5a]);
+        }
+        return;
+    }
+    if ((port & 0xfff0) == 0x23c0 || (port & 0xfff0) == 0x33c0 ||
+        (port & 0xfff0) == 0x63c0) {
+        return; /* Drawing parameters are latched until a command starts. */
+    }
+    if (port != 0x0102 && port != 0x46e8) {
         qemu_log_mask(LOG_UNIMP, "QVision: unimplemented engine write %04x=%02x\n",
                       port, value);
     }
@@ -469,6 +578,8 @@ static void qvision_reset(DeviceState *dev)
     memset(s->dac_command, 0, sizeof(s->dac_command));
     memset(s->cursor_ram, 0, sizeof(s->cursor_ram));
     memset(s->cursor_palette, 0, sizeof(s->cursor_palette));
+    memset(s->pattern, 0, sizeof(s->pattern));
+    s->pattern_count = 0;
     s->board_control = 1;
     s->setup = 0x10;
     s->video_enable = 8;

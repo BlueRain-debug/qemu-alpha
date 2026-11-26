@@ -65,7 +65,7 @@ def check(qemu, rom, root):
         gc(0x10, 0)
         gc(0x40, 1)
         expect(read_gc(0x40) == 1,
-               'AVGA enable before BitBLT configuration unlock, as used by Xdec')
+               'AVGA enable before BitBLT unlock, as used by Xdec')
         gc(0x40, 0)
         expect(io.read(memory(0xc0000)) == int.from_bytes(rom.read_bytes()[:4],
                                                         'little'),
