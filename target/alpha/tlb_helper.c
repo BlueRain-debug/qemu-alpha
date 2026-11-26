@@ -693,6 +693,20 @@ void alpha_tlb_fill(CPUAlphaState *env, AlphaTLBType type, vaddr address,
         entry = &ctx->entries[get_next_tlbe(ctx)];
     }
 
+    /*
+     * Cached translations must not outlive the architectural TLB entry.
+     * This also handles replacing a mapping without a separate TBIS.
+     * Otherwise a normal PAL load can use a stale cache entry, while a
+     * later HW_LD of the same page unexpectedly takes a nested miss.
+     */
+    if (entry->flags & R_PTE_VALID_MASK) {
+        bool ifetch = type == AlphaTLBType_Instruction;
+        unsigned bits = regime_address_bits(alpha_va48_enabled(env, ifetch));
+
+        tlb_flush_range_by_mmuidx(env_cpu(env), entry->vaddr,
+                                 entry->keep_mask + 1, all_tlbmask(), bits);
+    }
+
     entry->vaddr = address & match_mask;
     entry->paddr = paddr & phys_mask;
     entry->match_mask = match_mask;
