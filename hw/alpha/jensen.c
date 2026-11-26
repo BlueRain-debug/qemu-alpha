@@ -66,6 +66,7 @@ struct JensenMachineState {
     MemoryRegion inta, hae_reg, sysctl_reg, spare_reg, board_id;
     AddressSpace io_as, mem_as, flash_as[2], rtc_as;
     MemoryRegion rtc_window, kbd_command, vga_rom, chipctrl0;
+    MemoryRegion uart_iir[2];
     AddressSpace kbd_command_as;
     ISAKBDState *kbd;
     ISADevice *pit;
@@ -647,6 +648,44 @@ static void jensen_local_irq(void *opaque, int n, int level)
                  (s->local_irqs & 12) != 0);
 }
 
+static uint64_t jensen_uart_iir_read(void *opaque, hwaddr addr, unsigned size)
+{
+    return serial_io_ops.read(opaque, 2, 1);
+}
+
+static void jensen_uart_iir_write(void *opaque, hwaddr addr,
+                                  uint64_t value, unsigned size)
+{
+    /* The 16C450 IIR is read-only; there is no FIFO control register. */
+}
+
+static const MemoryRegionOps jensen_uart_iir_ops = {
+    .read = jensen_uart_iir_read,
+    .write = jensen_uart_iir_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 1,
+};
+
+static void jensen_uart_init(JensenMachineState *s, unsigned index,
+                              hwaddr base)
+{
+    SerialMM *uart = serial_mm_init(&s->isa_io, base, 0,
+                        qemu_allocate_irq(jensen_local_irq, s, index),
+                        1843200 / 16, serial_hd(index), DEVICE_LITTLE_ENDIAN);
+
+    /*
+     * VL82C106 data sheet, Serial Communications Ports, page 6-192:
+     * both UARTs use 16C450 cores, without 16550 FIFOs. Overlay offset 2
+     * in the shared I/O space so local and EISA accesses agree.
+     */
+    memory_region_init_io(&s->uart_iir[index], OBJECT(s),
+                          &jensen_uart_iir_ops, &uart->serial,
+                          "jensen-uart-iir", 1);
+    memory_region_add_subregion_overlap(&s->isa_io, base + 2,
+                                        &s->uart_iir[index], 1);
+}
+
 /* Complete the interrupt-controller handoff normally done by SROM$357_INIT. */
 static void jensen_srom_init_pic(JensenMachineState *s)
 {
@@ -850,12 +889,8 @@ static void jensen_init(MachineState *machine)
                           qemu_allocate_irq(jensen_local_irq, s, 2));
     qdev_connect_gpio_out(DEVICE(kbd), 1,
                           qemu_allocate_irq(jensen_local_irq, s, 3));
-    serial_mm_init(&s->isa_io, 0x3f8, 0,
-                   qemu_allocate_irq(jensen_local_irq, s, 0), 1843200 / 16,
-                   serial_hd(0), DEVICE_LITTLE_ENDIAN);
-    serial_mm_init(&s->isa_io, 0x2f8, 0,
-                   qemu_allocate_irq(jensen_local_irq, s, 1), 1843200 / 16,
-                   serial_hd(1), DEVICE_LITTLE_ENDIAN);
+    jensen_uart_init(s, 0, 0x3f8);
+    jensen_uart_init(s, 1, 0x2f8);
     if (s->s3_romfile && !s->s3_928) {
         error_report("s3-romfile requires s3-928=on");
         exit(EXIT_FAILURE);
