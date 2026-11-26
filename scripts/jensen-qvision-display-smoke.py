@@ -42,8 +42,8 @@ def test_display(qemu, rom, root, width, height):
             reg(0x3d4, index, value)
         for index, value in [(0, 3), (1, 1), (2, 15), (4, 14)]:
             reg(0x3c4, index, value)
-        for index, value in [(5, 0), (6, 5), (0x0f, 5), (0x10, 8),
-                             (0x40, 1), (0x48, 4)]:
+        for index, value in [(5, 0), (6, 5), (0x0f, 5), (0x10, 0),
+                             (0x40, 1), (0x10, 8), (0x48, 4)]:
             reg(0x3ce, index, value)
         io.outb(0x3c0, 0x10)
         io.outb(0x3c0, 1)

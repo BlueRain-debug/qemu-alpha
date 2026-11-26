@@ -332,7 +332,11 @@ static void qvision_write_byte(JensenQVision *s, unsigned port, uint8_t value)
         if (index != 0x0f && (vga->gr[0x0f] & 15) != 5) {
             return;
         }
-        if (index >= 0x40 && !(vga->gr[0x10] & 8)) {
+        /* AVGA display enable is not part of the BitBLT register lock.
+         * The original Xdec driver enables GR40 after the GR0F password,
+         * before setting GR10 bit 3 to access the drawing configuration.
+         */
+        if (index > 0x40 && !(vga->gr[0x10] & 8)) {
             return;
         }
         vga->gr[index] = value;

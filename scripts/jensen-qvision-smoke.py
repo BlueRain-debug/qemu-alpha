@@ -61,6 +61,12 @@ def check(qemu, rom, root):
         expect(io.inb(0x3ce) == 0xff, 'option-select command disable')
         io.outb(0x0102, 1)
         expect(io.inb(0x3ce) != 0xff, 'option-select command re-enable')
+        gc(0x0f, 5)
+        gc(0x10, 0)
+        gc(0x40, 1)
+        expect(read_gc(0x40) == 1,
+               'AVGA enable before BitBLT configuration unlock, as used by Xdec')
+        gc(0x40, 0)
         expect(io.read(memory(0xc0000)) == int.from_bytes(rom.read_bytes()[:4],
                                                         'little'),
                'original ROM visible through EISA memory')
