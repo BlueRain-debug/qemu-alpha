@@ -35,11 +35,18 @@ typedef struct QVisionPort {
     uint16_t base;
 } QVisionPort;
 
+typedef struct QVisionHostBlt {
+    bool active, mono, transparent, primary_only, rop_enabled;
+    uint32_t dest, pitch, width, height, row, bit;
+    uint8_t align, foreground, background, mask, rop;
+} QVisionHostBlt;
+
 struct JensenQVision {
     ISADevice parent_obj;
     VGACommonState vga;
     GraphicHwOps hw_ops;
-    MemoryRegion aperture, eisa, rom, highmap;
+    MemoryRegion aperture, eisa, rom, highmap, hostmap;
+    QVisionHostBlt host;
     QVisionPort standard;
     QVisionPort extra[11];
     uint8_t registers[65536];
@@ -88,6 +95,9 @@ static void qvision_update_map(JensenQVision *s)
     memory_region_set_enabled(&s->highmap, false);
     memory_region_set_address(&s->highmap, base);
     memory_region_set_enabled(&s->highmap, enable);
+    memory_region_set_enabled(&s->hostmap, false);
+    memory_region_set_address(&s->hostmap, base);
+    memory_region_set_enabled(&s->hostmap, enable && s->host.active);
     memory_region_transaction_commit();
     trace_jensen_qvision_map(base, enable);
 }
@@ -286,6 +296,141 @@ static bool qvision_solid_blt(JensenQVision *s, uint8_t command)
     return true;
 }
 
+static void qvision_host_stop(JensenQVision *s)
+{
+    s->host.active = false;
+    s->registers[0x33ce] &= ~1;
+    qvision_update_map(s);
+}
+
+static bool qvision_host_start(JensenQVision *s, uint8_t command)
+{
+    VGACommonState *vga = &s->vga;
+    QVisionHostBlt *host = &s->host;
+    uint8_t datapath = vga->gr[0x5a];
+    uint8_t control = s->registers[0x63ca];
+    unsigned width = qvision_engine_reg(s, 0x23c2, 2);
+    unsigned height = qvision_engine_reg(s, 0x23c4, 2);
+
+    if (!qvision_vga_enabled(s) || !qvision_packed(s) ||
+        (vga->gr[0x10] & 0x48) != 8 || vga->sr[2] != 0xff ||
+        (control != 3 && control != 0x13) || command != 1 ||
+        (control == 3 && ((datapath & 0x30) ||
+                           (s->registers[0x63c0] & 3))) ||
+        (datapath & 3) != 0 || (datapath & 0x0c) > 4 ||
+        (datapath & 0x30) > 0x10 || (datapath & 0xc0) == 0x80 ||
+        (uint64_t)width * height > 16 * MiB) {
+        return false;
+    }
+    *host = (QVisionHostBlt) {
+        .active = width && height,
+        .mono = control == 0x13,
+        .dest = qvision_engine_reg(s, 0x63cc, 4),
+        .pitch = qvision_engine_reg(s, 0x23ce, 2) * 4,
+        .width = width,
+        .height = height,
+        .align = control == 0x13 ? s->registers[0x63c0] & 7 : 0,
+        .foreground = vga->gr[0x43],
+        .background = vga->gr[0x44],
+        .mask = (datapath & 4) ? 0xff : vga->gr[8],
+        .rop = s->registers[0x33c7],
+        .rop_enabled = datapath & 0xc0,
+        .primary_only = (datapath & 0xc0) == 0x40,
+        .transparent = datapath & 0x10,
+    };
+    if (s->registers[0x33cf] & 0x80) {
+        host->dest = (host->dest >> 16) * host->pitch +
+                     (host->dest & 0xffff);
+    }
+    if (!host->active) {
+        s->registers[0x33ce] &= ~1;
+    }
+    qvision_update_map(s);
+    return true;
+}
+
+static void qvision_host_pixel(JensenQVision *s, uint8_t color, bool primary)
+{
+    QVisionHostBlt *host = &s->host;
+    VGACommonState *vga = &s->vga;
+    uint32_t offset = (host->dest + host->row * host->pitch +
+                       host->bit - host->align) & (vga->vram_size - 1);
+    uint8_t dest = vga->vram_ptr[offset];
+
+    if (host->rop_enabled && (!host->primary_only || primary)) {
+        color = qvision_rop(host->rop, color, dest);
+    }
+    vga->vram_ptr[offset] = (dest & ~host->mask) | (color & host->mask);
+    memory_region_set_dirty(&vga->vram, offset, 1);
+}
+
+static void qvision_host_write(JensenQVision *s, hwaddr addr,
+                               uint64_t value, unsigned size)
+{
+    QVisionHostBlt *host = &s->host;
+
+    trace_jensen_qvision_host(addr, value, size, host->row, host->bit);
+    for (unsigned i = 0; i < size; i++) {
+        uint8_t data = value >> (i * 8);
+
+        if (host->mono) {
+            for (unsigned b = 0; b < 8; b++, host->bit++) {
+                unsigned bit = (data >> (7 - b)) & 1;
+
+                if (host->bit < host->align ||
+                    host->bit >= host->align + host->width ||
+                    (host->transparent && !bit)) {
+                    continue;
+                }
+                qvision_host_pixel(s, bit ? host->foreground : host->background,
+                                    bit);
+            }
+        } else {
+            qvision_host_pixel(s, data, true);
+            host->bit++;
+        }
+        if (host->bit >= host->align + host->width) {
+            /*
+             * Rows end at byte boundaries. Xdec packs several narrow
+             * glyph rows into a single bus write; only trailing bytes
+             * after the final row are discarded.
+             */
+            host->bit = 0;
+            if (++host->row == host->height) {
+                qvision_host_stop(s);
+                break;
+            }
+        }
+    }
+}
+
+static uint64_t qvision_hostmap_read(void *opaque, hwaddr addr, unsigned size)
+{
+    JensenQVision *s = opaque;
+    uint64_t value = 0;
+
+    for (unsigned i = 0; i < size; i++) {
+        unsigned offset = (addr + i) & (s->vga.vram_size - 1);
+
+        value |= (uint64_t)s->vga.vram_ptr[offset] << (i * 8);
+    }
+    return value;
+}
+
+static void qvision_hostmap_write(void *opaque, hwaddr addr,
+                                  uint64_t value, unsigned size)
+{
+    qvision_host_write(opaque, addr, value, size);
+}
+
+static const MemoryRegionOps qvision_hostmap_ops = {
+    .read = qvision_hostmap_read,
+    .write = qvision_hostmap_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4, .unaligned = true },
+    .impl = { .min_access_size = 1, .max_access_size = 4, .unaligned = true },
+};
+
 static uint8_t qvision_read_byte(JensenQVision *s, unsigned port)
 {
     VGACommonState *vga = &s->vga;
@@ -302,6 +447,9 @@ static uint8_t qvision_read_byte(JensenQVision *s, unsigned port)
     }
     if (port == 0x0102) {
         return s->option_select;
+    }
+    if (port == 0x63ca) {
+        return s->registers[port] | (s->host.active ? 0x40 : 0);
     }
     if (port >= 0x3b0 && port <= 0x3df && !qvision_vga_enabled(s)) {
         return 0xff;
@@ -412,6 +560,9 @@ static void qvision_write_byte(JensenQVision *s, unsigned port, uint8_t value)
             return;
         }
         vga->gr[index] = value;
+        if (index == 0x10 && (value & 0x40)) {
+            qvision_host_stop(s);
+        }
         if (index == 0x48 || index == 0x49) {
             qvision_update_map(s);
         }
@@ -427,6 +578,8 @@ static void qvision_write_byte(JensenQVision *s, unsigned port, uint8_t value)
      * The original QVision console driver relies on this when restoring text.
      */
     if (port == 0x3c5 && vga->sr_index == 0 && (value & 3) != 3) {
+        s->host.active = false;
+        s->registers[0x33ce] &= ~1;
         vga->gr[0x40] &= ~1;
         vga->gr[0x48] = vga->gr[0x49] = 0;
         qvision_update_map(s);
@@ -459,8 +612,15 @@ static void qvision_write_byte(JensenQVision *s, unsigned port, uint8_t value)
         s->registers[port] &= ~0xc0; /* Busy bits are read-only. */
         return;
     }
-    if (port == 0x33ce && (value & 1)) {
-        if (!qvision_solid_blt(s, value)) {
+    if (port == 0x33ce) {
+        if (s->host.active) {
+            qvision_host_stop(s);
+            s->registers[port] = value;
+        }
+        if (!(value & 1)) {
+            return;
+        }
+        if (!qvision_host_start(s, value) && !qvision_solid_blt(s, value)) {
             qemu_log_mask(LOG_UNIMP,
                           "QVision: unsupported BitBLT command=%02x "
                           "control=%02x datapath=%02x\n", value,
@@ -514,7 +674,15 @@ static uint64_t qvision_memory_read(void *opaque, hwaddr addr, unsigned size)
 {
     JensenQVision *s = opaque;
 
-    return qvision_vga_enabled(s) ? vga_mem_readb(&s->vga, addr) : 0xff;
+    uint64_t value = 0;
+
+    for (unsigned i = 0; i < size; i++) {
+        uint8_t data = qvision_vga_enabled(s) ?
+            vga_mem_readb(&s->vga, addr + i) : 0xff;
+
+        value |= (uint64_t)data << (i * 8);
+    }
+    return value;
 }
 
 static void qvision_memory_write(void *opaque, hwaddr addr,
@@ -523,7 +691,13 @@ static void qvision_memory_write(void *opaque, hwaddr addr,
     JensenQVision *s = opaque;
 
     if (qvision_vga_enabled(s)) {
-        vga_mem_writeb(&s->vga, addr, value);
+        if (s->host.active) {
+            qvision_host_write(s, addr, value, size);
+        } else {
+            for (unsigned i = 0; i < size; i++) {
+                vga_mem_writeb(&s->vga, addr + i, value >> (i * 8));
+            }
+        }
     }
 }
 
@@ -532,7 +706,7 @@ static const MemoryRegionOps qvision_memory_ops = {
     .write = qvision_memory_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = { .min_access_size = 1, .max_access_size = 4, .unaligned = true },
-    .impl = { .min_access_size = 1, .max_access_size = 1 },
+    .impl = { .min_access_size = 1, .max_access_size = 4, .unaligned = true },
 };
 
 static uint64_t qvision_eisa_read(void *opaque, hwaddr addr, unsigned size)
@@ -574,6 +748,7 @@ static void qvision_reset(DeviceState *dev)
     JensenQVision *s = JENSEN_QVISION(dev);
 
     vga_common_reset(&s->vga);
+    memset(&s->host, 0, sizeof(s->host));
     memset(s->registers, 0, sizeof(s->registers));
     memset(s->dac_command, 0, sizeof(s->dac_command));
     memset(s->cursor_ram, 0, sizeof(s->cursor_ram));
@@ -645,6 +820,11 @@ static void qvision_realize(DeviceState *dev, Error **errp)
                              &vga->vram, 0, MiB);
     memory_region_set_enabled(&s->highmap, false);
     memory_region_add_subregion(isa_address_space(isa), 0, &s->highmap);
+    memory_region_init_io(&s->hostmap, OBJECT(dev), &qvision_hostmap_ops, s,
+                          "qvision-host-data", MiB);
+    memory_region_set_enabled(&s->hostmap, false);
+    memory_region_add_subregion_overlap(isa_address_space(isa), 0,
+                                        &s->hostmap, 1);
     memory_region_init_rom(&s->rom, OBJECT(dev), "qvision-rom", 32 * KiB, errp);
     if (*errp) {
         return;

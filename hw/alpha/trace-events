@@ -79,3 +79,5 @@ alpha2100a_capture(bool read, uint64_t addr, uint64_t latch, uint64_t control, u
 alpha2100a_correction(uint64_t addr, unsigned size, uint64_t value, unsigned cpu, uint64_t pc) "addr=0x%" PRIx64 " size=%u value=0x%" PRIx64 " cpu=%u pc=0x%" PRIx64
 
 alpha2100a_dma(uint64_t addr, uint64_t translated, unsigned window, bool sg, bool valid) "addr=0x%" PRIx64 " translated=0x%" PRIx64 " window=%u sg=%d valid=%d"
+
+jensen_qvision_host(uint64_t addr, uint64_t value, unsigned size, unsigned row, unsigned bit) "addr=0x%"PRIx64" value=0x%"PRIx64" size=%u row=%u bit=%u"
