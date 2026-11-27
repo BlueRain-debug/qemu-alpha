@@ -296,6 +296,54 @@ static bool qvision_solid_blt(JensenQVision *s, uint8_t command)
     return true;
 }
 
+static bool qvision_screen_blt(JensenQVision *s, uint8_t command)
+{
+    VGACommonState *vga = &s->vga;
+    uint8_t datapath = vga->gr[0x5a];
+    uint32_t source = qvision_engine_reg(s, 0x63c0, 4);
+    uint32_t dest = qvision_engine_reg(s, 0x63cc, 4);
+    unsigned source_pitch = qvision_engine_reg(s, 0x23ca, 2) * 4;
+    unsigned dest_pitch = qvision_engine_reg(s, 0x23ce, 2) * 4;
+    unsigned width = qvision_engine_reg(s, 0x23c2, 2);
+    unsigned height = qvision_engine_reg(s, 0x23c4, 2);
+    int direction = command & 0x40 ? -1 : 1;
+    uint8_t mask = datapath & 4 ? 0xff : vga->gr[8];
+
+    if (!qvision_vga_enabled(s) || !qvision_packed(s) ||
+        (vga->gr[0x10] & 0x48) != 8 || vga->sr[2] != 0xff ||
+        s->registers[0x63ca] != 3 || (datapath & 0x33) != 1 ||
+        (datapath & 0x0c) > 4 ||
+        ((datapath & 0xc0) != 0 && (datapath & 0xc0) != 0xc0) ||
+        (command & ~0xc1) || (uint64_t)width * height > 16 * MiB) {
+        return false;
+    }
+    if (s->registers[0x33cf] & 0x40) {
+        source = (source >> 16) * source_pitch + (source & 0xffff);
+    }
+    if (s->registers[0x33cf] & 0x80) {
+        dest = (dest >> 16) * dest_pitch + (dest & 0xffff);
+    }
+    for (unsigned y = 0; y < height; y++) {
+        uint32_t src_row = source + direction * y * source_pitch;
+        uint32_t dst_row = dest + direction * y * dest_pitch;
+
+        for (unsigned x = 0; x < width; x++) {
+            uint32_t src = (src_row + direction * x) & (vga->vram_size - 1);
+            uint32_t dst = (dst_row + direction * x) & (vga->vram_size - 1);
+            uint8_t color = vga->vram_ptr[src];
+            uint8_t old = vga->vram_ptr[dst];
+
+            if (datapath & 0xc0) {
+                color = qvision_rop(s->registers[0x33c7], color, old);
+            }
+            vga->vram_ptr[dst] = (old & ~mask) | (color & mask);
+        }
+    }
+    memory_region_set_dirty(&vga->vram, 0, vga->vram_size);
+    s->registers[0x33ce] &= ~1;
+    return true;
+}
+
 static void qvision_host_stop(JensenQVision *s)
 {
     s->host.active = false;
@@ -391,13 +439,21 @@ static void qvision_host_write(JensenQVision *s, hwaddr addr,
         }
         if (host->bit >= host->align + host->width) {
             /*
-             * Rows end at byte boundaries. Xdec packs several narrow
-             * glyph rows into a single bus write; only trailing bytes
-             * after the final row are discarded.
+             * Monochrome rows end at byte boundaries. Xdec packs
+             * several narrow glyph rows into a single bus write; only
+             * bytes after the final glyph row are discarded.
              */
             host->bit = 0;
             if (++host->row == host->height) {
                 qvision_host_stop(s);
+                break;
+            }
+            if (!host->mono) {
+                /*
+                 * Packed X images pad the last bus word of each row.
+                 * In contrast, Xdec packs multiple narrow mono rows into
+                 * a word. Do not interpret color padding as another row.
+                 */
                 break;
             }
         }
@@ -620,7 +676,8 @@ static void qvision_write_byte(JensenQVision *s, unsigned port, uint8_t value)
         if (!(value & 1)) {
             return;
         }
-        if (!qvision_host_start(s, value) && !qvision_solid_blt(s, value)) {
+        if (!qvision_host_start(s, value) && !qvision_solid_blt(s, value) &&
+            !qvision_screen_blt(s, value)) {
             qemu_log_mask(LOG_UNIMP,
                           "QVision: unsupported BitBLT command=%02x "
                           "control=%02x datapath=%02x\n", value,

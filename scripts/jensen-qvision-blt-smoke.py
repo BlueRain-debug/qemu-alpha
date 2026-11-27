@@ -107,7 +107,59 @@ def check(qemu, rom, root):
         assert io.inb(0x33ce) & 1, 'unexecuted command reported complete'
         command(0, 1024, 0, 1024)
         assert snapshot() == expected, 'zero-height command changed VRAM'
-        gc(0x5a, 5)  # Screen source is not yet implemented.
+        # Screen copies use the existing two-input ROP table and separate
+        # source/destination pitches. Compare with an untouched source image.
+        for rop, operation in enumerate(ops):
+            initial = bytes((i * 37 + 11) & 255 for i in range(1024))
+            for i in range(0, 1024, 4):
+                io.write(mem(i), int.from_bytes(initial[i:i + 4], 'little'))
+            gc(0x5a, 0xc1)
+            gc(8, 0x5a)
+            io.outb(0x33c7, rop)
+            out(0x63c0, 3, 4)
+            out(0x23ca, 8, 2)
+            command(300, 7, 3, 32)
+            expected = bytearray(initial)
+            for y in range(3):
+                for x in range(7):
+                    src, dst = 3 + y * 32 + x, 300 + y * 32 + x
+                    expected[dst] = (initial[dst] & ~0x5a) | (
+                        operation(initial[src], initial[dst]) & 0x5a)
+            assert snapshot() == expected, f'screen copy ROP {rop:x}'
+        for source, dest, reverse in ((100, 70, False), (70, 100, True)):
+            initial = bytes((i * 23 + 7) & 255 for i in range(1024))
+            for i in range(0, 1024, 4):
+                io.write(mem(i), int.from_bytes(initial[i:i + 4], 'little'))
+            gc(0x5a, 5)
+            out(0x63c0, source + (39 if reverse else 0), 4)
+            out(0x23ca, 4, 2)
+            command(dest + (39 if reverse else 0), 8, 3, 16, reverse=reverse)
+            expected = bytearray(initial)
+            for y in range(3):
+                expected[dest + y * 16:dest + y * 16 + 8] = (
+                    initial[source + y * 16:source + y * 16 + 8])
+            assert snapshot() == expected, 'overlapping screen-copy direction'
+        initial = snapshot()
+        out(0x63c0, (1 << 16) | 2, 4)
+        out(0x63cc, (7 << 16) | 4, 4)
+        out(0x23ca, 8, 2)
+        out(0x23ce, 8, 2)
+        out(0x23c2, 11, 2)
+        out(0x23c4, 2, 2)
+        io.outb(0x33cf, 0xc0)
+        io.outb(0x33ce, 0x81)
+        expected = bytearray(initial)
+        for y in range(2):
+            expected[(7 + y) * 32 + 4:(7 + y) * 32 + 15] = (
+                initial[(1 + y) * 32 + 2:(1 + y) * 32 + 13])
+        assert snapshot() == expected, 'XY screen copy with no-wrap command'
+        assert not io.inb(0x33ce) & 1, 'screen copy did not complete'
+        out(0x23c2, 0, 2)
+        io.outb(0x33ce, 1)
+        assert snapshot() == expected, 'zero-width screen copy changed VRAM'
+        # Keep the rejection checks independent of the previous copy fixture.
+        expected = bytearray(snapshot())
+        gc(0x5a, 7)  # Line-pattern source is not yet implemented.
         command(0, 16, 4, 16)
         assert snapshot() == expected, 'unsupported source executed as a fill'
         gc(0x5a, 6)
@@ -117,7 +169,7 @@ def check(qemu, rom, root):
         out(0x33cc, 0x2222, 2)
         command(0, 16, 4, 16)
         assert snapshot() == expected, 'nonuniform pattern executed'
-        print('PASS: QVision solid XY/linear/reverse/pitch, 16 ROPs, '
+        print('PASS: QVision solid/screen XY/linear/reverse/pitch, 16 ROPs, '
               'plane masks, busy/completion and unsupported-source checks')
     finally:
         io.close()

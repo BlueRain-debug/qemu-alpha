@@ -125,9 +125,9 @@ def check(qemu, rom, root):
         out(0x23c2, 3, 2)
         out(0x23c4, 2, 2)
         io.outb(0x33ce, 1)
-        data(0x44332211)
+        data(0xee332211)
         assert io.inb(0x63ca) & 0x40, 'packed upload completed before last row'
-        data(0xffff6655)
+        data(0xdd665544)
         expected = bytearray([0xa5] * 1024)
         for row, colors in enumerate(((0x11, 0x22, 0x33), (0x44, 0x55, 0x66))):
             for x, color in enumerate(colors):
@@ -136,6 +136,29 @@ def check(qemu, rom, root):
         assert snapshot() == expected, 'packed CPU upload row/pitch/ROP/mask'
         assert not io.inb(0x63ca) & 0x40, 'packed upload did not complete'
         gc(8, 0xff)
+
+        # Original Xdec clipped root tile: five pixels wide, with each
+        # scanline ending in a padded doubleword. Padding is not next-row
+        # data in packed-color mode (unlike narrow monochrome glyphs).
+        initialize()
+        io.outb(0x63ca, 3)
+        gc(0x5a, 0xc0)
+        io.outb(0x33c7, 12)
+        out(0x63c0, 0, 4)
+        out(0x63cc, (2 << 16) | 3, 4)
+        out(0x23ce, 8, 2)
+        out(0x23c2, 5, 2)
+        out(0x23c4, 16, 2)
+        io.outb(0x33ce, 1)
+        for row in range(16):
+            data(0x0a0a0a0a)
+            data(0x0000000a)
+            assert bool(io.inb(0x63ca) & 0x40) == (row != 15), (
+                'clipped color tile consumed padding as extra rows')
+        expected = bytearray([0xa5] * 1024)
+        for row in range(16):
+            expected[(row + 2) * 32 + 3:(row + 2) * 32 + 8] = bytes([10]) * 5
+        assert snapshot() == expected, 'white diagonal clipped-color regression'
 
         command(8, 4)
         io.outb(0x33ce, 0)
